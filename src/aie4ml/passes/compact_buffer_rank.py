@@ -5,17 +5,16 @@ from __future__ import annotations
 
 from math import prod
 
-from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
-
 from ..ir import get_backend_context
+from .base import AIEPass
 
 
-class CompactBufferRank(ModelOptimizerPass):
+class CompactBufferRank(AIEPass):
     def __init__(self):
         self.name = 'compact_buffer_rank'
 
-    def transform(self, model) -> bool:
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx) -> bool:
+        ctx = get_backend_context(model_or_ctx)
         plan = ctx.ir.physical.plan
         buffers = plan['buffers']
         changed = False

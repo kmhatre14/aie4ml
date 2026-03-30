@@ -1,9 +1,8 @@
-from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
-
 from ..ir import TraitInstance, get_backend_context
+from .base import AIEPass
 
 
-class FoldTransposeViews(ModelOptimizerPass):
+class FoldTransposeViews(AIEPass):
     def __init__(self):
         self.name = 'fold_transpose_views'
 
@@ -16,8 +15,8 @@ class FoldTransposeViews(ModelOptimizerPass):
         trait.data.setdefault('outputs', {})
         return trait.data
 
-    def transform(self, model):
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx):
+        ctx = get_backend_context(model_or_ctx)
         graph = ctx.ir.logical
         changed = False
 

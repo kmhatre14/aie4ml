@@ -5,7 +5,6 @@ import copy
 import logging
 import os
 import subprocess
-from pathlib import Path
 
 from hls4ml.backends.backend import Backend, extract_optimizers_from_path
 from hls4ml.backends.fpga.fpga_backend import FPGABackend as _FPGABackendHelper
@@ -13,11 +12,28 @@ from hls4ml.model.attributes import Attribute, ConfigurableAttribute
 from hls4ml.model.flow import register_flow
 from hls4ml.model.layers import Activation, Dense
 from hls4ml.model.optimizer import layer_optimizer, model_optimizer
+from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 from hls4ml.writer import get_writer
 
-from .device_catalog import load_device_catalog
+from ...device_catalog import load_device_catalog
+from ...ir import get_backend_context
 
 log = logging.getLogger(__name__)
+
+
+def _make_hls4ml_pass(aie_pass_instance):
+    """Wrap a plain AIEPass instance as a ModelOptimizerPass for hls4ml registration."""
+
+    class _Wrapper(ModelOptimizerPass):
+        def __init__(self):
+            self._aie = aie_pass_instance
+            self.name = aie_pass_instance.name
+
+        def transform(self, model):
+            return self._aie.transform(model)
+
+    _Wrapper.__name__ = type(aie_pass_instance).__name__
+    return _Wrapper
 
 
 class AIEBackend(Backend):
@@ -29,14 +45,17 @@ class AIEBackend(Backend):
         self._register_flows()
 
     def _init_file_optimizers(self):
-        base = os.path.dirname(__file__)
+        from aie4ml.pipeline import DEFAULT_PIPELINE
+
         result = {}
-        for subdir, mod_path in [
-            ('passes', 'aie4ml.passes'),
-            ('frontends/hls4ml', 'aie4ml.frontends.hls4ml'),
-        ]:
-            path = os.path.normpath(os.path.join(base, subdir))
-            result.update(extract_optimizers_from_path(path, mod_path, self))
+        for cls in DEFAULT_PIPELINE:
+            wrapper_cls = _make_hls4ml_pass(cls())
+            wrapper_inst = wrapper_cls()
+            result[wrapper_inst.name] = wrapper_inst
+
+        # Scan this directory for hls4ml-native passes (lower.py)
+        result.update(extract_optimizers_from_path(os.path.dirname(__file__), 'aie4ml.frontends.hls4ml', self))
+
         return result
 
     def _register_aie_layer_attributes(self):
@@ -62,47 +81,21 @@ class AIEBackend(Backend):
         self.attribute_map[Activation] = activation_attrs
 
     def _register_flows(self):
-        initializers = self._get_layer_initializers()
-        init_flow = register_flow('init_layers', initializers, requires=['optimize'], backend=self.name)
-        lower_flow = register_flow('lower', ['aie:lower_to_aie_ir'], requires=[init_flow], backend=self.name)
-        force_float_flow = register_flow(
-            'force_float', ['aie:force_float_mode'], requires=[lower_flow], backend=self.name
-        )
-        fold_alpha_flow = register_flow(
-            'fold_apply_alpha', ['aie:fold_apply_alpha'], requires=[force_float_flow], backend=self.name
-        )
-        fuse_flow = register_flow('fuse', ['aie:fuse_activation_casts'], requires=[fold_alpha_flow], backend=self.name)
-        fold_views_flow = register_flow(
-            'fold_views', ['aie:fold_transpose_views'], requires=[fuse_flow], backend=self.name
-        )
-        resolve_flow = register_flow('resolve', ['aie:resolve'], requires=[fold_views_flow], backend=self.name)
-        pack_flow = register_flow('pack', ['aie:pack_kernel_artifacts'], requires=[resolve_flow], backend=self.name)
-        placement_flow = register_flow('placement', ['aie:place_kernels'], requires=[pack_flow], backend=self.name)
-        memory_collect_flow = register_flow(
-            'memory_collect', ['aie:collect_memory_entries'], requires=[placement_flow], backend=self.name
-        )
-        fanout_legalize_flow = register_flow(
-            'fanout_legalize', ['aie:legalize_fanout_entries'], requires=[memory_collect_flow], backend=self.name
-        )
-        memtile_legalize_flow = register_flow(
-            'memtile_legalize',
-            ['aie:legalize_memtile_port_limits'],
-            requires=[fanout_legalize_flow],
-            backend=self.name,
-        )
-        memory_plan_flow = register_flow(
-            'memory_plan', ['aie:materialize_memory_plan'], requires=[memtile_legalize_flow], backend=self.name
-        )
-        compact_buffer_flow = register_flow(
-            'compact_batch', ['aie:compact_buffer_rank'], requires=[memory_plan_flow], backend=self.name
-        )
-        template_flow = register_flow(
-            'apply_templates', self._get_layer_templates, requires=[compact_buffer_flow], backend=self.name
-        )
+        from aie4ml.pipeline import HLS4ML_FLOW_SPEC
 
-        self._default_flow = register_flow('project', None, requires=[template_flow], backend=self.name)
-        writer_passes = ['make_stamp', 'aie:write_aie']
-        self._writer_flow = register_flow('write', writer_passes, requires=[self._default_flow], backend=self.name)
+        initializers = self._get_layer_initializers()
+        flow = register_flow('init_layers', initializers, requires=['optimize'], backend=self.name)
+        flow = register_flow('lower', ['aie:lower_to_aie_ir'], requires=[flow], backend=self.name)
+
+        for flow_name, pass_cls in HLS4ML_FLOW_SPEC:
+            pass_name = pass_cls().name
+            flow = register_flow(flow_name, [f'aie:{pass_name}'], requires=[flow], backend=self.name)
+
+        flow = register_flow('apply_templates', self._get_layer_templates, requires=[flow], backend=self.name)
+        self._default_flow = register_flow('project', None, requires=[flow], backend=self.name)
+        self._writer_flow = register_flow(
+            'write', ['make_stamp', 'aie:write_aie'], requires=[self._default_flow], backend=self.name
+        )
 
     def create_layer_class(self, layer_class):
         new_attributes = []
@@ -136,18 +129,12 @@ class AIEBackend(Backend):
         pass
 
     def compile(self, model):
-        """Compile the generated project for x86 simulation.
-
-        The AIE flow relies on the generated Makefile targets. Invoking the
-        ``x86com`` target builds the host application and graph for execution
-        on the x86 functional simulator.
-        """
-
-        log.info('Compiling %s using make x86com', model.config.get_project_name())
+        """Compile the generated project for x86 simulation."""
+        log.info('Compiling %s using make x86com', get_backend_context(model).project_config.project_name)
         self.build(model, make_target='x86com')
 
     def predict(self, model, X, simulator='x86', quantize_io=True):
-        from .simulation import (
+        from ...simulation import (
             build_io_layout,
             collect_outputs,
             dequantize_outputs,
@@ -156,18 +143,18 @@ class AIEBackend(Backend):
             write_input_files,
         )
 
-        output_dir = Path(model.config.get_output_dir())
+        ctx = get_backend_context(model)
+        output_dir = ctx.project_config.output_dir
         if not output_dir.exists():
             raise FileNotFoundError(
                 f'Output directory "{output_dir}" does not exist. Run write() and compile() before predicting.'
             )
 
         layout = build_io_layout(model)
-        aie_cfg = model.config.get_config_value('AIEConfig', {}) or {}
-        iterations = int(aie_cfg.get('Iterations'))
+        iterations = int(ctx.aie_config['Iterations'])
         quantize_io = bool(quantize_io)
 
-        plio_width = int(aie_cfg.get('PLIOWidthBits', 128))
+        plio_width = ctx.device.plio_width_bits
         prepared_inputs = prepare_inputs(layout, X, iterations=iterations, quantize=quantize_io)
         write_input_files(output_dir, layout, prepared_inputs, plio_width_bits=plio_width)
 
@@ -179,7 +166,7 @@ class AIEBackend(Backend):
         else:
             raise ValueError(f'Unknown simulator "{simulator}". Expected one of: x86, aie.')
 
-        log.info('Running %s simulation using make %s', model.config.get_project_name(), make_target)
+        log.info('Running %s simulation using make %s', ctx.project_config.project_name, make_target)
         run_simulation_target(output_dir, make_target)
 
         sim_out = collect_outputs(output_dir, sim_key, layout)
@@ -268,7 +255,8 @@ class AIEBackend(Backend):
         return config
 
     def build(self, model, make_target='all', env=None, log_to_stdout=True):
-        output_dir = Path(model.config.get_output_dir())
+        ctx = get_backend_context(model)
+        output_dir = ctx.project_config.output_dir
         if not output_dir.exists():
             raise FileNotFoundError(f'Output directory "{output_dir}" does not exist. Run .write() first.')
 
@@ -280,7 +268,7 @@ class AIEBackend(Backend):
 
         result = subprocess.run(cmd, cwd=output_dir, env=env, stdout=stdout, stderr=stderr, text=True)
         if result.returncode != 0:
-            raise RuntimeError(f'Make target "{make_target}" failed for project "{model.config.get_project_name()}"')
+            raise RuntimeError(f'Make target "{make_target}" failed for project "{ctx.project_config.project_name}"')
 
         if not log_to_stdout and result.stdout:
             log.info(result.stdout)

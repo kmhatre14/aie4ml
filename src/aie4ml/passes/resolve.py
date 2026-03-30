@@ -7,11 +7,10 @@ from __future__ import annotations
 
 import logging
 
-from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
-
 from ..ir import ResolvedAttributes, get_backend_context
 from ..op_impls import OpImplSelectionContext, get_op_impl_registry
-from .resolve_registry import LayerResolveContext, get_layer_policy, merge_config_layers
+from .base import AIEPass
+from .resolve_registry import LayerResolveContext, get_layer_policy
 
 log = logging.getLogger(__name__)
 
@@ -30,26 +29,22 @@ def _quant_meta(node) -> dict:
     return meta
 
 
-def resolve_aie_attributes(model, ctx, node) -> ResolvedAttributes:
+def resolve_aie_attributes(ctx, node) -> ResolvedAttributes:
     """Run the registered resolver pipeline for the given IR node."""
 
     layer_class = node.metadata.get('layer_class')
     policy = get_layer_policy(layer_class)
     layer_name = node.metadata['source_layer']
-    merged_cfg = merge_config_layers(model.config.config, layer_name, layer_class)
     attributes = ResolvedAttributes()
 
     context = LayerResolveContext(
-        model=model,
         backend_ctx=ctx,
         node=node,
         layer_name=layer_name,
         layer_class=layer_class,
         policy=policy,
-        config=merged_cfg,
         quant=_quant_meta(node),
         device=ctx.device,
-        global_config=model.config.get_config_value('AIEConfig', {}) or {},
         attributes=attributes,
     )
 
@@ -79,22 +74,22 @@ def resolve_aie_attributes(model, ctx, node) -> ResolvedAttributes:
     return attributes
 
 
-class Resolve(ModelOptimizerPass):
-    """Merge global/local AIE config and derive per-layer resolved attributes."""
+class Resolve(AIEPass):
+    """Derive per-layer resolved attributes via the registered resolver pipeline."""
 
     def __init__(self):
         self.name = 'resolve'
         self._registry = get_op_impl_registry()
 
-    def transform(self, model):
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx) -> bool:
+        ctx = get_backend_context(model_or_ctx)
         changed = False
         visited = set()
         for node in ctx.ir.logical:
             if node.metadata['layer_class'] == 'Input':
                 continue
 
-            resolved = resolve_aie_attributes(model, ctx, node)
+            resolved = resolve_aie_attributes(ctx, node)
             selection_ctx = OpImplSelectionContext(
                 node=node,
                 attributes=resolved,

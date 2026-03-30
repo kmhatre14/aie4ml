@@ -34,16 +34,13 @@ class LayerPolicy:
 class LayerResolveContext:
     """State shared across resolver functions."""
 
-    model: Any
     backend_ctx: Any
     node: Any
     layer_name: str
     layer_class: str
     policy: LayerPolicy
-    config: Dict[str, Any]
     quant: Dict[str, Any]
     device: Any
-    global_config: Dict[str, Any]
     attributes: ResolvedAttributes
     state: Dict[str, Any] = field(default_factory=dict)
 
@@ -990,23 +987,6 @@ def resolve_scalars(ctx: LayerResolveContext) -> None:
     scalars['io_shapes'] = _resolve_io_shapes(ctx)
 
 
-def merge_config_layers(config: dict, layer_name: str, layer_class: str) -> dict:
-    h = config.get('HLSConfig', {}) or {}
-    merged = {}
-    for scope in (
-        h.get('AIE', {}),
-        h.get('LayerType', {}).get(layer_class, {}),
-        h.get('LayerName', {}).get(layer_name, {}),
-    ):
-        if isinstance(scope, dict):
-            for k, v in scope.items():
-                if isinstance(v, dict):
-                    merged.setdefault(k, {}).update(v)
-                else:
-                    merged[k] = v
-    return merged
-
-
 def register_layer_policy(name: str, policy: LayerPolicy) -> None:
     LAYER_RESOLVE_REGISTRY[name] = policy
 
@@ -1054,6 +1034,5 @@ __all__ = [
     'NumericBundle',
     'ParallelismResult',
     'get_layer_policy',
-    'merge_config_layers',
     'register_layer_policy',
 ]

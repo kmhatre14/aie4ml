@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Tuple
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .graph import AIEPipelineIR
 
@@ -60,7 +61,7 @@ class BackendPolicies:
 class DeviceSpec:
     """Model-level device specification published to passes."""
 
-    name: str
+    platform: str
     generation: str
     columns: int
     rows: int
@@ -73,14 +74,14 @@ class DeviceSpec:
     dialect: str
 
     @classmethod
-    def from_config(cls, name: str, cfg: Dict[str, Any]) -> 'DeviceSpec':
+    def from_config(cls, platform: str, cfg: Dict[str, Any]) -> 'DeviceSpec':
         def _require_int(source: Dict[str, Any], key: str) -> int:
             if key not in source:
                 raise KeyError(f'AIEConfig missing "{key}".')
             return int(source[key])
 
         return cls(
-            name=name,
+            platform=platform,
             generation=str(cfg['Generation']),
             columns=_require_int(cfg, 'Columns'),
             rows=_require_int(cfg, 'Rows'),
@@ -92,6 +93,16 @@ class DeviceSpec:
             max_mem_out_ports=_require_int(cfg, 'MaxMemTileOutPorts'),
             dialect=detect_dialect(str(cfg['Generation'])),
         )
+
+
+@dataclass
+class ProjectConfig:
+    """Project-level config populated during lowering; consumed by writer, simulation, and build."""
+
+    output_dir: Path
+    project_name: str
+    stamp: Optional[str]
+    custom_sources: Dict[str, str]
 
 
 def detect_dialect(generation: str) -> str:
@@ -107,6 +118,8 @@ class AIEBackendContext:
 
     device: DeviceSpec
     policies: BackendPolicies
+    project_config: ProjectConfig
+    aie_config: Dict[str, Any] = field(default_factory=dict)
     traits: TraitRegistry = field(default_factory=TraitRegistry)
     ir: AIEPipelineIR = field(default_factory=AIEPipelineIR)
 
@@ -123,8 +136,10 @@ def ensure_backend_context(model, factory: Callable[[], AIEBackendContext]) -> A
     return ctx
 
 
-def get_backend_context(model) -> AIEBackendContext:
-    ctx = getattr(model, CONTEXT_ATTR, None)
+def get_backend_context(model_or_ctx: Union[Any, AIEBackendContext]) -> AIEBackendContext:
+    if isinstance(model_or_ctx, AIEBackendContext):
+        return model_or_ctx
+    ctx = getattr(model_or_ctx, CONTEXT_ATTR, None)
     if ctx is None:
         raise RuntimeError('AIE backend context missing. Run lowering before invoking downstream passes.')
     return ctx

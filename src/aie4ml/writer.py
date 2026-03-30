@@ -4,28 +4,23 @@
 from pathlib import Path
 from shutil import copyfile
 
-from hls4ml.writer.writers import Writer
 from jinja2 import Environment, FileSystemLoader
 
-from .ir import get_backend_context
 from .passes.utils import sanitize_identifier
 from .serialization import dump_pipeline_ir
 
-config_filename = 'hls4ml_config.yml'
 
+class AIEProjectEmitter:
+    """Framework-agnostic project emitter. Takes a populated AIEBackendContext and writes all output files."""
 
-class AIEWriter(Writer):
     def __init__(self):
-        super().__init__()
         self._template_root = Path(__file__).resolve().parent / 'templates'
 
-    def write_aie(self, model):
-        output_dir = Path(model.config.get_output_dir())
+    def emit(self, ctx):
+        output_dir = ctx.project_config.output_dir
         self._prepare_directories(output_dir)
 
-        ctx = get_backend_context(model)
         layers = self._collect_layers(ctx)
-
         graph_plan = ctx.ir.physical.plan or {}
         dump_pipeline_ir(ctx, output_dir / 'aie_pipeline.json')
 
@@ -37,8 +32,8 @@ class AIEWriter(Writer):
         )
 
         self._emit_kernel_artifacts(output_dir, layers, env)
-        self._copy_kernel_sources(output_dir, model)
-        self._render_templates(output_dir, model, layers, graph_plan, env)
+        self._copy_kernel_sources(output_dir, ctx.project_config.custom_sources)
+        self._render_templates(output_dir, ctx, layers, graph_plan, env)
 
     def _prepare_directories(self, output_dir: Path):
         (output_dir / 'src').mkdir(parents=True, exist_ok=True)
@@ -64,7 +59,6 @@ class AIEWriter(Writer):
             placement = dict(placements[node.name])
 
             layer_index += 1
-
             artifacts = variant.get_artifacts(inst)
 
             entry = {
@@ -76,8 +70,6 @@ class AIEWriter(Writer):
                 'placement': placement,
                 'artifacts': artifacts,
             }
-
-            # Optional metadata passthrough
             entry.update({k: node.metadata[k] for k in ('n_in', 'n_out') if k in node.metadata})
             layers.append(entry)
 
@@ -103,7 +95,7 @@ class AIEWriter(Writer):
                     )
                 )
 
-    def _copy_kernel_sources(self, output_dir: Path, model):
+    def _copy_kernel_sources(self, output_dir: Path, custom_sources: dict):
         src_kernel_dir = self._template_root / 'nnet_utils'
         dst_kernel_dir = output_dir / 'src' / 'kernels'
 
@@ -122,7 +114,7 @@ class AIEWriter(Writer):
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 copyfile(src, dst)
 
-        for dst, src in model.config.backend.get_custom_source().items():
+        for dst, src in custom_sources.items():
             dst = output_dir / dst
             dst.parent.mkdir(parents=True, exist_ok=True)
             copyfile(src, dst)
@@ -135,18 +127,15 @@ class AIEWriter(Writer):
         else:
             path.unlink()
 
-    def _render_templates(self, output_dir: Path, model, layers, graph_plan, env: Environment):
-        aie_cfg = model.config.get_config_value('AIEConfig', {})
-        platform = model.config.get_config_value('Part')
-
+    def _render_templates(self, output_dir: Path, ctx, layers, graph_plan, env: Environment):
         context = {
             'layers': layers,
             'graph_plan': graph_plan,
-            'plio_bitwidth': int(aie_cfg['PLIOWidthBits']),
-            'iterations': int(aie_cfg['Iterations']),
-            'pl_freq_mhz': float(aie_cfg['PLClockFreqMHz']),
-            'stamp': model.config.get_config_value('Stamp'),
-            'platform': platform,
+            'plio_bitwidth': ctx.device.plio_width_bits,
+            'iterations': int(ctx.aie_config['Iterations']),
+            'pl_freq_mhz': float(ctx.aie_config['PLClockFreqMHz']),
+            'stamp': ctx.project_config.stamp,
+            'platform': ctx.device.platform,
         }
 
         self._render_template(env, 'Makefile.jinja', output_dir / 'Makefile', context)

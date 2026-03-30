@@ -1,11 +1,10 @@
 """Dense+activation fusion pass on aie4ml logical IR."""
 
-from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
-
 from ..ir import TraitInstance, get_backend_context
+from .base import AIEPass
 
 
-class FuseActivationCasts(ModelOptimizerPass):
+class FuseActivationCasts(AIEPass):
     """Fuse relu into Dense (adds fused_activation trait) and contract linear activations out.
 
     After this pass, no activation nodes remain in the IR and output tensors carry post-activation precision.
@@ -14,8 +13,8 @@ class FuseActivationCasts(ModelOptimizerPass):
     def __init__(self):
         self.name = 'fuse_activation_casts'
 
-    def transform(self, model):
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx):
+        ctx = get_backend_context(model_or_ctx)
         graph = ctx.ir.logical
         changed = False
 

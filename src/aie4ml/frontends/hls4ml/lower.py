@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Dict
 
 import numpy as np
@@ -20,7 +21,7 @@ from ...ir import (
     TraitInstance,
     ensure_backend_context,
 )
-from ...ir.context import AIEBackendContext, DeviceSpec
+from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
 from ...passes.utils import is_pointwise_dense
 from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
 
@@ -167,7 +168,7 @@ class LowerToAieIr(ModelOptimizerPass):
     def _create_context(self, model) -> AIEBackendContext:
         config = model.config
         aie_cfg = config.get_config_value('AIEConfig', {}) or {}
-        part_name = aie_cfg.get('Device') or aie_cfg.get('Part') or config.get_config_value('Part') or 'unknown_part'
+        part_name = aie_cfg.get('Part') or config.get_config_value('Part') or aie_cfg.get('Device') or 'unknown_part'
 
         catalog = load_device_catalog()
         device_entry = catalog.get(part_name, {}) or catalog.get(part_name.lower(), {})
@@ -187,7 +188,13 @@ class LowerToAieIr(ModelOptimizerPass):
             ),
         )
 
-        ctx = AIEBackendContext(device=device, policies=policies)
+        project_config = ProjectConfig(
+            output_dir=Path(config.get_output_dir()),
+            project_name=config.get_project_name(),
+            stamp=config.get_config_value('Stamp'),
+            custom_sources=dict(config.backend.get_custom_source()),
+        )
+        ctx = AIEBackendContext(device=device, policies=policies, project_config=project_config, aie_config=aie_cfg)
         self._register_default_traits(ctx)
         return ctx
 

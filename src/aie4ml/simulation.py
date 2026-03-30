@@ -25,9 +25,11 @@ def _is_float_c_type(c_type: str) -> bool:
 
 def read_aie_report(model_or_path: Union[object, str, Path]) -> Dict:
     model = None
-    if hasattr(model_or_path, 'config'):
+    if hasattr(model_or_path, '_aie_backend_context'):
         model = model_or_path
-        output_dir = Path(model.config.get_output_dir())
+        from .ir import get_backend_context
+
+        output_dir = get_backend_context(model).project_config.output_dir
     else:
         output_dir = Path(model_or_path)
     output_dir = output_dir.resolve()

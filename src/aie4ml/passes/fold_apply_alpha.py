@@ -4,13 +4,13 @@
 """Fold per-channel scale nodes into their predecessor Dense weight precision."""
 
 import numpy as np
-from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
 
 from ..aie_types import FloatIntent, QuantIntent
 from ..ir import get_backend_context
+from .base import AIEPass
 
 
-class FoldApplyAlpha(ModelOptimizerPass):
+class FoldApplyAlpha(AIEPass):
     """Fold output scale into a preceding Dense when legal.
 
     For applyalpha nodes with constant per-channel scale, this pass updates the
@@ -24,8 +24,8 @@ class FoldApplyAlpha(ModelOptimizerPass):
     def __init__(self):
         self.name = 'fold_apply_alpha'
 
-    def transform(self, model):
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx):
+        ctx = get_backend_context(model_or_ctx)
         graph = ctx.ir.logical
         changed = False
 

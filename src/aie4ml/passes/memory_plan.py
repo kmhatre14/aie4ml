@@ -6,9 +6,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
-
 from ..ir import OpNode, get_backend_context
+from .base import AIEPass
 from .utils import sanitize_identifier
 
 
@@ -40,34 +39,34 @@ class _EdgeEntry:
     shard_count: int = 1
 
 
-class BuildMemoryPlan(ModelOptimizerPass):
+class BuildMemoryPlan(AIEPass):
     def __init__(self):
         self.name = 'plan_memory'
 
-    def transform(self, model) -> bool:
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx) -> bool:
+        ctx = get_backend_context(model_or_ctx)
         ctx.ir.physical.plan = _CodegenPlanner(ctx).build(list(ctx.ir.logical))
         return True
 
 
-class CollectMemoryEntries(ModelOptimizerPass):
+class CollectMemoryEntries(AIEPass):
     def __init__(self):
         self.name = 'collect_memory_entries'
 
-    def transform(self, model) -> bool:
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx) -> bool:
+        ctx = get_backend_context(model_or_ctx)
         planner = _CodegenPlanner(ctx)
         state = planner.collect(list(ctx.ir.logical))
         ctx.ir.physical.plan = {'_memory_plan_state': state}
         return True
 
 
-class MaterializeMemoryPlan(ModelOptimizerPass):
+class MaterializeMemoryPlan(AIEPass):
     def __init__(self):
         self.name = 'materialize_memory_plan'
 
-    def transform(self, model) -> bool:
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx) -> bool:
+        ctx = get_backend_context(model_or_ctx)
         planner = _CodegenPlanner(ctx)
         state = ctx.ir.physical.plan['_memory_plan_state']
         ctx.ir.physical.plan = planner.materialize(state)

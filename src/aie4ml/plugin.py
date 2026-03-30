@@ -6,8 +6,8 @@ from typing import Callable
 
 from hls4ml.backends.backend import Backend
 
-from .aie_backend import AIEBackend
-from .writer import AIEWriter
+from .frontends.hls4ml.backend import AIEBackend
+from .frontends.hls4ml.writer import AIEWriter
 
 
 def register(

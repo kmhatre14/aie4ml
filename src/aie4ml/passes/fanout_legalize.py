@@ -2,17 +2,16 @@ from __future__ import annotations
 
 import copy
 
-from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
-
 from ..ir import get_backend_context
+from .base import AIEPass
 
 
-class LegalizeFanoutEntries(ModelOptimizerPass):
+class LegalizeFanoutEntries(AIEPass):
     def __init__(self):
         self.name = 'legalize_fanout_entries'
 
-    def transform(self, model) -> bool:
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx) -> bool:
+        ctx = get_backend_context(model_or_ctx)
         state = ctx.ir.physical.plan['_memory_plan_state']
         entries = state['entries']
 

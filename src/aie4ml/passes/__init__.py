@@ -1,6 +1,6 @@
 """Optimizer passes specific to the AIE backend."""
 
-from ..frontends.hls4ml.lower import LowerToAieIr
+from .base import AIEPass, run_aie_passes
 from .compact_buffer_rank import CompactBufferRank
 from .fanout_legalize import LegalizeFanoutEntries
 from .fold_apply_alpha import FoldApplyAlpha
@@ -14,7 +14,8 @@ from .placement import PlaceKernels
 from .resolve import Resolve
 
 __all__ = [
-    'LowerToAieIr',
+    'AIEPass',
+    'run_aie_passes',
     'FuseActivationCasts',
     'FoldApplyAlpha',
     'ForceFloatMode',
