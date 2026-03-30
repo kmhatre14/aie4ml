@@ -1,43 +1,120 @@
 # Copyright 2025 D. Danopoulos, aie4ml
 # SPDX-License-Identifier: Apache-2.0
 
-"""Graph placement helpers for the AIE backend."""
+"""Graph-aware kernel placement for the AIE backend."""
 
 from __future__ import annotations
 
 import logging
-import math
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-
-from hls4ml.model.optimizer.optimizer import ModelOptimizerPass
+from dataclasses import dataclass, field
+from itertools import permutations
+from statistics import median
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from ..ir import get_backend_context
-from ..op_impls import OpImplFootprint, OpImplPlacementContext
+from ..op_impls import OpImplPlacementContext
+from .base import AIEPass
 
 log = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Geometry model
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PortFace:
+    """
+    One port-bearing face of a rectangular kernel footprint.
+
+    side:
+      - 'left'
+      - 'right'
+      - 'top'
+      - 'bottom'
+
+    start/end are inclusive offsets along that face:
+      - left/right  -> row offsets [0 .. h-1]
+      - top/bottom  -> col offsets [0 .. w-1]
+    """
+
+    side: str
+    start: int
+    end: int
+
+
 @dataclass
 class Rect:
-    """Rectangular footprint of a node on the AIE grid."""
+    """Concrete rectangular footprint and placement metadata."""
 
     w: int
     h: int
-    in_col_off: int
-    in_row_off: int
-    out_col_off: int
-    out_row_off: int
+
+    input_face: PortFace
+    output_face: PortFace
+
+    keepout_left: int = 0
+    keepout_right: int = 0
+    keepout_top: int = 0
+    keepout_bottom: int = 0
+
+    extras: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
-class NodeAdapter:
-    """Thin adapter around an IR node for placement."""
+class NodeSpec:
+    """Placement-facing adapter for one kernel node."""
 
     node: Any
     name: str
+    index: int
     rect: Rect
-    anchor: Optional[Tuple[int, int]] = None  # local (x,y) if fixed
+    anchor: Optional[Tuple[int, int]] = None  # local device coordinates
+    x_range: Optional[Tuple[int, int]] = None
+    y_range: Optional[Tuple[int, int]] = None
+
+
+@dataclass(frozen=True)
+class EdgeSpec:
+    """One logical tensor edge between two kernel nodes."""
+
+    src: str
+    dst: str
+    tensor: Optional[str] = None
+
+
+@dataclass
+class GraphSpec:
+    """Kernel-only placement DAG."""
+
+    order: List[str]
+    specs: Dict[str, NodeSpec]
+    edges: List[EdgeSpec]
+    preds: Dict[str, List[str]]
+    succs: Dict[str, List[str]]
+
+
+@dataclass(frozen=True)
+class BranchBand:
+    child: str
+    names: Tuple[str, ...]
+    top_pad: int
+    bottom_pad: int
+    inner_height: int
+
+
+@dataclass(frozen=True)
+class PlacementHeuristics:
+    """
+    Search-order heuristics only.
+
+    These do not change legality or the final objective; they only bias the
+    order in which candidates are explored.
+    """
+
+    low_row_weight: float = 0.05
+    rightward_progress_weight: float = 0.25
 
 
 @dataclass
@@ -49,400 +126,1110 @@ class Placed:
     y: int
     rect: Rect
 
-    @property
-    def in_abs(self) -> Tuple[int, int]:
-        return (self.x + self.rect.in_col_off, self.y + self.rect.in_row_off)
 
-    @property
-    def out_abs(self) -> Tuple[int, int]:
-        return (self.x + self.rect.out_col_off, self.y + self.rect.out_row_off)
+class PlacementInfeasibleError(RuntimeError):
+    """Raised when no legal placement exists within the current search domain."""
 
 
 # ---------------------------------------------------------------------------
-# Geometry helpers
+# Generic helpers
 # ---------------------------------------------------------------------------
 
 
-def _rects_conflict(candidate: Placed, existing: Placed) -> bool:
+def _interval_distance(a0: float, a1: float, b0: float, b1: float) -> float:
+    """Distance between two closed 1D intervals."""
+    if a1 < b0:
+        return b0 - a1
+    if b1 < a0:
+        return a0 - b1
+    return 0.0
+
+
+def _edge_end_name(endpoint: Any) -> Optional[str]:
+    if endpoint is None:
+        return None
+    if hasattr(endpoint, 'name'):
+        return str(endpoint.name)
+    return str(endpoint)
+
+
+# ---------------------------------------------------------------------------
+# Footprint parsing
+# ---------------------------------------------------------------------------
+
+
+def _parse_face(
+    raw: Optional[Dict[str, Any]],
+    *,
+    default_side: str,
+    w: int,
+    h: int,
+) -> PortFace:
+    side = str((raw or {}).get('side', default_side))
+    if side not in ('left', 'right', 'top', 'bottom'):
+        raise ValueError(f'Invalid face side: {side!r}')
+
+    limit = h if side in ('left', 'right') else w
+    start = int((raw or {}).get('start', 0))
+    end = int((raw or {}).get('end', limit - 1))
+
+    if start < 0 or end < start or end >= limit:
+        raise ValueError(f'Invalid face span ({start}, {end}) for side={side!r} with limit={limit}.')
+
+    return PortFace(side=side, start=start, end=end)
+
+
+def _coerce_rect(footprint: Any) -> Rect:
     """
-    Check whether 'candidate' (with a one-column left margin) conflicts with 'existing'.
+    Convert a kernel variant footprint object into a Rect.
 
-    Margin: [x-1, x+w-1] × [y, y+h-1], clipped at column 0.
-    Existing: normal [x, x+w-1] × [y, y+h-1].
-    Constraint for dense layer placement to avoid memory bank conflicts.
+    Required footprint contract:
+      footprint.width
+      footprint.height
+
+    Optional footprint.extras keys:
+      input_face:  {"side": ..., "start": ..., "end": ...}
+      output_face: {"side": ..., "start": ..., "end": ...}
+      input_side:  "left" | "right" | "top" | "bottom"
+      output_side: "left" | "right" | "top" | "bottom"
+      keepout_left / keepout_right / keepout_top / keepout_bottom
     """
-    ax0 = max(0, candidate.x - 1)
-    ax1 = candidate.x + candidate.rect.w - 1
-    ay0 = candidate.y
-    ay1 = candidate.y + candidate.rect.h - 1
+    w = int(getattr(footprint, 'width'))
+    h = int(getattr(footprint, 'height'))
+    extras = dict(getattr(footprint, 'extras', {}) or {})
 
-    bx0 = existing.x
-    bx1 = existing.x + existing.rect.w - 1
-    by0 = existing.y
-    by1 = existing.y + existing.rect.h - 1
+    input_face = _parse_face(
+        extras.get('input_face'),
+        default_side=str(extras.get('input_side', 'left')),
+        w=w,
+        h=h,
+    )
+    output_face = _parse_face(
+        extras.get('output_face'),
+        default_side=str(extras.get('output_side', 'right')),
+        w=w,
+        h=h,
+    )
 
+    # Preserve the old dense-like bank-conflict spacing by default.
+    default_keepout_left = 1 if input_face.side == 'left' else 0
+
+    return Rect(
+        w=w,
+        h=h,
+        input_face=input_face,
+        output_face=output_face,
+        keepout_left=int(extras.get('keepout_left', default_keepout_left)),
+        keepout_right=int(extras.get('keepout_right', 0)),
+        keepout_top=int(extras.get('keepout_top', 0)),
+        keepout_bottom=int(extras.get('keepout_bottom', 0)),
+        extras=extras,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Geometry
+# ---------------------------------------------------------------------------
+
+
+def _face_local_center(rect: Rect, face: PortFace) -> Tuple[float, float]:
+    """Local center point of a face span."""
+    mid = 0.5 * (face.start + face.end)
+
+    if face.side == 'left':
+        return (0.0, mid)
+    if face.side == 'right':
+        return (float(rect.w - 1), mid)
+    if face.side == 'top':
+        return (mid, 0.0)
+    if face.side == 'bottom':
+        return (mid, float(rect.h - 1))
+
+    raise ValueError(f'Unsupported face side: {face.side!r}')
+
+
+def _face_abs_center(placed: Placed, face: PortFace) -> Tuple[float, float]:
+    lx, ly = _face_local_center(placed.rect, face)
+    return (placed.x + lx, placed.y + ly)
+
+
+def _face_abs_box(placed: Placed, face: PortFace) -> Tuple[float, float, float, float]:
+    """
+    Return the absolute axis-aligned span of a face as:
+      (x0, x1, y0, y1)
+
+    A vertical face has x0 == x1 and a y-interval.
+    A horizontal face has y0 == y1 and an x-interval.
+    """
+    x = placed.x
+    y = placed.y
+    w = placed.rect.w
+    h = placed.rect.h
+
+    if face.side == 'left':
+        return (x, x, y + face.start, y + face.end)
+    if face.side == 'right':
+        xr = x + w - 1
+        return (xr, xr, y + face.start, y + face.end)
+    if face.side == 'top':
+        return (x + face.start, x + face.end, y, y)
+    if face.side == 'bottom':
+        yb = y + h - 1
+        return (x + face.start, x + face.end, yb, yb)
+
+    raise ValueError(f'Unsupported face side: {face.side!r}')
+
+
+def _face_cost(
+    a_box: Tuple[float, float, float, float],
+    b_box: Tuple[float, float, float, float],
+    lam: float,
+) -> float:
+    """Minimum weighted Manhattan distance between two face boxes."""
+    ax0, ax1, ay0, ay1 = a_box
+    bx0, bx1, by0, by1 = b_box
+    dx = _interval_distance(ax0, ax1, bx0, bx1)
+    dy = _interval_distance(ay0, ay1, by0, by1)
+    return dx + lam * dy
+
+
+def _edge_cost_between_placements(src: Placed, dst: Placed, lam: float) -> float:
+    return _face_cost(
+        _face_abs_box(src, src.rect.output_face),
+        _face_abs_box(dst, dst.rect.input_face),
+        lam,
+    )
+
+
+def _expanded_box(placed: Placed) -> Tuple[int, int, int, int]:
+    """
+    Occupancy plus keepout margins.
+
+    Low-side keepouts are clipped at zero so placement at col/row 0 remains legal.
+    """
+    r = placed.rect
+    return (
+        max(0, placed.x - r.keepout_left),
+        placed.x + r.w - 1 + r.keepout_right,
+        max(0, placed.y - r.keepout_top),
+        placed.y + r.h - 1 + r.keepout_bottom,
+    )
+
+
+def _rects_conflict(a: Placed, b: Placed) -> bool:
+    ax0, ax1, ay0, ay1 = _expanded_box(a)
+    bx0, bx1, by0, by1 = _expanded_box(b)
     return not (ax1 < bx0 or bx1 < ax0 or ay1 < by0 or by1 < ay0)
 
 
 def _in_bounds(p: Placed, W: int, H: int) -> bool:
-    if p.x < 0 or p.y < 0:
-        return False
-    if p.x + p.rect.w > W:
-        return False
-    if p.y + p.rect.h > H:
-        return False
-
-    r = p.rect
-    # pin offsets must lie inside rect
-    return 0 <= r.in_col_off < r.w and 0 <= r.out_col_off < r.w and 0 <= r.in_row_off < r.h and 0 <= r.out_row_off < r.h
+    return p.x >= 0 and p.y >= 0 and p.x + p.rect.w <= W and p.y + p.rect.h <= H
 
 
-def _feasible(p: Placed, partial: List[Placed], W: int, H: int) -> bool:
+def _feasible(p: Placed, placed: Dict[str, Placed], W: int, H: int) -> bool:
     if not _in_bounds(p, W, H):
         return False
-    return all(not _rects_conflict(p, q) for q in partial)
+    return all(not _rects_conflict(p, q) for q in placed.values())
 
 
-# ---------------------------------------------------------------------------
-# Cost model (chain)
-# ---------------------------------------------------------------------------
-
-
-def _placement_cost_chain(placed: List[Placed], lam: float, mu: float) -> float:
+def _possible_face_domain(
+    spec: NodeSpec,
+    face: PortFace,
+    W: int,
+    H: int,
+) -> Tuple[float, float, float, float]:
     """
-    Total cost for the placed chain so far.
+    Bounding box of the union of all possible absolute face positions for `spec`.
 
-    - horizontal: sum |c_out - c_in|
-    - vertical:   sum |r_out - r_in|
-    - bias:       mu * sum(top_row_y)
-
-    Note: local coordinates are used (0..H-1).
+    This intentionally ignores occupancy conflicts and uses only bounds/anchors.
+    That makes it an admissible lower-bound domain for cut-edge estimates.
     """
-    horiz = 0.0
-    vert = 0.0
-    sum_rows = 0.0
+    rect = spec.rect
 
-    for i in range(len(placed) - 1):
-        c_out, r_out = placed[i].out_abs
-        c_in, r_in = placed[i + 1].in_abs
-        horiz += abs(c_out - c_in)
-        # TODO for direct connections we must use both vertical costs
-        # vert  += abs(r_out - r_in)
-        vert += abs(r_in - 0)
+    if spec.anchor is not None:
+        ax, ay = spec.anchor
+        return _face_abs_box(Placed(spec.name, ax, ay, rect), face)
 
-    for p in placed:
-        sum_rows += p.y
+    max_x = W - rect.w
+    max_y = H - rect.h
+    if max_x < 0 or max_y < 0:
+        raise RuntimeError(f'Node {spec.name} footprint ({rect.w}x{rect.h}) does not fit device ({W}x{H}).')
 
-    return horiz + lam * vert + mu * sum_rows
+    min_x = 0 if spec.x_range is None else spec.x_range[0]
+    max_x = max_x if spec.x_range is None else spec.x_range[1]
+    min_y = 0 if spec.y_range is None else spec.y_range[0]
+    max_y = max_y if spec.y_range is None else spec.y_range[1]
+    if max_x < min_x or max_y < min_y:
+        raise RuntimeError(f'Node {spec.name} has no legal placement domain within device ({W}x{H}).')
+
+    if face.side == 'left':
+        return (float(min_x), float(max_x), float(min_y + face.start), float(max_y + face.end))
+    if face.side == 'right':
+        return (
+            float(min_x + rect.w - 1),
+            float(max_x + rect.w - 1),
+            float(min_y + face.start),
+            float(max_y + face.end),
+        )
+    if face.side == 'top':
+        return (float(min_x + face.start), float(max_x + face.end), float(min_y), float(max_y))
+    if face.side == 'bottom':
+        return (
+            float(min_x + face.start),
+            float(max_x + face.end),
+            float(min_y + rect.h - 1),
+            float(max_y + rect.h - 1),
+        )
+
+    raise ValueError(f'Unsupported face side: {face.side!r}')
 
 
 # ---------------------------------------------------------------------------
-# Branch-and-bound placement
+# Graph helpers
 # ---------------------------------------------------------------------------
 
 
-def _bnb_place_chain(
-    chain: List[NodeAdapter],
+def _derive_edges_from_tensors(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
+    """
+    Reconstruct kernel edges from tensor producers/consumers if logical_edges is
+    unavailable on the IR object.
+    """
+    kernel_set = set(kernel_names)
+    producer_of: Dict[str, str] = {}
+
+    for node in ctx.ir.logical:
+        if node.name not in kernel_set:
+            continue
+        for tensor in getattr(node, 'outputs', []) or []:
+            producer_of[str(tensor)] = node.name
+
+    edges: List[EdgeSpec] = []
+    seen = set()
+
+    for node in ctx.ir.logical:
+        if node.name not in kernel_set:
+            continue
+        for tensor in getattr(node, 'inputs', []) or []:
+            src = producer_of.get(str(tensor))
+            if src is None or src == node.name:
+                continue
+            key = (src, node.name, str(tensor))
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append(EdgeSpec(src=src, dst=node.name, tensor=str(tensor)))
+
+    return edges
+
+
+def _topological_order(
+    names: Sequence[str],
+    edges: Sequence[EdgeSpec],
+    stable_index: Dict[str, int],
+) -> List[str]:
+    indeg = {n: 0 for n in names}
+    succs: Dict[str, List[str]] = {n: [] for n in names}
+
+    for e in edges:
+        if e.src in indeg and e.dst in indeg:
+            indeg[e.dst] += 1
+            succs[e.src].append(e.dst)
+
+    ready = sorted([n for n, d in indeg.items() if d == 0], key=lambda n: stable_index[n])
+    order: List[str] = []
+
+    while ready:
+        n = ready.pop(0)
+        order.append(n)
+        for m in sorted(succs[n], key=lambda x: stable_index[x]):
+            indeg[m] -= 1
+            if indeg[m] == 0:
+                ready.append(m)
+                ready.sort(key=lambda x: stable_index[x])
+
+    # If a cycle somehow slips in, keep the original stable order instead of
+    # pretending we found a topological order.
+    if len(order) != len(names):
+        return sorted(list(names), key=lambda n: stable_index[n])
+
+    return order
+
+
+def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
+    specs: Dict[str, NodeSpec] = {}
+    stable_index: Dict[str, int] = {}
+
+    for idx, node in enumerate(ctx.ir.logical):
+        inst = ctx.ir.execution.get(node.name)
+        if inst is None:
+            continue
+
+        placement_ctx = OpImplPlacementContext(
+            node=node,
+            metadata=node.metadata,
+            config=inst.config,
+        )
+        footprint = inst.variant.footprint(placement_ctx)
+        if footprint is None:
+            raise RuntimeError(f'{node.name}: kernel variant did not provide a footprint.')
+
+        rect = _coerce_rect(footprint)
+
+        placement_hint = node.directives.get('placement', {})
+        anchor: Optional[Tuple[int, int]] = None
+        if placement_hint.get('col') is not None and placement_hint.get('row') is not None:
+            anchor = (
+                int(placement_hint['col']) - col_offset,
+                int(placement_hint['row']) - row_offset,
+            )
+
+        specs[node.name] = NodeSpec(
+            node=node,
+            name=node.name,
+            index=idx,
+            rect=rect,
+            anchor=anchor,
+        )
+        stable_index[node.name] = idx
+
+    if hasattr(ctx.ir, 'logical_edges'):
+        raw_edges = getattr(ctx.ir, 'logical_edges') or []
+        edges: List[EdgeSpec] = []
+        seen = set()
+
+        for edge in raw_edges:
+            src = _edge_end_name(getattr(edge, 'src', None))
+            dst = _edge_end_name(getattr(edge, 'dst', None))
+            if src not in specs or dst not in specs or src == dst:
+                continue
+
+            tensor = getattr(edge, 'tensor', None)
+            tensor_name = str(tensor) if tensor is not None else None
+            key = (src, dst, tensor_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            edges.append(EdgeSpec(src=src, dst=dst, tensor=tensor_name))
+    else:
+        edges = _derive_edges_from_tensors(ctx, list(specs))
+
+    preds = {name: [] for name in specs}
+    succs = {name: [] for name in specs}
+
+    for e in edges:
+        preds[e.dst].append(e.src)
+        succs[e.src].append(e.dst)
+
+    order = _topological_order(list(specs), edges, stable_index)
+
+    return GraphSpec(
+        order=order,
+        specs=specs,
+        edges=edges,
+        preds=preds,
+        succs=succs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Cost model and lower bound
+# ---------------------------------------------------------------------------
+
+
+def _edge_lower_bound(
+    edge: EdgeSpec,
+    graph: GraphSpec,
+    placed: Dict[str, Placed],
+    W: int,
+    H: int,
+    lam: float,
+) -> float:
+    """
+    Admissible lower bound for a single edge.
+
+    - both placed: exact edge cost
+    - one placed: min cost from exact placed face to the bounded domain of the
+      unplaced endpoint's face
+    - neither placed: 0
+    """
+    src_p = placed.get(edge.src)
+    dst_p = placed.get(edge.dst)
+
+    if src_p is not None and dst_p is not None:
+        return _edge_cost_between_placements(src_p, dst_p, lam)
+
+    if src_p is not None:
+        dst_spec = graph.specs[edge.dst]
+        return _face_cost(
+            _face_abs_box(src_p, src_p.rect.output_face),
+            _possible_face_domain(dst_spec, dst_spec.rect.input_face, W, H),
+            lam,
+        )
+
+    if dst_p is not None:
+        src_spec = graph.specs[edge.src]
+        return _face_cost(
+            _possible_face_domain(src_spec, src_spec.rect.output_face, W, H),
+            _face_abs_box(dst_p, dst_p.rect.input_face),
+            lam,
+        )
+
+    return 0.0
+
+
+def _lower_bound(
+    graph: GraphSpec,
+    placed: Dict[str, Placed],
     W: int,
     H: int,
     lam: float,
     mu: float,
-    col_window: int = 6,
-) -> List[Placed]:
-    """Place a linear chain of rectangles using branch-and-bound."""
+) -> float:
+    edge_cost = sum(_edge_lower_bound(e, graph, placed, W, H, lam) for e in graph.edges)
+    row_bias = sum(mu * p.y for p in placed.values())
+    return edge_cost + row_bias
 
-    if not chain:
-        return []
 
-    # First node: if it has an anchor, honor it; otherwise start at (0,0)
-    first_spec = chain[0]
-    start_x, start_y = first_spec.anchor if first_spec.anchor is not None else (0, 0)
-    first = Placed(first_spec.name, start_x, start_y, first_spec.rect)
-    if not _in_bounds(first, W, H):
-        raise ValueError(f'Placement anchor for {first_spec.name} is out of bounds.')
+def _full_cost(
+    graph: GraphSpec,
+    placed: Dict[str, Placed],
+    lam: float,
+    mu: float,
+) -> float:
+    edge_cost = sum(_edge_cost_between_placements(placed[e.src], placed[e.dst], lam) for e in graph.edges)
+    row_bias = sum(mu * p.y for p in placed.values())
+    return edge_cost + row_bias
 
-    best: List[Placed] = []
-    best_cost: float = math.inf
 
-    def optimistic_bound(partial: List[Placed]) -> float:
-        # Exact cost for the prefix, assuming zero cost for remaining nodes (admissible).
-        return _placement_cost_chain(partial, lam, mu)
+# ---------------------------------------------------------------------------
+# Search heuristics
+# ---------------------------------------------------------------------------
 
-    def candidate_positions(prev: Placed, rect: Rect) -> Iterable[Tuple[int, int]]:
-        """
-        Enumerate candidate (x,y) positions for 'rect', ordered by proximity in x
-        to the previous rect's end (ideal_x). We restrict x to a window around
-        ideal_x to keep branching under control.
-        """
-        ideal_x = prev.x + prev.rect.w  # just to the right of previous box
 
-        min_x = max(0, ideal_x - col_window)
-        max_x = min(W - rect.w, ideal_x + col_window)
-        if min_x > max_x:
-            # degenerate / tiny grid: fall back to full search
-            min_x, max_x = 0, W - rect.w
+def _placed_neighbor_count(graph: GraphSpec, name: str, placed_names: set[str]) -> int:
+    return sum(1 for n in graph.preds[name] + graph.succs[name] if n in placed_names)
 
+
+def _select_next_node(graph: GraphSpec, placed: Dict[str, Placed]) -> str:
+    """
+    Frontier-first branching:
+      1. maximize number of already-placed neighbors
+      2. maximize total degree
+      3. maximize area (larger boxes earlier tend to prune sooner)
+      4. stabilize with the original logical order
+    """
+    placed_names = set(placed)
+    candidates = [name for name in graph.order if name not in placed_names]
+
+    def key(name: str) -> Tuple[int, int, int, int]:
+        rect = graph.specs[name].rect
+        frontier = _placed_neighbor_count(graph, name, placed_names)
+        degree = len(graph.preds[name]) + len(graph.succs[name])
+        area = rect.w * rect.h
+        return (frontier, degree, area, -graph.specs[name].index)
+
+    return max(candidates, key=key)
+
+
+def _ideal_anchor_from_neighbors(
+    spec: NodeSpec,
+    graph: GraphSpec,
+    placed: Dict[str, Placed],
+) -> Tuple[float, float]:
+    """
+    Compute an ideal local (x,y) for the node anchor by projecting from already
+    placed neighbors onto this node's input/output faces and taking medians.
+    """
+    target_xs: List[float] = []
+    target_ys: List[float] = []
+
+    in_lx, in_ly = _face_local_center(spec.rect, spec.rect.input_face)
+    out_lx, out_ly = _face_local_center(spec.rect, spec.rect.output_face)
+
+    for pred in graph.preds[spec.name]:
+        pred_p = placed.get(pred)
+        if pred_p is None:
+            continue
+        px, py = _face_abs_center(pred_p, pred_p.rect.output_face)
+        target_xs.append(px - in_lx)
+        target_ys.append(py - in_ly)
+
+    for succ in graph.succs[spec.name]:
+        succ_p = placed.get(succ)
+        if succ_p is None:
+            continue
+        sx, sy = _face_abs_center(succ_p, succ_p.rect.input_face)
+        target_xs.append(sx - out_lx)
+        target_ys.append(sy - out_ly)
+
+    if not target_xs:
+        return (0.0, 0.0)
+
+    return (float(median(target_xs)), float(median(target_ys)))
+
+
+def _rightward_progress_penalty(
+    spec: NodeSpec,
+    graph: GraphSpec,
+    placed: Dict[str, Placed],
+    x: int,
+) -> float:
+    penalty = 0.0
+    for pred in graph.preds[spec.name]:
+        pred_p = placed.get(pred)
+        if pred_p is None:
+            continue
+        desired_x = pred_p.x + pred_p.rect.w
+        if x < desired_x:
+            penalty += desired_x - x
+    return penalty
+
+
+def _enumerate_candidate_positions(
+    spec: NodeSpec,
+    graph: GraphSpec,
+    placed: Dict[str, Placed],
+    W: int,
+    H: int,
+    candidate_limit: Optional[int],
+    heuristics: PlacementHeuristics,
+) -> Iterable[Tuple[int, int]]:
+    """
+    Enumerate candidate local placements for a node, ordered by proximity to the
+    median ideal location induced by placed neighbors.
+
+    candidate_limit:
+      - None: exact search over all in-bounds positions
+      - int : heuristic search over the top-N closest positions
+    """
+    if spec.anchor is not None:
+        yield spec.anchor
+        return
+
+    min_x = 0 if spec.x_range is None else spec.x_range[0]
+    max_x = (W - spec.rect.w) if spec.x_range is None else spec.x_range[1]
+    min_y = 0 if spec.y_range is None else spec.y_range[0]
+    max_y = (H - spec.rect.h) if spec.y_range is None else spec.y_range[1]
+    if max_x < 0 or max_y < 0:
+        return
+    if max_x < min_x or max_y < min_y:
+        return
+
+    ideal_x, ideal_y = _ideal_anchor_from_neighbors(spec, graph, placed)
+
+    # Exact mode: enumerate all legal coordinates, biased toward the ideal.
+    if candidate_limit is None:
         xs = list(range(min_x, max_x + 1))
-        xs.sort(key=lambda c: abs(c - ideal_x))
-
-        ys = range(0, H - rect.h + 1)
+        ys = list(range(min_y, max_y + 1))
+        xs.sort(key=lambda x: (abs(x - ideal_x), x))
+        ys.sort(key=lambda y: (abs(y - ideal_y), y))
         for y in ys:
             for x in xs:
-                yield x, y
+                yield (x, y)
+        return
 
-    def dfs(partial: List[Placed], idx: int) -> None:
-        nonlocal best, best_cost
+    # Heuristic mode: score the full domain and keep the best N.
+    scored: List[Tuple[float, int, int, int]] = []
+    for y in range(min_y, max_y + 1):
+        for x in range(min_x, max_x + 1):
+            score = abs(x - ideal_x) + abs(y - ideal_y)
+            score += heuristics.low_row_weight * y
+            score += heuristics.rightward_progress_weight * _rightward_progress_penalty(
+                spec,
+                graph,
+                placed,
+                x,
+            )
+            scored.append((score, y, -x, x))
+    scored.sort()
 
-        if idx == len(chain):
-            tot = _placement_cost_chain(partial, lam, mu)
-            if tot < best_cost:
-                best_cost = tot
-                best = partial.copy()
-            return
-
-        if optimistic_bound(partial) >= best_cost:
-            return
-
-        prev = partial[-1]
-        spec = chain[idx]
-
-        # If this node has a fixed anchor, try only that.
-        if spec.anchor is not None:
-            ax, ay = spec.anchor
-            cand = Placed(spec.name, ax, ay, spec.rect)
-            if _feasible(cand, partial, W, H):
-                partial.append(cand)
-                dfs(partial, idx + 1)
-                partial.pop()
-            return
-
-        for x, y in candidate_positions(prev, spec.rect):
-            cand = Placed(spec.name, x, y, spec.rect)
-            if not _feasible(cand, partial, W, H):
-                continue
-            partial.append(cand)
-            dfs(partial, idx + 1)
-            partial.pop()
-
-    # Optional: seed with a greedy solution to tighten pruning
-    # best: List[Placed] = []
-    # best_cost: float = math.inf
-    seed = _greedy_right_first(chain, W, H)
-    if seed:
-        best = seed
-        best_cost = _placement_cost_chain(seed, lam, mu)
-
-    dfs([first], 1)
-
-    if not best:
-        raise RuntimeError('No feasible placement found for the given chain and grid.')
-
-    return best
+    for _, y, _, x in scored[:candidate_limit]:
+        yield (x, y)
 
 
-def _greedy_right_first(chain: List[NodeAdapter], W: int, H: int) -> List[Placed]:
-    """Simple greedy heuristic: place each rect to the right, then first-fit."""
-    if not chain:
-        return []
+def _validate_and_preplace_anchors(
+    graph: GraphSpec,
+    W: int,
+    H: int,
+) -> Dict[str, Placed]:
+    """
+    Validate all fixed anchors and pre-place them before the search starts.
+    """
+    placed: Dict[str, Placed] = {}
 
-    g0 = chain[0]
-    x0, y0 = g0.anchor if g0.anchor is not None else (0, 0)
-    placed: List[Placed] = []
-    cur = Placed(g0.name, x0, y0, g0.rect)
-    if not _in_bounds(cur, W, H):
-        return []
-    placed.append(cur)
-
-    for spec in chain[1:]:
-        # prefer right of previous
-        prev = placed[-1]
-        try_x = prev.x + prev.rect.w
-        try_y = prev.y
-        cand = Placed(spec.name, try_x, try_y, spec.rect)
-        if _feasible(cand, placed, W, H):
-            placed.append(cand)
+    for name in graph.order:
+        spec = graph.specs[name]
+        if spec.anchor is None:
             continue
 
-        # fallback scan
-        found = False
-        for y in range(0, H - spec.rect.h + 1):
-            for x in range(0, W - spec.rect.w + 1):
-                cand = Placed(spec.name, x, y, spec.rect)
-                if _feasible(cand, placed, W, H):
-                    placed.append(cand)
-                    found = True
-                    break
-            if found:
-                break
-
-        if not found:
-            return []
+        p = Placed(name=name, x=spec.anchor[0], y=spec.anchor[1], rect=spec.rect)
+        if not _feasible(p, placed, W, H):
+            raise ValueError(f'Invalid fixed anchor for {name}: out of bounds or conflicts with another anchor.')
+        placed[name] = p
 
     return placed
 
 
-class PlaceKernels(ModelOptimizerPass):
-    """
-    Assign tile coordinates to rectangular compute layers
-    using a branch-and-bound placement algorithm.
+def _subgraph(
+    graph: GraphSpec,
+    names: Sequence[str],
+    spec_overrides: Optional[Dict[str, NodeSpec]] = None,
+) -> GraphSpec:
+    selected = set(names)
+    specs = {
+        name: (spec_overrides[name] if spec_overrides and name in spec_overrides else graph.specs[name])
+        for name in graph.order
+        if name in selected
+    }
+    edges = [e for e in graph.edges if e.src in selected and e.dst in selected]
+    preds = {name: [] for name in specs}
+    succs = {name: [] for name in specs}
+    for e in edges:
+        preds[e.dst].append(e.src)
+        succs[e.src].append(e.dst)
+    order = [name for name in graph.order if name in selected]
+    return GraphSpec(order=order, specs=specs, edges=edges, preds=preds, succs=succs)
 
-    - Uses config.parameters.parallelism.cas_length as width and
-      config.parameters.parallelism.cas_num as height.
-    - Honors user placement hints from node.directives['placement'] (col, row):
-      for the first dense layer this becomes the anchor; later layers
-      can also be forced to a fixed tile.
+
+def _collect_descendants(graph: GraphSpec, root: str) -> set[str]:
+    pending = [root]
+    out: set[str] = set()
+    while pending:
+        name = pending.pop()
+        if name in out:
+            continue
+        out.add(name)
+        pending.extend(graph.succs[name])
+    return out
+
+
+def _detect_disjoint_fanout(
+    graph: GraphSpec,
+) -> Optional[Tuple[str, Dict[str, Tuple[str, ...]]]]:
+    all_names = set(graph.specs)
+
+    for root in graph.order:
+        children = list(graph.succs[root])
+        if len(children) <= 1 or graph.preds[root]:
+            continue
+
+        branch_sets: Dict[str, set[str]] = {}
+        union: set[str] = set()
+        valid = True
+
+        for child in children:
+            branch = _collect_descendants(graph, child)
+            if union & branch:
+                valid = False
+                break
+            union |= branch
+            branch_sets[child] = branch
+
+        if not valid or union | {root} != all_names:
+            continue
+
+        for child, branch in branch_sets.items():
+            for name in branch:
+                if graph.specs[name].anchor is not None:
+                    valid = False
+                    break
+                allowed_preds = set(branch)
+                if name == child:
+                    allowed_preds.add(root)
+                if any(pred not in allowed_preds for pred in graph.preds[name]):
+                    valid = False
+                    break
+                if any(succ not in branch for succ in graph.succs[name]):
+                    valid = False
+                    break
+            if not valid:
+                break
+
+        if valid:
+            branches = {child: tuple(name for name in graph.order if name in branch_sets[child]) for child in children}
+            return root, branches
+
+    return None
+
+
+def _branch_band(graph: GraphSpec, names: Sequence[str], child: str) -> BranchBand:
+    rects = [graph.specs[name].rect for name in names]
+    return BranchBand(
+        child=child,
+        names=tuple(names),
+        top_pad=max(rect.keepout_top for rect in rects),
+        bottom_pad=max(rect.keepout_bottom for rect in rects),
+        inner_height=max(rect.h for rect in rects),
+    )
+
+
+def _assign_branch_bands(
+    graph: GraphSpec,
+    branches: Dict[str, Tuple[str, ...]],
+    order: Sequence[str],
+    start_row: int,
+    H: int,
+) -> Optional[Dict[str, Tuple[int, int, int]]]:
+    """
+    Pack branch bands tightly above the shared fanout root.
+
+    The goal is to keep compute close to row 0 / memtile-facing rows and avoid
+    spare vertical room that would encourage unnecessary vertical chains.
+    """
+    bands = {child: _branch_band(graph, names, child) for child, names in branches.items()}
+    base_heights = {child: band.top_pad + band.inner_height + band.bottom_pad for child, band in bands.items()}
+    required = sum(base_heights.values())
+    if start_row + required > H:
+        return None
+
+    band_rows: Dict[str, Tuple[int, int, int]] = {}
+    current_top = start_row
+    for child in order:
+        band = bands[child]
+        band_height = base_heights[child]
+        band_top = current_top
+        inner_top = band_top + band.top_pad
+        inner_height = band.inner_height
+        band_rows[child] = (inner_top, inner_height, band_top)
+        current_top = band_top + band_height
+
+    return band_rows
+
+
+# ---------------------------------------------------------------------------
+# Branch-and-bound search
+# ---------------------------------------------------------------------------
+
+
+def _bnb_place_graph(
+    graph: GraphSpec,
+    W: int,
+    H: int,
+    lam: float,
+    mu: float,
+    candidate_limit: Optional[int],
+    heuristics: PlacementHeuristics,
+    max_states: Optional[int],
+) -> Dict[str, Placed]:
+    """
+    BnB placement over the kernel DAG.
+
+    Nodes are selected frontier-first (most placed neighbors) and candidates
+    are ordered by proximity to the median ideal position from placed neighbors.
+    The first complete path through the DFS tree acts as the initial incumbent,
+    after which cost pruning fires. Backtracking handles infeasibility.
+
+    Exact search when candidate_limit=None (exponential on large grids).
+    Heuristic bounded search when candidate_limit is an int (recommended: 32).
+    """
+    if mu < 0:
+        raise ValueError('mu must be non-negative for the lower bound to remain admissible.')
+
+    preplaced = _validate_and_preplace_anchors(graph, W, H)
+
+    best_cost = float('inf')
+    best: Dict[str, Placed] = {}
+    states_visited = 0
+    budget_exhausted = False
+
+    def dfs(placed: Dict[str, Placed]) -> None:
+        nonlocal best, best_cost, states_visited, budget_exhausted
+
+        if budget_exhausted:
+            return
+        states_visited += 1
+        if max_states is not None and states_visited > max_states:
+            budget_exhausted = True
+            return
+
+        lb = _lower_bound(graph, placed, W, H, lam, mu)
+        if lb >= best_cost:
+            return
+
+        if len(placed) == len(graph.specs):
+            total = _full_cost(graph, placed, lam, mu)
+            if total < best_cost:
+                best_cost = total
+                best = dict(placed)
+            return
+
+        name = _select_next_node(graph, placed)
+        spec = graph.specs[name]
+
+        for x, y in _enumerate_candidate_positions(
+            spec,
+            graph,
+            placed,
+            W,
+            H,
+            candidate_limit,
+            heuristics,
+        ):
+            cand = Placed(name=name, x=x, y=y, rect=spec.rect)
+            if not _feasible(cand, placed, W, H):
+                continue
+
+            placed[name] = cand
+            dfs(placed)
+            del placed[name]
+
+    dfs(dict(preplaced))
+
+    if len(best) != len(graph.specs):
+        if budget_exhausted:
+            raise PlacementInfeasibleError(f'No feasible placement found within search budget ({max_states} states).')
+        raise PlacementInfeasibleError('No feasible placement found for the given graph and device.')
+
+    return best
+
+
+def _place_graph_with_fallback(
+    graph: GraphSpec,
+    W: int,
+    H: int,
+    lam: float,
+    mu: float,
+    candidate_limit: Optional[int],
+    heuristics: PlacementHeuristics,
+    max_states: Optional[int],
+) -> Dict[str, Placed]:
+    if candidate_limit is None:
+        return _bnb_place_graph(graph, W, H, lam, mu, None, heuristics, max_states)
+
+    try:
+        return _bnb_place_graph(graph, W, H, lam, mu, candidate_limit, heuristics, max_states)
+    except PlacementInfeasibleError:
+        log.warning(
+            'AIE placement: bounded search (candidate_limit=%d) found no feasible placement; '
+            'retrying with exact search.',
+            candidate_limit,
+        )
+        return _bnb_place_graph(graph, W, H, lam, mu, None, heuristics, max_states)
+
+
+def _place_disjoint_fanout(
+    graph: GraphSpec,
+    W: int,
+    H: int,
+    lam: float,
+    mu: float,
+    candidate_limit: Optional[int],
+    heuristics: PlacementHeuristics,
+    max_states: Optional[int],
+) -> Optional[Dict[str, Placed]]:
+    """
+    Fast path for strict disjoint fanout trees.
+
+    Known limitation: branch bands are allocated only below the shared root.
+    This matches the common case where the root is already placed near row 0,
+    but it intentionally leaves rows above the root unused.
+    """
+    detected = _detect_disjoint_fanout(graph)
+    if detected is None:
+        log.debug('AIE placement: disjoint-fanout fast path not applicable.')
+        return None
+
+    root, branches = detected
+    if len(branches) > 4:
+        log.debug(
+            'AIE placement: disjoint-fanout fast path skipped for root %s with %d branches.',
+            root,
+            len(branches),
+        )
+        return None
+
+    root_graph = _subgraph(graph, [root])
+    root_placed = _place_graph_with_fallback(root_graph, W, H, lam, mu, candidate_limit, heuristics, max_states)
+    root_pos = root_placed[root]
+    start_row = _expanded_box(root_pos)[3] + 1
+    if start_row >= H:
+        log.debug(
+            """AIE placement: disjoint-fanout fast path skipped for root %s
+                because branches would start at row %d outside device height %d.""",
+            root,
+            start_row,
+            H,
+        )
+        return None
+
+    log.debug(
+        'AIE placement: using disjoint-fanout fast path for root %s with %d branches.',
+        root,
+        len(branches),
+    )
+
+    branch_children = list(branches)
+    placement_orders = list(permutations(branch_children))
+
+    for order in placement_orders:
+        band_rows = _assign_branch_bands(graph, branches, order, start_row, H)
+        if band_rows is None:
+            continue
+
+        placed = dict(root_placed)
+        valid = True
+
+        for child in order:
+            inner_top, inner_height, _ = band_rows[child]
+            specs: Dict[str, NodeSpec] = {}
+            for name in [root, *branches[child]]:
+                spec = graph.specs[name]
+                if name == root:
+                    specs[name] = NodeSpec(
+                        node=spec.node,
+                        name=spec.name,
+                        index=spec.index,
+                        rect=spec.rect,
+                        anchor=(root_pos.x, root_pos.y),
+                    )
+                    continue
+
+                max_y = inner_top + inner_height - spec.rect.h
+                if max_y < inner_top:
+                    valid = False
+                    break
+                specs[name] = NodeSpec(
+                    node=spec.node,
+                    name=spec.name,
+                    index=spec.index,
+                    rect=spec.rect,
+                    x_range=spec.x_range,
+                    y_range=(inner_top, max_y),
+                )
+
+            if not valid:
+                break
+
+            sub_graph = _subgraph(graph, [root, *branches[child]], spec_overrides=specs)
+
+            try:
+                branch_placed = _place_graph_with_fallback(
+                    sub_graph,
+                    W,
+                    H,
+                    lam,
+                    mu,
+                    candidate_limit,
+                    heuristics,
+                    max_states,
+                )
+            except PlacementInfeasibleError:
+                valid = False
+                break
+
+            for name, pos in branch_placed.items():
+                if name != root:
+                    placed[name] = pos
+
+        if valid and len(placed) == len(graph.specs):
+            return placed
+
+    log.debug('AIE placement: disjoint-fanout fast path failed; falling back to global placement.')
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Pass
+# ---------------------------------------------------------------------------
+
+
+class PlaceKernels(AIEPass):
+    """
+    Graph-aware AIE kernel placement.
+
+    Parameters
+    ----------
+    lam:
+        Weight on vertical edge distance in the objective:
+          |Δcol| + lam * |Δrow|
+
+    mu:
+        Row-bias weight in the objective:
+          + mu * Σ(node.row)
+
+    candidate_limit:
+        Maximum number of candidate positions tried per node in the BnB search,
+        ordered by proximity to the ideal position from placed neighbors.
+        - int (default 64): heuristic bounded search; fast for any model size.
+          If it finds no feasible placement, the placer retries with exact
+          search before failing.
+        - None: exact search over all in-bounds positions — only feasible on
+          very small grids (e.g. W*H < 30); exponential on typical AIE arrays.
+
+    max_states:
+        Maximum DFS states explored per placement solve. If the budget is
+        exhausted, the best complete placement found so far is returned; if no
+        complete placement was found, placement fails hard.
+
+    low_row_weight / rightward_progress_weight:
+        Search-order heuristics only. They bias candidate exploration toward
+        lower rows and left-to-right growth without changing legality or the
+        final placement objective.
     """
 
-    def __init__(self, lam: float = 1.0, mu: float = 0.05, col_window: int = 6):
+    def __init__(
+        self,
+        lam: float = 1.0,
+        mu: float = 0.05,
+        candidate_limit: Optional[int] = 64,
+        max_states: Optional[int] = 5000,
+        low_row_weight: float = 0.05,
+        rightward_progress_weight: float = 0.25,
+    ):
         self.name = 'place_kernels'
         self._lam = float(lam)
         self._mu = float(mu)
-        self._col_window = int(col_window)
+        self._candidate_limit = candidate_limit
+        self._max_states = max_states
+        self._heuristics = PlacementHeuristics(
+            low_row_weight=float(low_row_weight),
+            rightward_progress_weight=float(rightward_progress_weight),
+        )
 
-    def transform(self, model) -> bool:
-        ctx = get_backend_context(model)
+    def transform(self, model_or_ctx) -> bool:
+        ctx = get_backend_context(model_or_ctx)
         device = ctx.device
 
-        # local coordinates: [0 .. W-1], [0 .. H-1]
         W = int(device.columns)
         H = int(device.rows)
         col_offset = int(device.column_start)
         row_offset = int(device.row_start)
 
-        kernel_nodes = [(node, ctx.ir.execution.get(node.name)) for node in ctx.ir.logical]
-        kernel_nodes = [(node, inst) for node, inst in kernel_nodes if inst]
-        if not kernel_nodes:
+        graph = _build_graph(ctx, col_offset, row_offset)
+        if not graph.specs:
             return False
 
-        chain: List[NodeAdapter] = []
-        for node, inst in kernel_nodes:
-            footprint = self._node_footprint(ctx, node, inst)
-            w = footprint.width
-            h = footprint.height
-
-            # For now, approximate I/O ports as middle-left and middle-right.
-            in_row = max(0, min(h - 1, h // 2))
-            rect = Rect(
-                w=w,
-                h=h,
-                in_col_off=0,
-                in_row_off=in_row,
-                out_col_off=w - 1,
-                out_row_off=in_row,
-            )
-
-            # Optional user placement hint (absolute coords)
-            anchor = None
-            placement_hint = node.directives.get('placement', {})
-            if placement_hint:
-                hint_col = placement_hint.get('col')
-                hint_row = placement_hint.get('row')
-                if hint_col is not None and hint_row is not None:
-                    # convert absolute → local
-                    ax = int(hint_col) - col_offset
-                    ay = int(hint_row) - row_offset
-                    anchor = (ax, ay)
-
-            chain.append(NodeAdapter(node=node, name=node.name, rect=rect, anchor=anchor))
-
-        try:
-            placed_chain = _bnb_place_chain(
-                chain,
+        placed = _place_disjoint_fanout(
+            graph=graph,
+            W=W,
+            H=H,
+            lam=self._lam,
+            mu=self._mu,
+            candidate_limit=self._candidate_limit,
+            heuristics=self._heuristics,
+            max_states=self._max_states,
+        )
+        if placed is None:
+            placed = _place_graph_with_fallback(
+                graph=graph,
                 W=W,
                 H=H,
                 lam=self._lam,
                 mu=self._mu,
-                col_window=self._col_window,
+                candidate_limit=self._candidate_limit,
+                heuristics=self._heuristics,
+                max_states=self._max_states,
             )
-        except Exception as exc:
-            log.warning('AIE placement: branch-and-bound failed (%s); falling back to legacy greedy layout.', exc)
-            return self._legacy_fallback(ctx, col_offset, row_offset, W, H)
-
-        # Map placements back to nodes by name
-        placed_by_name: Dict[str, Placed] = {p.name: p for p in placed_chain}
 
         changed = False
-
-        for nad in chain:
-            node = nad.node
-            placed = placed_by_name[node.name]
-            col = placed.x + col_offset
-            row = placed.y + row_offset
-            placement = {'col': int(col), 'row': int(row)}
-
-            prev = ctx.ir.physical.placements.get(node.name)
+        for name, p in placed.items():
+            placement = {
+                'col': int(p.x + col_offset),
+                'row': int(p.y + row_offset),
+            }
+            prev = ctx.ir.physical.placements.get(name)
             if prev != placement:
-                ctx.ir.physical.placements[node.name] = placement.copy()
+                ctx.ir.physical.placements[name] = placement
                 changed = True
 
         return changed
-
-    # Optional: legacy greedy fallback
-    @staticmethod
-    def _legacy_fallback(ctx, col_offset: int, row_offset: int, W: int, H: int) -> bool:
-        """Very simple greedy placement pass."""
-        current_col = col_offset
-        current_row = row_offset
-        max_col = col_offset + W
-        max_row = row_offset + H
-
-        changed = False
-
-        for node in ctx.ir.logical:
-            inst = ctx.ir.execution.get(node.name)
-            if inst is not None:
-                footprint = PlaceKernels._footprint_static(ctx, node, inst)
-                width = footprint.width
-                height = footprint.height
-                requested = node.directives.get('placement', {})
-                requested_col = requested.get('col')
-                requested_row = requested.get('row')
-                user_specified = requested_col is not None or requested_row is not None
-
-                if user_specified:
-                    col = int(requested_col) if requested_col is not None else current_col
-                    row = int(requested_row) if requested_row is not None else current_row
-                    placement = {'col': col, 'row': row}
-                    current_col, current_row = col + width + 1, row
-                else:
-                    if current_col + width + 1 > max_col:
-                        current_col = col_offset
-                        current_row += height
-                    if current_row + height > max_row:
-                        log.warning(
-                            'AIE backend: node %s exceeds grid dimensions (%dx%d starting at %d,%d).',
-                            node.name,
-                            W,
-                            H,
-                            col_offset,
-                            row_offset,
-                        )
-                    placement = {'col': current_col, 'row': current_row}
-                    current_col += width + 1
-
-                prev = ctx.ir.physical.placements.get(node.name)
-                if prev != placement:
-                    ctx.ir.physical.placements[node.name] = placement.copy()
-                    changed = True
-
-        return changed
-
-    @staticmethod
-    def _footprint_static(ctx, node, inst=None) -> 'OpImplFootprint':
-        if inst is None:
-            inst = ctx.ir.execution.get(node.name)
-        if inst is None:
-            raise RuntimeError(f'{node.name}: op implementation missing; run resolve before placement.')
-        config = inst.config
-        placement_ctx = OpImplPlacementContext(
-            node=node,
-            metadata=node.metadata,
-            config=config,
-        )
-        footprint = inst.variant.footprint(placement_ctx)
-        if footprint is None:
-            raise RuntimeError(f'{node.name}: implementation variant did not provide a footprint.')
-        return footprint
-
-    def _node_footprint(self, ctx, node, inst):
-        return self._footprint_static(ctx, node, inst)
