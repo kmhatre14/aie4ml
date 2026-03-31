@@ -1,6 +1,3 @@
-# Copyright 2025 D. Danopoulos, aie4ml
-# SPDX-License-Identifier: Apache-2.0
-
 """Core AIE compiler pipeline definition."""
 
 from .passes import (

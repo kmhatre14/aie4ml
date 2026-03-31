@@ -54,3 +54,24 @@ class AIEDataType:
     rounding: RoundingMode = RoundingMode.RND
     saturation: SaturationMode = SaturationMode.SAT
     c_type: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        return {
+            'width': int(self.width),
+            'signed': bool(self.signed),
+            'frac': int(self.frac),
+            'rounding': self.rounding.name,
+            'saturation': self.saturation.name,
+            'c_type': self.c_type,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'AIEDataType':
+        return cls(
+            width=int(data['width']),
+            signed=bool(data['signed']),
+            frac=int(data['frac']),
+            rounding=RoundingMode[str(data['rounding'])],
+            saturation=SaturationMode[str(data['saturation'])],
+            c_type=data.get('c_type'),
+        )

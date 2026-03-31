@@ -4,7 +4,6 @@
 import copy
 import logging
 import os
-import subprocess
 
 from hls4ml.backends.backend import Backend, extract_optimizers_from_path
 from hls4ml.backends.fpga.fpga_backend import FPGABackend as _FPGABackendHelper
@@ -17,6 +16,7 @@ from hls4ml.writer import get_writer
 
 from ...device_catalog import load_device_catalog
 from ...ir import get_backend_context
+from ...model import AIEModel
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +117,9 @@ class AIEBackend(Backend):
     def get_writer_flow(self):
         return self._writer_flow
 
+    def _aie_model(self, model):
+        return AIEModel.from_context(get_backend_context(model), source_model=model)
+
     @layer_optimizer(Dense)
     def init_dense_defaults(self, layer):
         if layer.get_attr('tiling', None) is None:
@@ -129,57 +132,24 @@ class AIEBackend(Backend):
         pass
 
     def compile(self, model):
-        """Compile the generated project for x86 simulation."""
-        log.info('Compiling %s using make x86com', get_backend_context(model).project_config.project_name)
-        self.build(model, make_target='x86com')
+        self._aie_model(model).compile()
+        return None
 
-    def predict(self, model, X, simulator='x86', quantize_io=True):
-        from ...simulation import (
-            build_io_layout,
-            collect_outputs,
-            dequantize_outputs,
-            prepare_inputs,
-            run_simulation_target,
-            write_input_files,
+    def predict(
+        self,
+        model,
+        X,
+        simulator='x86',
+        *,
+        quantize_in=True,
+        dequantize_out=True,
+    ):
+        return self._aie_model(model).predict(
+            X,
+            simulator=simulator,
+            quantize_in=quantize_in,
+            dequantize_out=dequantize_out,
         )
-
-        ctx = get_backend_context(model)
-        output_dir = ctx.project_config.output_dir
-        if not output_dir.exists():
-            raise FileNotFoundError(
-                f'Output directory "{output_dir}" does not exist. Run write() and compile() before predicting.'
-            )
-
-        layout = build_io_layout(model)
-        iterations = int(ctx.aie_config['Iterations'])
-        quantize_io = bool(quantize_io)
-
-        plio_width = ctx.device.plio_width_bits
-        prepared_inputs = prepare_inputs(layout, X, iterations=iterations, quantize=quantize_io)
-        write_input_files(output_dir, layout, prepared_inputs, plio_width_bits=plio_width)
-
-        sim_key = simulator.lower()
-        if sim_key == 'x86':
-            make_target = 'x86sim'
-        elif sim_key == 'aie':
-            make_target = 'aiesim'
-        else:
-            raise ValueError(f'Unknown simulator "{simulator}". Expected one of: x86, aie.')
-
-        log.info('Running %s simulation using make %s', ctx.project_config.project_name, make_target)
-        run_simulation_target(output_dir, make_target)
-
-        sim_out = collect_outputs(output_dir, sim_key, layout)
-        final_out = dequantize_outputs(layout, sim_out) if quantize_io else sim_out
-
-        def _flatten_iters(arr):
-            if getattr(arr, 'ndim', 0) >= 2:
-                return arr.reshape(arr.shape[0] * arr.shape[1], *arr.shape[2:])
-            return arr
-
-        if len(final_out) == 1:
-            return _flatten_iters(next(iter(final_out.values())))
-        return {k: _flatten_iters(v) for k, v in final_out.items()}
 
     def write(self, model):
         model.apply_flow(self.get_writer_flow())
@@ -255,25 +225,7 @@ class AIEBackend(Backend):
         return config
 
     def build(self, model, make_target='all', env=None, log_to_stdout=True):
-        ctx = get_backend_context(model)
-        output_dir = ctx.project_config.output_dir
-        if not output_dir.exists():
-            raise FileNotFoundError(f'Output directory "{output_dir}" does not exist. Run .write() first.')
-
-        cmd = ['make', make_target]
-        log.debug('Running %s in %s', ' '.join(cmd), output_dir)
-
-        stdout = None if log_to_stdout else subprocess.PIPE
-        stderr = None if log_to_stdout else subprocess.STDOUT
-
-        result = subprocess.run(cmd, cwd=output_dir, env=env, stdout=stdout, stderr=stderr, text=True)
-        if result.returncode != 0:
-            raise RuntimeError(f'Make target "{make_target}" failed for project "{ctx.project_config.project_name}"')
-
-        if not log_to_stdout and result.stdout:
-            log.info(result.stdout)
-
-        return result.returncode
+        return self._aie_model(model).build(make_target=make_target, env=env, log_to_stdout=log_to_stdout)
 
     @model_optimizer()
     def write_aie(self, model):

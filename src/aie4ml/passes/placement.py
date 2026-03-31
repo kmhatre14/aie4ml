@@ -82,6 +82,7 @@ class EdgeSpec:
     src: str
     dst: str
     tensor: Optional[str] = None
+    prefer_direct: bool = False
 
 
 @dataclass
@@ -151,6 +152,14 @@ def _edge_end_name(endpoint: Any) -> Optional[str]:
     if hasattr(endpoint, 'name'):
         return str(endpoint.name)
     return str(endpoint)
+
+
+def _tensor_name(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if hasattr(value, 'name'):
+        return str(value.name)
+    return str(value)
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +426,70 @@ def _derive_edges_from_tensors(ctx, kernel_names: Sequence[str]) -> List[EdgeSpe
             if key in seen:
                 continue
             seen.add(key)
-            edges.append(EdgeSpec(src=src, dst=node.name, tensor=str(tensor)))
+            tensor_name = _tensor_name(tensor)
+            edges.append(
+                EdgeSpec(
+                    src=src,
+                    dst=node.name,
+                    tensor=tensor_name,
+                    prefer_direct=_edge_prefers_direct(ctx, src, node.name, tensor_name),
+                )
+            )
 
     return edges
+
+
+def _normalized_direct_staging(desc: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if desc is None:
+        return None
+    data = {k: v for k, v in desc.items() if k not in ('access', 'boundary_dimension')}
+    if 'io_boundary_dimension' in data and 'boundary_dimension' not in data:
+        data['boundary_dimension'] = data['io_boundary_dimension']
+    return data
+
+
+def _direct_transport_supported(src_inst, dst_inst, tensor_name: str) -> bool:
+    src_desc = src_inst.variant.describe_output_staging(src_inst.node, src_inst.config, tensor_name, 0, None)
+    dst_desc = dst_inst.variant.describe_input_staging(
+        dst_inst.node, dst_inst.config, tensor_name, 0, None, src_inst.node
+    )
+    return _normalized_direct_staging(src_desc) == _normalized_direct_staging(dst_desc)
+
+
+def _edge_prefers_direct(ctx, src_name: str, dst_name: str, tensor_name: Optional[str]) -> bool:
+    if not tensor_name:
+        return False
+
+    tensor = ctx.ir.logical.tensors.get(tensor_name)
+    if tensor is None or tensor.producer is None or tensor.producer.name != src_name:
+        return False
+    if len(tensor.consumers) != 1 or tensor.consumers[0].name != dst_name:
+        return False
+
+    src_inst = ctx.ir.execution.get(src_name)
+    dst_inst = ctx.ir.execution.get(dst_name)
+    if src_inst is None or dst_inst is None:
+        return False
+
+    src_binding = src_inst.config.ports.outputs.get(tensor_name)
+    dst_binding = dst_inst.config.ports.inputs.get(tensor_name)
+    if src_binding is None or dst_binding is None:
+        return False
+    if int(src_binding.count) != 1 or int(dst_binding.count) != 1:
+        return False
+
+    dst_view = dst_inst.node.traits.get('io_view')
+    if dst_view is None:
+        return False
+    if dst_view.data['inputs'][tensor_name].get('perm') is not None:
+        return False
+
+    src_mode = str(src_inst.config.io_route.get('outputs', {}).get(tensor_name, 'auto'))
+    dst_mode = str(dst_inst.config.io_route.get('inputs', {}).get(tensor_name, 'auto'))
+    if src_mode not in ('auto', 'direct') or dst_mode not in ('auto', 'direct'):
+        return False
+
+    return _direct_transport_supported(src_inst, dst_inst, tensor_name)
 
 
 def _topological_order(
@@ -503,13 +573,19 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
             if src not in specs or dst not in specs or src == dst:
                 continue
 
-            tensor = getattr(edge, 'tensor', None)
-            tensor_name = str(tensor) if tensor is not None else None
+            tensor_name = _tensor_name(getattr(edge, 'tensor', None))
             key = (src, dst, tensor_name)
             if key in seen:
                 continue
             seen.add(key)
-            edges.append(EdgeSpec(src=src, dst=dst, tensor=tensor_name))
+            edges.append(
+                EdgeSpec(
+                    src=src,
+                    dst=dst,
+                    tensor=tensor_name,
+                    prefer_direct=_edge_prefers_direct(ctx, src, dst, tensor_name),
+                )
+            )
     else:
         edges = _derive_edges_from_tensors(ctx, list(specs))
 
@@ -601,6 +677,25 @@ def _full_cost(
     return edge_cost + row_bias
 
 
+def _direct_edge_geometry_ok(src: Placed, dst: Placed) -> bool:
+    return dst.y == src.y and dst.x >= src.x + 2
+
+
+def _edge_constraints_ok(graph: GraphSpec, placed: Dict[str, Placed], cand: Placed) -> bool:
+    for edge in graph.edges:
+        if not edge.prefer_direct:
+            continue
+        if edge.src == cand.name:
+            dst = placed.get(edge.dst)
+            if dst is not None and not _direct_edge_geometry_ok(cand, dst):
+                return False
+        elif edge.dst == cand.name:
+            src = placed.get(edge.src)
+            if src is not None and not _direct_edge_geometry_ok(src, cand):
+                return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Search heuristics
 # ---------------------------------------------------------------------------
@@ -613,6 +708,7 @@ def _placed_neighbor_count(graph: GraphSpec, name: str, placed_names: set[str]) 
 def _select_next_node(graph: GraphSpec, placed: Dict[str, Placed]) -> str:
     """
     Frontier-first branching:
+      0. when nothing is placed yet, start from a graph source
       1. maximize number of already-placed neighbors
       2. maximize total degree
       3. maximize area (larger boxes earlier tend to prune sooner)
@@ -620,6 +716,11 @@ def _select_next_node(graph: GraphSpec, placed: Dict[str, Placed]) -> str:
     """
     placed_names = set(placed)
     candidates = [name for name in graph.order if name not in placed_names]
+
+    if not placed_names:
+        sources = [name for name in candidates if not graph.preds[name]]
+        if sources:
+            return min(sources, key=lambda name: graph.specs[name].index)
 
     def key(name: str) -> Tuple[int, int, int, int]:
         rect = graph.specs[name].rect
@@ -968,6 +1069,8 @@ def _bnb_place_graph(
             cand = Placed(name=name, x=x, y=y, rect=spec.rect)
             if not _feasible(cand, placed, W, H):
                 continue
+            if not _edge_constraints_ok(graph, placed, cand):
+                continue
 
             placed[name] = cand
             dfs(placed)
@@ -1165,6 +1268,11 @@ class PlaceKernels(AIEPass):
         Search-order heuristics only. They bias candidate exploration toward
         lower rows and left-to-right growth without changing legality or the
         final placement objective.
+
+    Direct kernel-to-kernel edges are constrained explicitly to the current
+    dense-chain geometry:
+      - same row
+      - consumer at least two columns to the right of producer
     """
 
     def __init__(
@@ -1172,7 +1280,7 @@ class PlaceKernels(AIEPass):
         lam: float = 1.0,
         mu: float = 0.05,
         candidate_limit: Optional[int] = 64,
-        max_states: Optional[int] = 5000,
+        max_states: Optional[int] = 50000,
         low_row_weight: float = 0.05,
         rightward_progress_weight: float = 0.25,
     ):

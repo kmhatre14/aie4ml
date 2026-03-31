@@ -61,10 +61,11 @@ class AIEProjectEmitter:
             layer_index += 1
             artifacts = variant.get_artifacts(inst)
 
+            sanitized_name = sanitize_identifier(inst.name)
             entry = {
                 'index': layer_index,
-                'inst_name': inst.name,
-                'op_impl_name': sanitize_identifier(node.name),
+                'inst_name': sanitized_name,
+                'op_impl_name': sanitized_name,
                 'struct_name': f'L{layer_index}Cfg',
                 'op_impl': op_impl_cfg,
                 'placement': placement,

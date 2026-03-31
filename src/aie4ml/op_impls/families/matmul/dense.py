@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 from ....ir.graph import OpImplInstance, OpNode
+from ....passes.utils import sanitize_identifier
 from ...base import (
     OpImplConfig,
     OpImplFootprint,
@@ -313,23 +314,37 @@ class DenseOpImplVariant(OpImplVariant):
         return OpImplFootprint(width=p.parallelism.cas_length, height=p.parallelism.cas_num)
 
     def get_artifacts(self, inst: OpImplInstance):
-        return [
+        inst_name = sanitize_identifier(inst.name)
+        p = inst.config.parameters
+        artifacts = [
             {
                 'name': 'weights',
                 'kind': '2d',
                 'storage': 'rom',
                 'array': inst.artifacts['packed_weights'],
-                'dtype': inst.config.parameters.precision['weight'].c_type,
-                'filename': f'weights_{inst.name}.h',
+                'dtype': p.precision['weight'].c_type,
+                'filename': f'weights_{inst_name}.h',
                 'port': 'wts',
-            },
+            }
+        ]
+        packed_bias = inst.artifacts.get('packed_bias')
+        if packed_bias is None:
+            # The current dense graph always exposes a bias RTP port. For biasless
+            # layers we feed an explicit zero bias matching the fixed kernel
+            # interface instead of trying to specialize the graph signature.
+            packed_bias = np.zeros(
+                (int(p.parallelism.cas_num), int(p.out_feat_slice)),
+                dtype=np_bias_dtype_for_spec(p.precision['bias']),
+            )
+        artifacts.append(
             {
                 'name': 'bias',
                 'kind': '1d',
                 'storage': 'rom',
-                'array': inst.artifacts.get('packed_bias'),
-                'dtype': inst.config.parameters.precision['bias'].c_type,
-                'filename': f'bias_{inst.name}.h',
+                'array': packed_bias,
+                'dtype': p.precision['bias'].c_type,
+                'filename': f'bias_{inst_name}.h',
                 'port': 'bias',
-            },
-        ]
+            }
+        )
+        return artifacts

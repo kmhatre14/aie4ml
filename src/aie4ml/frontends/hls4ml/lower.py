@@ -17,12 +17,12 @@ from ...ir import (
     LogicalIR,
     OpNode,
     TensorVar,
-    TraitDefinition,
     TraitInstance,
     ensure_backend_context,
 )
 from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
 from ...passes.utils import is_pointwise_dense
+from ..common import register_default_traits
 from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
 
 
@@ -54,6 +54,7 @@ class LowerToAieIr(ModelOptimizerPass):
                     precision=_precision_of(input_var),
                 )
             )
+        graph.mark_graph_input(input_var.name)
 
         for layer in layers:
             var = model.output_vars[layer.name]
@@ -121,6 +122,9 @@ class LowerToAieIr(ModelOptimizerPass):
                     node.inputs.append(bias_tv)
 
             self._attach_traits(ctx, node, layer)
+
+        for out_var in model.get_output_variables():
+            graph.mark_graph_output(out_var.name)
 
         return True
 
@@ -195,27 +199,8 @@ class LowerToAieIr(ModelOptimizerPass):
             custom_sources=dict(config.backend.get_custom_source()),
         )
         ctx = AIEBackendContext(device=device, policies=policies, project_config=project_config, aie_config=aie_cfg)
-        self._register_default_traits(ctx)
+        register_default_traits(ctx)
         return ctx
-
-    @staticmethod
-    def _register_default_traits(ctx: AIEBackendContext) -> None:
-        ctx.traits.register(
-            TraitDefinition(
-                name='fused_activation',
-                dialects=(ctx.device.dialect,),
-                fields=('activation',),
-                description='Indicates that an activation has been fused into the producer op.',
-            )
-        )
-        ctx.traits.register(
-            TraitDefinition(
-                name='io_view',
-                dialects=(ctx.device.dialect,),
-                fields=('inputs', 'outputs'),
-                description='Per-tensor logical-to-physical view mapping for IO/staging.',
-            )
-        )
 
     def _attach_traits(self, ctx: AIEBackendContext, node: OpNode, layer) -> None:
         if layer.class_name == 'Dense' or is_pointwise_dense(layer):

@@ -225,8 +225,7 @@ class IOLayout:
 def build_io_layout(model) -> IOLayout:
     """
     Build a canonical per-port IO layout strictly from:
-      - ctx.ir.physical.plan['buffers'] (external endpoint discovery/mapping: ifm[x]/ofm[x])
-      - ctx.ir.execution (implementation instances + staging descriptors + numeric specs)
+      - ctx.ir.physical.plan['buffers']
     """
     ctx = get_backend_context(model)
     plan = ctx.ir.physical.plan
@@ -244,19 +243,12 @@ def build_io_layout(model) -> IOLayout:
             if writer['source_endpoint']['name'] != 'ifm':
                 continue
             port = int(writer['source_endpoint']['port'])
-
-            reader = next(r for r in buf['readers'] if r['target_type'] == 'op_impl')
-            inst = ctx.ir.execution.get(reader['target_endpoint']['op_impl'])
-
-            st = inst.variant.describe_input_staging(
-                inst.node,
-                inst.config,
-                tensor,
-                port,
-                None,
-                None,
-            )
-            dtype = inst.config.parameters.precision['input']
+            st = writer.get('staging')
+            dtype = _dtype_from_plan(writer.get('dtype'))
+            if st is None:
+                raise RuntimeError(f'{tensor}: physical plan is missing graph-input staging data.')
+            if dtype is None:
+                raise RuntimeError(f'{tensor}: physical plan is missing graph-input dtype data.')
 
             inputs.setdefault(tensor, []).append(
                 IOPortLayout(
@@ -275,19 +267,12 @@ def build_io_layout(model) -> IOLayout:
             if reader['target_endpoint']['name'] != 'ofm':
                 continue
             port = int(reader['target_endpoint']['port'])
-            kernel_port = int(reader['target_endpoint']['op_impl_port'])
-
-            writer = next(w for w in buf['writers'] if w['source_type'] == 'op_impl')
-            inst = ctx.ir.execution.get(writer['source_endpoint']['op_impl'])
-
-            st = inst.variant.describe_output_staging(
-                inst.node,
-                inst.config,
-                tensor,
-                kernel_port,
-                None,
-            )
-            dtype = inst.config.parameters.precision['output']
+            st = reader.get('staging')
+            dtype = _dtype_from_plan(reader.get('dtype'))
+            if st is None:
+                raise RuntimeError(f'{tensor}: physical plan is missing graph-output staging data.')
+            if dtype is None:
+                raise RuntimeError(f'{tensor}: physical plan is missing graph-output dtype data.')
 
             outputs.setdefault(tensor, []).append(
                 IOPortLayout(
@@ -306,6 +291,12 @@ def build_io_layout(model) -> IOLayout:
         outputs[t] = sorted(outputs[t], key=lambda p: p.port)
 
     return IOLayout(inputs=inputs, outputs=outputs)
+
+
+def _dtype_from_plan(data: Dict | None) -> AIEDataType | None:
+    if data is None:
+        return None
+    return AIEDataType.from_dict(data)
 
 
 def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) -> Dict[str, np.ndarray]:

@@ -855,10 +855,10 @@ def resolve_io_route(ctx: LayerResolveContext) -> None:
     r.setdefault('outputs', {})
 
     for t in ctx.node.inputs:
-        r['inputs'].setdefault(t.name, 'memtile')
+        r['inputs'].setdefault(t.name, 'auto')
 
     for t in ctx.node.outputs:
-        r['outputs'].setdefault(t.name, 'memtile')
+        r['outputs'].setdefault(t.name, 'auto')
 
     user = ctx.node.directives.get('io_route', {})
     for d in ('inputs', 'outputs'):

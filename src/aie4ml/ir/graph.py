@@ -130,6 +130,8 @@ class LogicalIR:
 
     tensors: Dict[str, TensorVar] = field(default_factory=dict)
     nodes: List[OpNode] = field(default_factory=list)
+    input_tensor_names: List[str] = field(default_factory=list)
+    output_tensor_names: List[str] = field(default_factory=list)
 
     def add_tensor(self, tensor: TensorVar) -> None:
         if tensor.name in self.tensors:
@@ -138,6 +140,18 @@ class LogicalIR:
 
     def add_node(self, node: OpNode) -> None:
         self.nodes.append(node)
+
+    def mark_graph_input(self, tensor_name: str) -> None:
+        if tensor_name not in self.tensors:
+            raise ValueError(f"Graph input tensor '{tensor_name}' does not exist.")
+        if tensor_name not in self.input_tensor_names:
+            self.input_tensor_names.append(tensor_name)
+
+    def mark_graph_output(self, tensor_name: str) -> None:
+        if tensor_name not in self.tensors:
+            raise ValueError(f"Graph output tensor '{tensor_name}' does not exist.")
+        if tensor_name not in self.output_tensor_names:
+            self.output_tensor_names.append(tensor_name)
 
     def remove_node(self, node: OpNode, mode: str = 'bypass') -> None:
         if len(node.inputs) == 1 and len(node.outputs) == 1:
@@ -213,10 +227,14 @@ class LogicalIR:
                 self.tensors.pop(t.name, None)
 
     def graph_inputs(self) -> List[TensorVar]:
-        return [t for t in self.tensors.values() if t.producer is None and not t.is_parameter]
+        if not self.input_tensor_names:
+            raise ValueError('LogicalIR.graph_inputs requires explicit input_tensor_names.')
+        return [self.tensors[name] for name in self.input_tensor_names]
 
     def graph_outputs(self) -> List[TensorVar]:
-        return [t for t in self.tensors.values() if not t.consumers and not t.is_parameter]
+        if not self.output_tensor_names:
+            raise ValueError('LogicalIR.graph_outputs requires explicit output_tensor_names.')
+        return [self.tensors[name] for name in self.output_tensor_names]
 
     def __iter__(self):
         return iter(self.nodes)
@@ -288,6 +306,31 @@ class PhysicalIR:
     def reset(self) -> None:
         self.placements.clear()
         self.plan.clear()
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'placements': _deep_copy(self.placements),
+            'plan': _deep_copy(self.plan),
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], *, require_plan_buffers: bool = False) -> 'PhysicalIR':
+        if not isinstance(data, dict):
+            raise RuntimeError('Missing or invalid physical IR section.')
+
+        placements = data.get('placements')
+        plan = data.get('plan')
+        if not isinstance(placements, dict):
+            raise RuntimeError('Physical IR is missing placements.')
+        if not isinstance(plan, dict):
+            raise RuntimeError('Physical IR is missing plan.')
+        if require_plan_buffers and not isinstance(plan.get('buffers'), list):
+            raise RuntimeError('Physical IR plan is missing buffers required for IO layout reconstruction.')
+
+        return cls(
+            placements=_deep_copy(placements),
+            plan=_deep_copy(plan),
+        )
 
 
 @dataclass

@@ -27,10 +27,6 @@ class AIEPass:
 
 
 def run_aie_passes(ctx: AIEBackendContext, passes: Iterable[AIEPass]) -> None:
-    """Run a sequence of AIE passes to a fixed point."""
-    changed = True
-    while changed:
-        changed = False
-        for p in passes:
-            if p.transform(ctx):
-                changed = True
+    """Run a sequence of AIE passes once in the declared pipeline order."""
+    for p in passes:
+        p.transform(ctx)

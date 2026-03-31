@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from ..aie_types import AIEDataType
 from ..ir import OpNode, get_backend_context
 from .base import AIEPass
 from .utils import sanitize_identifier
@@ -140,6 +141,7 @@ class _CodegenPlanner:
 
         connections: List[_Connection] = []
         seen_outputs: set[str] = set()
+        graph_output_names = set(self.ctx.ir.logical.output_tensor_names)
 
         # inputs — skip parameter tensors
         for n in nodes:
@@ -165,9 +167,10 @@ class _CodegenPlanner:
                 continue
             for t in getattr(n, 'outputs', []):
                 tname = t.name
-                if tname not in seen_outputs:
-                    pg = inst.config.ports.outputs[tname].group
-                    connections.append(_Connection(n, None, pg, 'graph_output', tname, 'output'))
+                if tname not in graph_output_names and tname in seen_outputs:
+                    continue
+                pg = inst.config.ports.outputs[tname].group
+                connections.append(_Connection(n, None, pg, 'graph_output', tname, 'output'))
 
         return connections
 
@@ -228,6 +231,7 @@ class _CodegenPlanner:
             and len(p_ports) == 1
             and len(c_ports) == 1
             and entry.consumers[0].consumer.traits['io_view'].data['inputs'][entry.tensor].get('perm') is None
+            and self._direct_transport_supported(entry)
         )
 
         if route == 'direct':
@@ -240,6 +244,26 @@ class _CodegenPlanner:
             self._emit_direct(entry, 1)
         else:
             self._emit_memtile(entry, p_ports, c_ports)
+
+    @staticmethod
+    def _normalized_direct_staging(desc: Dict[str, Any] | None) -> Dict[str, Any] | None:
+        if desc is None:
+            return None
+        data = {k: v for k, v in desc.items() if k not in ('access', 'boundary_dimension')}
+        if 'io_boundary_dimension' in data and 'boundary_dimension' not in data:
+            data['boundary_dimension'] = data['io_boundary_dimension']
+        return data
+
+    def _direct_transport_supported(self, entry: _EdgeEntry) -> bool:
+        if entry.producer is None or len(entry.consumers) != 1:
+            return False
+        src_inst = self._kernel_inst(entry.producer)
+        dst_inst = self._kernel_inst(entry.consumers[0].consumer)
+        src_desc = src_inst.variant.describe_output_staging(entry.producer, src_inst.config, entry.tensor, 0, None)
+        dst_desc = dst_inst.variant.describe_input_staging(
+            entry.consumers[0].consumer, dst_inst.config, entry.tensor, 0, None, entry.producer
+        )
+        return self._normalized_direct_staging(src_desc) == self._normalized_direct_staging(dst_desc)
 
     def _route_policy(self, entry: _EdgeEntry) -> str:
         if entry.producer is None or entry.graph_output:
@@ -332,6 +356,8 @@ class _CodegenPlanner:
                     'source_endpoint': self._producer_endpoint_meta(entry.producer, entry.producer_group, p)[1],
                     'target': f'{name}.in[{slot}]',
                     'descriptor': desc,
+                    'staging': self._graph_input_staging(entry, int(p)) if entry.producer is None else None,
+                    'dtype': self._graph_input_dtype(entry).to_dict() if entry.producer is None else None,
                 }
             )
 
@@ -378,6 +404,8 @@ class _CodegenPlanner:
                         'target_type': 'plio',
                         'target_endpoint': {'name': 'ofm', 'port': int(graph_port), 'op_impl_port': int(local_port)},
                         'descriptor': desc,
+                        'staging': self._graph_output_staging(entry, int(local_port)),
+                        'dtype': self._graph_output_dtype(entry).to_dict(),
                     }
                 )
 
@@ -398,6 +426,8 @@ class _CodegenPlanner:
             'access': 'write',
             'buffer_dimension': list(base['buffer_dimension']),
             'tiling_dimension': io_tile,
+            'io_tiling_dimension': list(io_tile),
+            'io_boundary_dimension': list(base['io_boundary_dimension']),
             'offset': [0 for _ in io_tile],
             'slice_dimension': int(base['slice_dimension']),
             'feature_dimension': int(base['feature_dimension']),
@@ -426,6 +456,8 @@ class _CodegenPlanner:
             'access': 'read',
             'buffer_dimension': list(buf_dims),
             'tiling_dimension': io_tile,
+            'io_tiling_dimension': list(io_tile),
+            'io_boundary_dimension': list(io_boundary),
             'offset': offset,
             'boundary_dimension': boundary,
             'slice_dimension': int(base['slice_dimension']),
@@ -476,6 +508,26 @@ class _CodegenPlanner:
             c = entry.consumers[0].consumer
             return f'typename Cfg{self.layer_indices[c.name]}::data_t'
         return f'typename Cfg{self.layer_indices[entry.producer.name]}::result_t'
+
+    def _graph_input_dtype(self, entry: _EdgeEntry) -> AIEDataType:
+        consumer = entry.consumers[0].consumer
+        inst = self._kernel_inst(consumer)
+        return inst.config.parameters.precision['input']
+
+    def _graph_input_staging(self, entry: _EdgeEntry, port: int) -> Dict[str, Any]:
+        consumer = entry.consumers[0].consumer
+        inst = self._kernel_inst(consumer)
+        return inst.variant.describe_input_staging(consumer, inst.config, entry.tensor, port, None, None)
+
+    def _graph_output_dtype(self, entry: _EdgeEntry) -> AIEDataType:
+        producer = entry.producer
+        inst = self._kernel_inst(producer)
+        return inst.config.parameters.precision['output']
+
+    def _graph_output_staging(self, entry: _EdgeEntry, port: int) -> Dict[str, Any]:
+        producer = entry.producer
+        inst = self._kernel_inst(producer)
+        return inst.variant.describe_output_staging(producer, inst.config, entry.tensor, port, None)
 
     def _next_buffer_name(self, entry: _EdgeEntry):
         base = sanitize_identifier(entry.tensor)

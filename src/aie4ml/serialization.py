@@ -71,10 +71,7 @@ def serialize_op_impl_instance(inst: OpImplInstance) -> Dict[str, Any]:
 
 
 def serialize_physical_ir(physical_ir) -> Dict[str, Any]:
-    return {
-        'placements': physical_ir.placements,
-        'plan': physical_ir.plan,
-    }
+    return physical_ir.to_dict()
 
 
 def serialize_precision(precision):
