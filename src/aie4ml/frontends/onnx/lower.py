@@ -9,12 +9,14 @@ from ...aie_types import QuantIntent
 from ...ir import LogicalIR, OpNode, TensorVar
 from ...ir.context import AIEBackendContext
 from ...model import AIEModel
+from ..common import attach_quant_role_bindings
 from .utils import (
     attr,
     create_context,
     dequantize_data,
     initializer_map,
     input_maps,
+    intent_from_initializer,
     intent_from_qparams,
     normalize_directives,
     require_onnx,
@@ -101,6 +103,24 @@ def lower_onnx_model(
             raise ValueError(f'{node_name}: unsupported input {name}. Expected a dequantized activation tensor.')
         return value_tensors[name]
 
+    def _parameter_source_for(name: str, node_name: str) -> TensorVar:
+        if name in value_tensors:
+            tensor = value_tensors[name]
+            if not tensor.is_parameter:
+                raise ValueError(f'{node_name}: parameter input {name} must be constant.')
+            return tensor
+        if name in initializers:
+            data = np.asarray(initializers[name])
+            return _param_tensor(name, data, intent_from_initializer(data, node_name))
+        raise ValueError(f'{node_name}: parameter input {name} must be a constant initializer.')
+
+    def _any_source_for(name: str, node_name: str) -> TensorVar:
+        if name in value_tensors:
+            return value_tensors[name]
+        if name in initializers:
+            return _parameter_source_for(name, node_name)
+        raise ValueError(f'{node_name}: unsupported input {name}.')
+
     for index, node in enumerate(graph_proto.node):
         node_name = onnx_node_name(node, index)
         directives = normalize_directives(node_name, layer_directives.get(node_name))
@@ -118,10 +138,38 @@ def lower_onnx_model(
             intent = intent_from_qparams(initializers, scale_name, zero_name, initializers[zero_name].dtype, node_name)
             if src_name in value_tensors:
                 tensor = value_tensors[src_name]
+                producer = tensor.producer
+                relu_producer = (
+                    producer is not None
+                    and producer.op_type == 'activation'
+                    and producer.metadata.get('activation') == 'relu'
+                )
                 if tensor.precision is None:
+                    if relu_producer:
+                        relu_input = producer.inputs[0] if producer.inputs else None
+                        if relu_input is not None and relu_input.precision is None:
+                            relu_input.precision = QuantIntent(
+                                width=int(intent.width),
+                                frac=int(intent.frac),
+                                signed=True,
+                                rounding=intent.rounding,
+                                saturation=intent.saturation,
+                            )
                     tensor.precision = intent
                 elif tensor.precision != intent:
-                    raise ValueError(f'{node_name}: QuantizeLinear intent does not match source tensor precision.')
+                    if relu_producer:
+                        relu_input = producer.inputs[0] if producer.inputs else None
+                        if relu_input is not None and relu_input.precision is None:
+                            relu_input.precision = QuantIntent(
+                                width=int(intent.width),
+                                frac=int(intent.frac),
+                                signed=True,
+                                rounding=intent.rounding,
+                                saturation=intent.saturation,
+                            )
+                        tensor.precision = intent
+                    else:
+                        raise ValueError(f'{node_name}: QuantizeLinear intent does not match source tensor precision.')
                 q_aliases[node.output[0]] = ('tensor', tensor, intent, tuple(int(x) for x in tensor.shape))
                 shape_of[node.output[0]] = tuple(int(x) for x in tensor.shape)
             elif src_name in raw_input_shapes:
@@ -183,9 +231,9 @@ def lower_onnx_model(
 
             if src_name in raw_input_shapes:
                 raw_dtype = raw_input_dtypes[src_name]
-                if not np.issubdtype(raw_dtype, np.signedinteger):
+                if not np.issubdtype(raw_dtype, np.integer):
                     raise ValueError(
-                        f'{node_name}: direct DequantizeLinear on graph input requires signed integer input type.'
+                        f'{node_name}: direct DequantizeLinear on graph input requires integer input type.'
                     )
                 intent = intent_from_qparams(initializers, scale_name, zero_name, raw_dtype, node_name)
                 tensor = _graph_tensor(src_name, raw_input_shapes[src_name], intent)
@@ -215,12 +263,15 @@ def lower_onnx_model(
 
             op = OpNode(name=f'{node_name}_aie', op_type='transpose', dialect=ctx.device.dialect)
             op.metadata.update(
-                {
-                    'perm': perm,
-                    'data_format': 'channels_last',
-                    'layer_class': 'Transpose',
-                    'source_layer': node_name,
-                }
+                attach_quant_role_bindings(
+                    {
+                        'perm': perm,
+                        'data_format': 'channels_last',
+                        'layer_class': 'Transpose',
+                        'source_layer': node_name,
+                        'input_roles': ['lhs'],
+                    }
+                )
             )
             op.directives.update(directives)
             src.consumers.append(op)
@@ -256,7 +307,7 @@ def lower_onnx_model(
                 trans_b = int(attr(node, 'transB', 0)) == 1
 
             act_tensor = _source_for(act_name, node_name)
-            weight_tensor = _source_for(weight_name, node_name)
+            weight_tensor = _parameter_source_for(weight_name, node_name)
             if act_tensor.is_parameter:
                 raise ValueError(f'{node_name}: activation input cannot be constant.')
             if not weight_tensor.is_parameter:
@@ -283,21 +334,24 @@ def lower_onnx_model(
             weight_param = _param_tensor(f'{node_name}_weight', weight_data, weight_tensor.precision)
             op = OpNode(name=f'{node_name}_aie', op_type='dense', dialect=ctx.device.dialect)
             op.metadata.update(
-                {
-                    'n_in': n_in,
-                    'n_out': n_out,
-                    'use_bias': False,
-                    'layer_class': 'Dense',
-                    'source_class': op_type,
-                    'source_layer': node_name,
-                }
+                attach_quant_role_bindings(
+                    {
+                        'n_in': n_in,
+                        'n_out': n_out,
+                        'use_bias': False,
+                        'layer_class': 'Dense',
+                        'source_class': op_type,
+                        'source_layer': node_name,
+                        'input_roles': ['lhs', 'rhs'],
+                    }
+                )
             )
             op.directives.update(directives)
             act_tensor.consumers.append(op)
             op.inputs.extend([act_tensor, weight_param])
 
             if bias_name is not None:
-                bias_tensor = _source_for(bias_name, node_name)
+                bias_tensor = _parameter_source_for(bias_name, node_name)
                 if not bias_tensor.is_parameter:
                     raise ValueError(f'{node_name}: Gemm bias must be constant.')
                 bias_data = np.asarray(bias_tensor.data, dtype=np.float64).reshape(-1)
@@ -306,6 +360,8 @@ def lower_onnx_model(
                 bias_param = _param_tensor(f'{node_name}_bias', bias_data, bias_tensor.precision)
                 op.inputs.append(bias_param)
                 op.metadata['use_bias'] = True
+                op.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
+                attach_quant_role_bindings(op.metadata)
 
             out_tensor = TensorVar(name=node.output[0], shape=out_shape, precision=None, producer=op)
             graph.add_tensor(out_tensor)
@@ -319,8 +375,8 @@ def lower_onnx_model(
             if len(node.input) != 2:
                 raise ValueError(f'{node_name}: Add must have exactly 2 inputs.')
             lhs_name, rhs_name = node.input
-            lhs = _source_for(lhs_name, node_name)
-            rhs = _source_for(rhs_name, node_name)
+            lhs = _any_source_for(lhs_name, node_name)
+            rhs = _any_source_for(rhs_name, node_name)
 
             if lhs.producer is not None and lhs.producer.op_type == 'dense' and rhs.is_parameter:
                 dense_tensor, bias_tensor = lhs, rhs
@@ -339,6 +395,8 @@ def lower_onnx_model(
             bias_param = _param_tensor(f'{node_name}_bias', bias_data, bias_tensor.precision)
             dense_node.inputs.append(bias_param)
             dense_node.metadata['use_bias'] = True
+            dense_node.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
+            attach_quant_role_bindings(dense_node.metadata)
             value_tensors[node.output[0]] = dense_tensor
             shape_of[node.output[0]] = tuple(int(x) for x in dense_tensor.shape)
             continue
@@ -351,11 +409,14 @@ def lower_onnx_model(
             out_shape = tuple(int(x) for x in shape_of[node.input[0]])
             op = OpNode(name=f'{node_name}_aie', op_type='activation', dialect=ctx.device.dialect)
             op.metadata.update(
-                {
-                    'activation': 'relu',
-                    'layer_class': 'Activation',
-                    'source_layer': node_name,
-                }
+                attach_quant_role_bindings(
+                    {
+                        'activation': 'relu',
+                        'layer_class': 'Activation',
+                        'source_layer': node_name,
+                        'input_roles': ['lhs'],
+                    }
+                )
             )
             op.directives.update(directives)
             src.consumers.append(op)

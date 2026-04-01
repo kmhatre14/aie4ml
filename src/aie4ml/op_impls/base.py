@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from ..ir.graph import OpNode, ResolvedAttributes
 from .common_types import PortBinding, PortMap, to_plain
@@ -112,6 +112,9 @@ class OpImplVariant:
     def build_config(self, context: OpImplSelectionContext) -> OpImplConfig:
         raise NotImplementedError
 
+    def validate_config(self, context: OpImplSelectionContext, config: OpImplConfig) -> None:
+        return None
+
     def tiling_options(self, generation: str, query: Any):
         raise NotImplementedError
 
@@ -148,18 +151,25 @@ class OpImplVariant:
     def _build_port_map(
         self,
         context: OpImplSelectionContext,
-        input_port_count: int,
-        output_port_count: int,
+        input_port_count: int | Mapping[str, int],
+        output_port_count: int | Mapping[str, int],
     ) -> PortMap:
         inputs: Dict[str, PortBinding] = {}
         outputs: Dict[str, PortBinding] = {}
 
+        def _count(spec: int | Mapping[str, int], tensor_name: str) -> int:
+            if isinstance(spec, Mapping):
+                if tensor_name not in spec:
+                    raise KeyError(f'Missing port count for tensor {tensor_name}.')
+                return int(spec[tensor_name])
+            return int(spec)
+
         data_inputs = [tensor for tensor in context.node.inputs if not tensor.is_parameter]
         for index, tensor in enumerate(data_inputs):
-            inputs[tensor.name] = PortBinding(group=f'in{index+1}', count=input_port_count)
+            inputs[tensor.name] = PortBinding(group=f'in{index+1}', count=_count(input_port_count, tensor.name))
 
         for index, tensor in enumerate(context.node.outputs):
-            outputs[tensor.name] = PortBinding(group=f'out{index+1}', count=output_port_count)
+            outputs[tensor.name] = PortBinding(group=f'out{index+1}', count=_count(output_port_count, tensor.name))
 
         return PortMap(inputs=inputs, outputs=outputs)
 
@@ -168,6 +178,8 @@ def _numeric_precisions(attrs: ResolvedAttributes) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
     for kind, dtype in attrs.numeric.items():
         out[kind] = int(dtype.width)
-    input_dtype = attrs.numeric.get('input')
-    out['input_c_type'] = getattr(input_dtype, 'c_type', '') or ''
+    lhs_dtype = attrs.numeric.get('lhs')
+    rhs_dtype = attrs.numeric.get('rhs')
+    out['lhs_c_type'] = getattr(lhs_dtype, 'c_type', '') or ''
+    out['rhs_c_type'] = getattr(rhs_dtype, 'c_type', '') or ''
     return out

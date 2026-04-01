@@ -20,3 +20,12 @@ def register_default_traits(ctx) -> None:
             description='Per-tensor logical-to-physical view mapping for IO/staging.',
         )
     )
+
+
+def attach_quant_role_bindings(meta: dict) -> dict:
+    roles = list(meta.get('input_roles') or [])
+    meta['quant_bindings'] = {
+        'inputs': {role: index for index, role in enumerate(roles)},
+        'output': 0,
+    }
+    return meta

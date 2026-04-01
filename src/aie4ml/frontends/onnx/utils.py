@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 
-from ...aie_types import QuantIntent, RoundingMode, SaturationMode
+from ...aie_types import FloatFormat, FloatIntent, QuantIntent, RoundingMode, SaturationMode
 from ...device_catalog import load_device_catalog
 from ...ir import BackendPolicies
 from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
@@ -175,8 +175,8 @@ def intent_from_qparams(
     if int(zero) != 0:
         raise ValueError(f'{node_name}: zero_point must be 0 for symmetric quantization.')
     dtype = np.dtype(qdtype)
-    if not np.issubdtype(dtype, np.signedinteger):
-        raise ValueError(f'{node_name}: only signed integer quantization is supported; got {dtype}.')
+    if not np.issubdtype(dtype, np.integer):
+        raise ValueError(f'{node_name}: only integer quantization is supported; got {dtype}.')
     if scale <= 0.0:
         raise ValueError(f'{node_name}: quantization scale must be positive.')
     log2_scale = np.log2(scale)
@@ -186,7 +186,7 @@ def intent_from_qparams(
     return QuantIntent(
         width=int(dtype.itemsize * 8),
         frac=int(-rounded),
-        signed=True,
+        signed=bool(np.issubdtype(dtype, np.signedinteger)),
         rounding=RoundingMode.RND_CONV,
         saturation=SaturationMode.SAT,
     )
@@ -202,6 +202,18 @@ def dequantize_data(
     scale = float(scalar_tensor(initializers, scale_name, node_name))
     zero = int(scalar_tensor(initializers, zero_name, node_name))
     return (np.asarray(data, dtype=np.float64) - float(zero)) * scale
+
+
+def intent_from_initializer(data: np.ndarray, node_name: str):
+    dtype = np.asarray(data).dtype
+    if dtype == np.dtype(np.float32):
+        return FloatIntent(width=32, format=FloatFormat.FP32)
+    if str(dtype) == 'bfloat16':
+        return FloatIntent(width=16, format=FloatFormat.BF16)
+    raise ValueError(
+        f'{node_name}: direct initializer inputs must be float32/bfloat16, '
+        f'or quantized via DequantizeLinear; got {dtype}.'
+    )
 
 
 def attr(node, name: str, default=None):

@@ -16,16 +16,30 @@ log = logging.getLogger(__name__)
 
 
 def _quant_meta(node) -> dict:
-    """Build the quant precision dict from a node's tensor inputs/outputs."""
+    """Collect resolver quant metadata from lowering-provided quant bindings."""
+    bindings = node.metadata.get('quant_bindings')
+    if not isinstance(bindings, dict):
+        raise RuntimeError(f'{node.name}: missing quant_bindings metadata.')
+
     meta: dict = {}
-    if node.inputs:
-        meta['input_precision'] = node.inputs[0].precision
-    if node.outputs:
-        meta['output_precision'] = node.outputs[0].precision
-    if len(node.inputs) > 1 and node.inputs[1].is_parameter:
-        meta['weight_precision'] = node.inputs[1].precision
-    if len(node.inputs) > 2 and node.inputs[2].is_parameter:
-        meta['bias_precision'] = node.inputs[2].precision
+
+    output_index = bindings.get('output')
+    if output_index is not None:
+        if not isinstance(output_index, int) or output_index < 0 or output_index >= len(node.outputs):
+            raise RuntimeError(f'{node.name}: invalid quant output binding {output_index}.')
+        meta['output_precision'] = node.outputs[output_index].precision
+
+    input_bindings = bindings.get('inputs', {})
+    if not isinstance(input_bindings, dict):
+        raise RuntimeError(f'{node.name}: invalid quant input bindings metadata.')
+
+    for role, index in input_bindings.items():
+        if not isinstance(role, str):
+            raise RuntimeError(f'{node.name}: invalid quant input role {role!r}.')
+        if not isinstance(index, int) or index < 0 or index >= len(node.inputs):
+            raise RuntimeError(f'{node.name}: invalid quant binding for role {role}: {index}.')
+        meta[f'{role}_precision'] = node.inputs[index].precision
+
     return meta
 
 
@@ -101,6 +115,7 @@ class Resolve(AIEPass):
                 raise RuntimeError(f'{node.name}: no implementation variant satisfies resolved attributes.')
 
             kernel_cfg = variant.build_config(selection_ctx)
+            variant.validate_config(selection_ctx, kernel_cfg)
             inst = ctx.ir.execution.get(node.name)
             if inst is not None:
                 same_variant = inst.variant.variant_id == variant.variant_id

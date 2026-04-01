@@ -21,7 +21,7 @@ from ...ir import (
 )
 from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
 from ...passes.utils import is_pointwise_dense
-from ..common import register_default_traits
+from ..common import attach_quant_role_bindings, register_default_traits
 from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
 
 
@@ -140,6 +140,7 @@ class LowerToAieIr(ModelOptimizerPass):
             meta['n_in'] = int(n_in)
             meta['n_out'] = int(n_out)
             meta['use_bias'] = layer.get_attr('bias_data') is not None
+            meta['input_roles'] = ['lhs', 'rhs'] + (['bias'] if meta['use_bias'] else [])
 
         if layer.class_name == 'ApplyAlpha':
             scale = layer.get_attr('scale_data')
@@ -147,10 +148,12 @@ class LowerToAieIr(ModelOptimizerPass):
                 meta['scale'] = np.asarray(scale, dtype=np.float64).flatten().tolist()
 
         if layer.class_name == 'Activation':
+            meta['input_roles'] = ['lhs']
             act = (layer.get_attr('activation', '') or '').lower()
             if act:
                 meta['activation'] = act
         if layer.class_name == 'Transpose':
+            meta['input_roles'] = ['lhs']
             perm = layer.get_attr('perm')
             if perm is None:
                 raise ValueError(f'{layer.name}: missing Transpose perm attribute.')
@@ -162,6 +165,7 @@ class LowerToAieIr(ModelOptimizerPass):
             meta['source_class'] = layer.class_name
             meta['layer_class'] = 'Dense'
         meta['source_layer'] = layer.name
+        attach_quant_role_bindings(meta)
 
         if meta:
             node.metadata.update(meta)

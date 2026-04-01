@@ -68,7 +68,7 @@ class DeviceSpec:
     column_start: int
     row_start: int
     plio_width_bits: int
-    weight_mem_bytes: int
+    bank_mem_bytes: int
     max_mem_in_ports: int
     max_mem_out_ports: int
     dialect: str
@@ -80,6 +80,11 @@ class DeviceSpec:
                 raise KeyError(f'AIEConfig missing "{key}".')
             return int(source[key])
 
+        def _require_bank_mem_bytes(source: Dict[str, Any]) -> int:
+            if 'BankMemBytes' not in source:
+                raise KeyError('AIEConfig Memory missing "BankMemBytes".')
+            return int(source['BankMemBytes'])
+
         return cls(
             platform=platform,
             generation=str(cfg['Generation']),
@@ -88,7 +93,7 @@ class DeviceSpec:
             column_start=_require_int(cfg, 'ColumnStart'),
             row_start=_require_int(cfg, 'RowStart'),
             plio_width_bits=_require_int(cfg, 'PLIOWidthBits'),
-            weight_mem_bytes=_require_int(cfg['Memory'], 'WeightMemBytes'),
+            bank_mem_bytes=_require_bank_mem_bytes(cfg['Memory']),
             max_mem_in_ports=_require_int(cfg, 'MaxMemTileInPorts'),
             max_mem_out_ports=_require_int(cfg, 'MaxMemTileOutPorts'),
             dialect=detect_dialect(str(cfg['Generation'])),

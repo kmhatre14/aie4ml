@@ -512,7 +512,7 @@ class _CodegenPlanner:
     def _graph_input_dtype(self, entry: _EdgeEntry) -> AIEDataType:
         consumer = entry.consumers[0].consumer
         inst = self._kernel_inst(consumer)
-        return inst.config.parameters.precision['input']
+        return inst.config.parameters.precision['lhs']
 
     def _graph_input_staging(self, entry: _EdgeEntry, port: int) -> Dict[str, Any]:
         consumer = entry.consumers[0].consumer

@@ -28,6 +28,8 @@ class LayerPolicy:
     namespaces: Tuple[str, ...]
     resolvers: Tuple[ResolverFn, ...]
     requires_numeric: bool = False
+    op_family: Optional[str] = None
+    static_parameter_roles: frozenset[str] = frozenset()
 
 
 @dataclass
@@ -86,23 +88,28 @@ class ParallelismResult:
 
     cas_num: int = 1
     cas_length: int = 1
-    input_slice: int = 0
-    output_slice: int = 0
-    input_slice_raw: int = 0
-    output_slice_raw: int = 0
-    weight_tile_bytes: int = 0
+    lhs_slice: int = 0
+    rhs_slice: int = 0
+    lhs_slice_raw: int = 0
+    rhs_slice_raw: int = 0
+    lhs_tile_bytes: int = 0
+    rhs_tile_bytes: int = 0
+    output_tile_bytes: int = 0
     parallel_factor: int = 1
-    input_alignment: int = 1
-    output_alignment: int = 1
+    lhs_alignment: int = 1
+    rhs_alignment: int = 1
     padded_independent_extent: int = 1
     independent_extent: int = 1
-    padded_in_features: int = 0
-    padded_out_features: int = 0
+    padded_lhs_features: int = 0
+    padded_rhs_features: int = 0
 
 
-M_GRANULARITY = 2
-K_GRANULARITY = 2
-N_GRANULARITY = 2
+ROLE_ALIASES: Dict[str, Tuple[str, ...]] = {
+    'lhs': ('lhs',),
+    'rhs': ('rhs',),
+    'bias': ('bias',),
+}
+
 
 OP_IMPL_REGISTRY = get_op_impl_registry()
 
@@ -128,6 +135,24 @@ def _normalize_precision_name(name: str) -> str:
         if name.endswith(suffix):
             return name[: -len(suffix)]
     return name
+
+
+def _input_role_map(node) -> Dict[str, str]:
+    roles = list(node.metadata.get('input_roles') or [])
+    return {tensor.name: str(roles[index]) for index, tensor in enumerate(node.inputs) if index < len(roles)}
+
+
+def _input_tensor_for_roles(ctx: LayerResolveContext, *roles: str):
+    wanted = set(roles)
+    role_map = _input_role_map(ctx.node)
+    for tensor in ctx.node.inputs:
+        if role_map.get(tensor.name) in wanted:
+            return tensor
+    return None
+
+
+def _input_role(node, tensor_name: str) -> str:
+    return _input_role_map(node).get(tensor_name, '')
 
 
 def _ctype_for_width(width: int, signed: bool) -> str:
@@ -196,7 +221,12 @@ def _resolve_storage_dtype(
 def _resolve_numeric_float(ctx: LayerResolveContext) -> None:
     """Float path for resolve_numeric: no shift, no accumulator tag, c_type from FloatFormat."""
     resolved: Dict[str, AIEDataType] = {}
-    for key in ('input', 'output', 'weight', 'bias'):
+    allowed = {'lhs', 'output'}
+    if ctx.policy.requires_numeric:
+        allowed.add('rhs')
+        if 'bias' in ctx.policy.static_parameter_roles:
+            allowed.add('bias')
+    for key in allowed:
         prec = ctx.quant.get(f'{key}_precision')
         if prec is None:
             continue
@@ -208,8 +238,8 @@ def _resolve_numeric_float(ctx: LayerResolveContext) -> None:
                 c_type=_ctype_for_float(prec.format),
             )
     if ctx.policy.requires_numeric:
-        # Bias is always accumulated in float32, regardless of activation/weight format.
-        resolved['bias'] = AIEDataType(width=32, signed=True, frac=0, c_type='float')
+        if 'bias' in ctx.policy.static_parameter_roles:
+            resolved['bias'] = AIEDataType(width=32, signed=True, frac=0, c_type='float')
         ctx.attributes.scalars['shift'] = 0
         ctx.attributes.scalars['accumulator_tag'] = 'accfloat'
         ctx.attributes.scalars['rounding_mode'] = 'conv_even'
@@ -223,8 +253,8 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
     """Resolve backend storage types and post-shift from quantization intent."""
 
     # Float path: any precision that is a FloatIntent takes the float branch.
-    input_prec = ctx.quant.get('input_precision')
-    if isinstance(input_prec, FloatIntent):
+    lhs_prec = ctx.quant.get('lhs_precision')
+    if isinstance(lhs_prec, FloatIntent):
         _resolve_numeric_float(ctx)
         return
 
@@ -235,14 +265,16 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
                 raise RuntimeError(f'{ctx.layer_name}: quant metadata "{key}" is None')
             precision_entries[key] = value
 
-    allowed = {'input', 'output'}
+    allowed = {'lhs', 'output'}
     if ctx.policy.requires_numeric:
-        allowed |= {'weight', 'bias', 'acc'}
+        allowed |= {'rhs', 'acc'}
+        if 'bias' in ctx.policy.static_parameter_roles:
+            allowed.add('bias')
 
     required: List[str] = []
     if ctx.policy.requires_numeric:
-        required.extend(['input', 'output', 'weight'])
-        if ctx.node.metadata['use_bias']:
+        required.extend(['lhs', 'output', 'rhs'])
+        if ctx.node.metadata.get('use_bias') and 'bias' in ctx.policy.static_parameter_roles:
             required.append('bias')
 
     missing = []
@@ -262,11 +294,11 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
 
     resolved: Dict[str, AIEDataType] = {}
 
-    if 'input' in intents:
-        resolved['input'] = _resolve_storage_dtype(
-            intents['input'],
+    if 'lhs' in intents:
+        resolved['lhs'] = _resolve_storage_dtype(
+            intents['lhs'],
             allowed=(4, 8, 16, 32),
-            namespace='input',
+            namespace='lhs',
             layer_name=ctx.layer_name,
         )
     if 'output' in intents:
@@ -278,46 +310,47 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
         )
 
     if ctx.policy.requires_numeric:
-        resolved['weight'] = _resolve_storage_dtype(
-            intents['weight'],
+        resolved['rhs'] = _resolve_storage_dtype(
+            intents['rhs'],
             allowed=(4, 8, 16, 32),
-            namespace='weight',
+            namespace='rhs',
             layer_name=ctx.layer_name,
         )
 
-        if 'bias' in intents:
-            # NOTE: keep bias storage fixed to 32 bits for now;
-            bias_width = 32
-            resolved['bias'] = AIEDataType(
-                width=bias_width,
-                signed=bool(intents['bias'].signed),
-                # Bias is consumed in accumulator scale by the AIE dense kernels.
-                frac=int(intents['input'].frac + intents['weight'].frac),
-                rounding=intents['bias'].rounding,
-                saturation=intents['bias'].saturation,
-                c_type=_ctype_for_width(bias_width, bool(intents['bias'].signed)),
-            )
-        else:
-            bias_width = 32
-            accum_frac = int(intents['input'].frac + intents['weight'].frac)
-            resolved['bias'] = AIEDataType(
-                width=bias_width,
-                signed=True,
-                frac=accum_frac,
-                rounding=RoundingMode.TRN,
-                saturation=SaturationMode.SAT,
-                c_type=_ctype_for_width(bias_width, True),
-            )
+        if 'bias' in ctx.policy.static_parameter_roles:
+            if 'bias' in intents:
+                # NOTE: keep bias storage fixed to 32 bits for now;
+                bias_width = 32
+                resolved['bias'] = AIEDataType(
+                    width=bias_width,
+                    signed=bool(intents['bias'].signed),
+                    # Bias is consumed in accumulator scale by the AIE dense kernels.
+                    frac=int(intents['lhs'].frac + intents['rhs'].frac),
+                    rounding=intents['bias'].rounding,
+                    saturation=intents['bias'].saturation,
+                    c_type=_ctype_for_width(bias_width, bool(intents['bias'].signed)),
+                )
+            else:
+                bias_width = 32
+                accum_frac = int(intents['lhs'].frac + intents['rhs'].frac)
+                resolved['bias'] = AIEDataType(
+                    width=bias_width,
+                    signed=True,
+                    frac=accum_frac,
+                    rounding=RoundingMode.TRN,
+                    saturation=SaturationMode.SAT,
+                    c_type=_ctype_for_width(bias_width, True),
+                )
 
-        in_width = int(resolved['input'].width)
-        w_width = int(resolved['weight'].width)
+        in_width = int(resolved['lhs'].width)
+        w_width = int(resolved['rhs'].width)
         if in_width <= 8 and w_width > 8:
             raise RuntimeError(
                 f'{ctx.layer_name}: unsupported int8 x int16 precision mix for AIE implementations; '
                 'no implementation variant available.'
             )
 
-        shift = int(intents['input'].frac + intents['weight'].frac - intents['output'].frac)
+        shift = int(intents['lhs'].frac + intents['rhs'].frac - intents['output'].frac)
         if shift < 0:
             log.warning(
                 'Layer %s: computed shift=%d (requires left-shift) but negative shifts are unsafe on AIE-ML/XDNA; '
@@ -329,7 +362,7 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
             shift = 0
         ctx.attributes.scalars['shift'] = shift
 
-        acc_tag = _infer_accumulator_tag(ctx.device, resolved['input'], resolved['weight'], None)
+        acc_tag = _infer_accumulator_tag(ctx.device, resolved['lhs'], resolved['rhs'], None)
         ctx.attributes.scalars['accumulator_tag'] = acc_tag
         ctx.attributes.scalars['rounding_mode'] = _aie_rounding_token(resolved['output'])
 
@@ -338,7 +371,7 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
             resolved['acc'] = AIEDataType(
                 width=acc_width,
                 signed=True,
-                frac=int(intents['input'].frac + intents['weight'].frac),
+                frac=int(intents['lhs'].frac + intents['rhs'].frac),
                 rounding=RoundingMode.TRN,
                 saturation=SaturationMode.SAT,
                 c_type=_ctype_for_width(acc_width, True),
@@ -349,8 +382,8 @@ def resolve_numeric(ctx: LayerResolveContext) -> None:
     ctx.set_numeric(numeric)
 
 
-def _supported_tile_options(gen: str, in_key, w_key):
-    return OP_IMPL_REGISTRY.supported_tilings('dense', gen, (in_key, w_key))
+def _supported_tile_options(op_family: str, gen: str, in_key, w_key):
+    return OP_IMPL_REGISTRY.supported_tilings(op_family, gen, (in_key, w_key))
 
 
 def _extract_tile_cfg(directives: Dict[str, Any]) -> Dict[str, int]:
@@ -360,6 +393,7 @@ def _extract_tile_cfg(directives: Dict[str, Any]) -> Dict[str, int]:
 
 def _resolve_tile_cfg(
     layer_name: str,
+    op_family: str,
     user_cfg: Dict[str, Any],
     device: Any,
     input_dtype: Optional[AIEDataType],
@@ -370,7 +404,7 @@ def _resolve_tile_cfg(
     w_key = tiling_key(weight_dtype) if weight_dtype else 0
     generation = getattr(device, 'generation', '') or ''
 
-    options = _supported_tile_options(generation, in_key, w_key)
+    options = _supported_tile_options(op_family, generation, in_key, w_key)
     if not options:
         raise ValueError(
             f'{layer_name}: no supported tile configs are registered for Generation={generation} and '
@@ -395,12 +429,13 @@ def resolve_tiling(ctx: LayerResolveContext) -> None:
     numeric = ctx.numeric()
     if numeric is None:
         return
-    input_dtype = numeric.get('input')
-    weight_dtype = numeric.get('weight')
-    if input_dtype is None or weight_dtype is None:
+    lhs_dtype = numeric.get('lhs')
+    rhs_dtype = numeric.get('rhs')
+    if lhs_dtype is None or rhs_dtype is None:
         return
 
-    tile_cfg = _resolve_tile_cfg(ctx.layer_name, ctx.node.directives, ctx.device, input_dtype, weight_dtype)
+    op_family = ctx.policy.op_family or ctx.node.op_type
+    tile_cfg = _resolve_tile_cfg(ctx.layer_name, op_family, ctx.node.directives, ctx.device, lhs_dtype, rhs_dtype)
     ctx.attributes.tiling.update(tile_cfg)
     ctx.state['tile_cfg'] = tile_cfg
 
@@ -443,15 +478,25 @@ def _lcm_many(values: Iterable[int]) -> int:
     return result
 
 
-def _input_slice_alignment(device: Any, tile_k: int, element_bytes: int) -> int:
-    base = max(1, K_GRANULARITY * max(1, tile_k))
+def _family_alignment_rules(op_family: str, tile_m: int, tile_k: int, tile_n: int) -> Dict[str, int]:
+    if op_family in ('dense', 'matmul'):
+        return {
+            'independent': max(1, 2 * max(1, tile_m)),
+            'lhs': max(1, 2 * max(1, tile_k)),
+            'rhs': max(1, 2 * max(1, tile_n)),
+        }
+    raise ValueError(f'Unsupported op_family {op_family!r} for alignment rule resolution.')
+
+
+def _lhs_slice_alignment(device: Any, lhs_granularity: int, element_bytes: int) -> int:
+    base = max(1, int(lhs_granularity))
     lane = _features_from_bytes(_device_lane_bytes(device), element_bytes)
     plio = _features_from_bytes(4, element_bytes)
     return _lcm_many([base, lane, plio])
 
 
-def _output_slice_alignment(device: Any, tile_n: int, element_bytes: int) -> int:
-    base = max(1, N_GRANULARITY * max(1, tile_n))
+def _rhs_slice_alignment(device: Any, rhs_granularity: int, element_bytes: int) -> int:
+    base = max(1, int(rhs_granularity))
     lane = _features_from_bytes(_device_lane_bytes(device), element_bytes)
     plio = _features_from_bytes(4, element_bytes)
     return _lcm_many([base, lane, plio])
@@ -461,6 +506,38 @@ def _align_up(value: int, multiple: int) -> int:
     if multiple <= 0:
         return max(0, value)
     return ((int(value) + multiple - 1) // multiple) * multiple
+
+
+def _bank_capacity_bytes(device: Any) -> int:
+    return max(1, int(getattr(device, 'bank_mem_bytes', 0) or 1))
+
+
+def _rhs_stack_overhead_bytes(op_family: str) -> int:
+    return 1024 if op_family == 'matmul' else 0
+
+
+def _tile_bank_usage(
+    *,
+    op_family: str,
+    device: Any,
+    padded_independent_extent: int,
+    lhs_slice: int,
+    rhs_slice: int,
+    lhs_bytes: int,
+    rhs_bytes: int,
+    output_bytes: int,
+) -> Dict[str, int]:
+    lhs_tile_bytes = int(padded_independent_extent) * int(lhs_slice) * max(1, int(lhs_bytes))
+    rhs_tile_bytes = int(lhs_slice) * int(rhs_slice) * max(1, int(rhs_bytes))
+    rhs_tile_bytes += _rhs_stack_overhead_bytes(op_family)
+    output_tile_bytes = int(padded_independent_extent) * int(rhs_slice) * max(1, int(output_bytes))
+    return {
+        'lhs_tile_bytes': lhs_tile_bytes,
+        'rhs_tile_bytes': rhs_tile_bytes,
+        'output_tile_bytes': output_tile_bytes,
+        'max_bank_tile_bytes': max(lhs_tile_bytes, rhs_tile_bytes, output_tile_bytes),
+        'bank_capacity_bytes': _bank_capacity_bytes(device),
+    }
 
 
 def _effective_view_shape(
@@ -481,13 +558,17 @@ def _effective_view_shape(
     return [int(logical[i]) for i in perm]
 
 
-def _aligned_batch_size(batch: int, tile_m: int) -> int:
-    two_m = max(1, 2 * max(1, tile_m))
-    return _align_up(int(batch), two_m)
+def _aligned_batch_size(batch: int, independent_granularity: int) -> int:
+    return _align_up(int(batch), max(1, int(independent_granularity)))
 
 
 def _independent_extent(ctx: LayerResolveContext) -> Tuple[int, int]:
-    logical = _effective_view_shape(ctx, ctx.node.inputs[0], 'inputs')
+    tensor = _input_tensor_for_roles(ctx, *ROLE_ALIASES['lhs'])
+    if tensor is None:
+        tensor = next((value for value in ctx.node.inputs if not value.is_parameter), None)
+    if tensor is None:
+        raise ValueError(f'{ctx.layer_name}: missing dynamic input tensor for independent extent resolution.')
+    logical = _effective_view_shape(ctx, tensor, 'inputs')
     if len(logical) < 2:
         raise ValueError(f'{ctx.layer_name}: tensor rank must be >=2, got {len(logical)}.')
     independent = logical[:-1]
@@ -499,21 +580,33 @@ def _independent_extent(ctx: LayerResolveContext) -> Tuple[int, int]:
 def _pad_logical_shape(
     logical: List[int],
     padded_feat: int,
-    tile_m: int,
+    independent_granularity: int,
 ) -> List[int]:
     padded = list(logical)
     feature_axis = len(logical) - 1
     padded[feature_axis] = int(padded_feat)
     if feature_axis > 0:
         last_axis = feature_axis - 1
-        padded[last_axis] = _align_up(int(padded[last_axis]), 2 * max(1, int(tile_m)))
+        padded[last_axis] = _align_up(int(padded[last_axis]), max(1, int(independent_granularity)))
     return padded
+
+
+def _input_padded_features(ctx: LayerResolveContext, tensor) -> Optional[int]:
+    role = _input_role(ctx.node, tensor.name)
+    if tensor.is_parameter and role in ctx.policy.static_parameter_roles:
+        return None
+    if role in ROLE_ALIASES['rhs']:
+        return int(ctx.attributes.scalars['padded_rhs_features'])
+    return int(ctx.attributes.scalars['padded_lhs_features'])
 
 
 def _resolve_io_shapes(ctx: LayerResolveContext) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
     io_trait = ctx.node.traits.get('io_view')
     views = io_trait.data if io_trait else {'inputs': {}, 'outputs': {}}
     tile_m = ctx.attributes.tiling['tile_m']
+    tile_k = ctx.attributes.tiling['tile_k']
+    tile_n = ctx.attributes.tiling['tile_n']
+    rules = _family_alignment_rules(ctx.policy.op_family or ctx.node.op_type, tile_m, tile_k, tile_n)
     shapes: Dict[str, Dict[str, Dict[str, List[int]]]] = {'inputs': {}, 'outputs': {}}
 
     def _view_shape(logical: List[int], view: Dict[str, Any]) -> List[int]:
@@ -528,10 +621,11 @@ def _resolve_io_shapes(ctx: LayerResolveContext) -> Dict[str, Dict[str, Dict[str
         view = views['inputs'][t.name]
         logical = [int(x) for x in t.shape]
         real = _view_shape(logical, view)
-        padded = _pad_logical_shape(
-            real,
-            padded_feat=int(ctx.attributes.scalars['padded_in_features']),
-            tile_m=tile_m,
+        padded_feat = _input_padded_features(ctx, t)
+        padded = (
+            list(real)
+            if padded_feat is None
+            else _pad_logical_shape(real, padded_feat=padded_feat, independent_granularity=rules['independent'])
         )
         shapes['inputs'][t.name] = {'logical': logical, 'real': real, 'padded': padded}
 
@@ -541,36 +635,39 @@ def _resolve_io_shapes(ctx: LayerResolveContext) -> Dict[str, Dict[str, Dict[str
         real = _view_shape(logical, view)
         padded = _pad_logical_shape(
             real,
-            padded_feat=int(ctx.attributes.scalars['padded_out_features']),
-            tile_m=tile_m,
+            padded_feat=int(ctx.attributes.scalars['padded_rhs_features']),
+            independent_granularity=rules['independent'],
         )
         shapes['outputs'][t.name] = {'logical': logical, 'real': real, 'padded': padded}
 
     return shapes
 
 
-def _aligned_input_features(
+def _aligned_lhs_features(
     in_feat: int,
     cas_length: int,
-    tile_k: int,
+    lhs_granularity: int,
     device: Any,
     element_bytes: int,
 ) -> int:
-    slice_alignment = _input_slice_alignment(device, tile_k, element_bytes)
+    slice_alignment = _lhs_slice_alignment(device, lhs_granularity, element_bytes)
     block = max(1, int(cas_length) * slice_alignment)
     return _align_up(int(in_feat), block)
 
 
 def _validate_parallel_override(
     layer_name: str,
+    op_family: str,
     chains: int,
     cas: int,
     n_in: int,
     n_out: int,
     align_k: int,
     align_n: int,
-    weight_bytes: int,
-    input_elem_bytes: int,
+    lhs_bytes: int,
+    rhs_bytes: int,
+    output_bytes: int,
+    padded_independent_extent: int,
     device: Any,
     allow_failure: bool = False,
 ) -> Optional[Dict[str, Any]]:
@@ -580,34 +677,45 @@ def _validate_parallel_override(
     out_slice_raw = (n_out + chains - 1) // chains if chains else n_out
     in_slice_raw = (n_in + cas - 1) // cas if cas else n_in
 
-    if in_slice_raw * input_elem_bytes % 4 != 0:  # PLIO 32-bit align
+    if in_slice_raw * lhs_bytes % 4 != 0:  # PLIO 32-bit align
         if allow_failure:
             return None
-        raise ValueError(f'{layer_name}: raw IN slice not 32-bit aligned ({in_slice_raw * input_elem_bytes}B).')
+        raise ValueError(f'{layer_name}: raw IN slice not 32-bit aligned ({in_slice_raw * lhs_bytes}B).')
 
     out_slice = _align_up(out_slice_raw, align_n)
     in_slice = _align_up(in_slice_raw, align_k)
 
-    tile_bytes = in_slice * out_slice * max(1, weight_bytes)
-    per_tile_limit = max(1, int(getattr(device, 'weight_mem_bytes', 0) or 1))
+    bank_usage = _tile_bank_usage(
+        op_family=op_family,
+        device=device,
+        padded_independent_extent=padded_independent_extent,
+        lhs_slice=in_slice,
+        rhs_slice=out_slice,
+        lhs_bytes=lhs_bytes,
+        rhs_bytes=rhs_bytes,
+        output_bytes=output_bytes,
+    )
+    per_tile_limit = int(bank_usage['bank_capacity_bytes'])
 
-    if tile_bytes > per_tile_limit:
+    if bank_usage['max_bank_tile_bytes'] > per_tile_limit:
         if allow_failure:
             return None
         raise ValueError(
             f'{layer_name}: no valid (cas_num, cas_length) fits tile memory '
-            f'(requested {chains}x{cas}, needs {tile_bytes}B > {per_tile_limit}B).'
+            f'(requested {chains}x{cas}, '
+            f'A={bank_usage["lhs_tile_bytes"]}B, B={bank_usage["rhs_tile_bytes"]}B, '
+            f'C={bank_usage["output_tile_bytes"]}B, limit={per_tile_limit}B).'
         )
 
     return {
         'cas_num': chains,
         'cas_length': cas,
-        'input_slice_raw': in_slice_raw,
-        'output_slice_raw': out_slice_raw,
-        'input_slice': in_slice,
-        'output_slice': out_slice,
-        'tile_bytes': tile_bytes,
+        'lhs_slice_raw': in_slice_raw,
+        'rhs_slice_raw': out_slice_raw,
+        'lhs_slice': in_slice,
+        'rhs_slice': out_slice,
         'balance': abs(in_slice - out_slice),
+        **bank_usage,
     }
 
 
@@ -646,17 +754,22 @@ def _resolve_parallelism_numeric(
     if tile_m <= 0 or tile_n <= 0 or tile_k <= 0:
         raise ValueError(f'{layer_name}: tiling not resolved before parallelism.')
 
-    input_bytes = _element_bytes(numeric.get('input'))
+    lhs_bytes = _element_bytes(numeric.get('lhs'))
     output_bytes = _element_bytes(numeric.get('output'))
-    weight_dtype = numeric.get('weight')
-    weight_width = int(getattr(weight_dtype, 'width'))
-    weight_bytes = max(1, math.ceil(weight_width / 8))
+    rhs_dtype = numeric.get('rhs')
+    rhs_bytes = _element_bytes(rhs_dtype)
+    op_family = ctx.policy.op_family or ctx.node.op_type
 
-    align_k = _input_slice_alignment(ctx.device, tile_k, input_bytes)
-    align_n = _output_slice_alignment(ctx.device, tile_n, output_bytes)
+    rules = _family_alignment_rules(op_family, tile_m, tile_k, tile_n)
+    lhs_align = _lhs_slice_alignment(ctx.device, rules['lhs'], lhs_bytes)
+    rhs_align = _rhs_slice_alignment(ctx.device, rules['rhs'], output_bytes)
 
     max_out_ports = max(1, int(getattr(ctx.device, 'max_mem_out_ports', 0) or 0))
     max_in_ports = max(1, int(getattr(ctx.device, 'max_mem_in_ports', 0) or 0))
+
+    indep_extent, last_indep = _independent_extent(ctx)
+    padded_last = _aligned_batch_size(last_indep, rules['independent'])
+    padded_indep = (indep_extent // max(1, last_indep)) * padded_last
 
     if user_num_chains and int(user_num_chains) > max_out_ports:
         log.warning(
@@ -678,14 +791,17 @@ def _resolve_parallelism_numeric(
     if user_num_chains and user_cas_length:
         override = _validate_parallel_override(
             layer_name,
+            op_family,
             int(user_num_chains),
             int(user_cas_length),
             in_shape,
             out_shape,
-            align_k,
-            align_n,
-            weight_bytes,
-            _element_bytes(numeric.get('input')),
+            lhs_align,
+            rhs_align,
+            lhs_bytes,
+            rhs_bytes,
+            output_bytes,
+            padded_indep,
             ctx.device,
         )
         if override is None:
@@ -706,14 +822,17 @@ def _resolve_parallelism_numeric(
             for chains in chain_candidates:
                 cand = _validate_parallel_override(
                     layer_name,
+                    op_family,
                     chains,
                     cas,
                     in_shape,
                     out_shape,
-                    align_k,
-                    align_n,
-                    weight_bytes,
-                    _element_bytes(numeric.get('input')),
+                    lhs_align,
+                    rhs_align,
+                    lhs_bytes,
+                    rhs_bytes,
+                    output_bytes,
+                    padded_indep,
                     ctx.device,
                     allow_failure=True,
                 )
@@ -722,16 +841,16 @@ def _resolve_parallelism_numeric(
 
                 parallel_factor = chains * cas
                 # --- scoring ---
-                per_tile_limit = max(1, int(getattr(ctx.device, 'weight_mem_bytes', 0)))
+                per_tile_limit = _bank_capacity_bytes(ctx.device)
                 utilization_penalty = abs(
-                    1.0 - (cand['tile_bytes'] / per_tile_limit)
-                )  # prefer to use the full tile memory
-                # aspect = cand['input_slice'] / cand['output_slice']
+                    1.0 - (cand['max_bank_tile_bytes'] / per_tile_limit)
+                )  # prefer to use the fullest per-bank tile use
+                # aspect = cand['lhs_slice'] / cand['rhs_slice']
                 shape_penalty = max(
-                    0.0, (cand['output_slice'] - cand['input_slice']) / max(1.0, cand['input_slice'])
+                    0.0, (cand['rhs_slice'] - cand['lhs_slice']) / max(1.0, cand['lhs_slice'])
                 )  # penalize OUT >> IN
-                padding_waste = (cand['input_slice'] * cas - in_shape) + (
-                    cand['output_slice'] * chains - out_shape
+                padding_waste = (cand['lhs_slice'] * cas - in_shape) + (
+                    cand['rhs_slice'] * chains - out_shape
                 )  # Penalize alignment padding
                 match_penalty = 0 if target_parallel_factor is None else abs(parallel_factor - target_parallel_factor)
                 if target_parallel_factor is not None:
@@ -761,47 +880,46 @@ def _resolve_parallelism_numeric(
 
         if best_pair is None:
             raise ValueError(
-                f"{layer_name}: no valid (cas_num, cas_length) fits tile memory "
-                f"(n_in={in_shape}, n_out={out_shape}, tile limit={getattr(ctx.device, 'weight_mem_bytes', 0)}B). "
-                "Try adjusting: parallelism, tiling, weight bitwidth, or device memory."
+                f'{layer_name}: no valid (cas_num, cas_length) fits tile memory '
+                f'(n_in={in_shape}, n_out={out_shape}, bank limit={_bank_capacity_bytes(ctx.device)}B). '
+                'Try adjusting: parallelism, tiling, tensor shapes, precision, or device memory.'
             )
         candidate = best_pair[1]
 
     cas_num = int(candidate['cas_num'])
     cas_length = int(candidate['cas_length'])
-    raw_in_slice = int(candidate['input_slice_raw'])
-    raw_out_slice = int(candidate['output_slice_raw'])
-    in_slice = int(candidate['input_slice'])
-    out_slice = int(candidate['output_slice'])
+    raw_lhs_slice = int(candidate['lhs_slice_raw'])
+    raw_rhs_slice = int(candidate['rhs_slice_raw'])
+    lhs_slice = int(candidate['lhs_slice'])
+    rhs_slice = int(candidate['rhs_slice'])
 
     # (Already aligned by validator; these are no-ops but safe)
-    if in_slice > 0:
-        in_slice = _align_up(in_slice, align_k)
-    if out_slice > 0:
-        out_slice = _align_up(out_slice, align_n)
+    if lhs_slice > 0:
+        lhs_slice = _align_up(lhs_slice, lhs_align)
+    if rhs_slice > 0:
+        rhs_slice = _align_up(rhs_slice, rhs_align)
 
-    indep_extent, last_indep = _independent_extent(ctx)
-    padded_last = _aligned_batch_size(last_indep, tile_m)
-    padded_indep = (indep_extent // max(1, last_indep)) * padded_last
-    padded_in = _aligned_input_features(in_shape, cas_length, tile_k, ctx.device, input_bytes)
-    padded_in = max(padded_in, in_slice * max(1, cas_length))
-    padded_out = out_slice * max(1, cas_num)
+    padded_lhs = _aligned_lhs_features(in_shape, cas_length, rules['lhs'], ctx.device, lhs_bytes)
+    padded_lhs = max(padded_lhs, lhs_slice * max(1, cas_length))
+    padded_rhs = rhs_slice * max(1, cas_num)
 
     return ParallelismResult(
         cas_num=cas_num,
         cas_length=cas_length,
-        input_slice=in_slice,
-        output_slice=out_slice,
-        input_slice_raw=raw_in_slice,
-        output_slice_raw=raw_out_slice,
-        weight_tile_bytes=int(candidate['tile_bytes']),
+        lhs_slice=lhs_slice,
+        rhs_slice=rhs_slice,
+        lhs_slice_raw=raw_lhs_slice,
+        rhs_slice_raw=raw_rhs_slice,
+        lhs_tile_bytes=int(candidate['lhs_tile_bytes']),
+        rhs_tile_bytes=int(candidate['rhs_tile_bytes']),
+        output_tile_bytes=int(candidate['output_tile_bytes']),
         parallel_factor=int(candidate['parallel_factor']),
-        input_alignment=align_k,
-        output_alignment=align_n,
+        lhs_alignment=lhs_align,
+        rhs_alignment=rhs_align,
         padded_independent_extent=int(padded_indep),
         independent_extent=int(indep_extent),
-        padded_in_features=int(padded_in),
-        padded_out_features=int(padded_out),
+        padded_lhs_features=int(padded_lhs),
+        padded_rhs_features=int(padded_rhs),
     )
 
 
@@ -818,17 +936,19 @@ def resolve_parallelism(ctx: LayerResolveContext) -> None:
             'parallel_factor': int(result.parallel_factor),
             'cas_num': int(result.cas_num),
             'cas_length': int(result.cas_length),
-            'weight_tile_bytes': int(result.weight_tile_bytes),
-            'input_alignment': int(result.input_alignment),
-            'output_alignment': int(result.output_alignment),
+            'lhs_tile_bytes': int(result.lhs_tile_bytes),
+            'rhs_tile_bytes': int(result.rhs_tile_bytes),
+            'output_tile_bytes': int(result.output_tile_bytes),
+            'lhs_alignment': int(result.lhs_alignment),
+            'rhs_alignment': int(result.rhs_alignment),
         }
     )
     ctx.attributes.slices.update(
         {
-            'input': int(result.input_slice),
-            'input_raw': int(result.input_slice_raw),
-            'output': int(result.output_slice),
-            'output_raw': int(result.output_slice_raw),
+            'lhs': int(result.lhs_slice),
+            'lhs_raw': int(result.lhs_slice_raw),
+            'rhs': int(result.rhs_slice),
+            'rhs_raw': int(result.rhs_slice_raw),
         }
     )
 
@@ -979,11 +1099,18 @@ def resolve_scalars(ctx: LayerResolveContext) -> None:
         raise RuntimeError(f'{ctx.layer_name}: missing resolved numeric scalar "shift"')
 
     parallelism = ctx.parallelism()
+    if parallelism is None:
+        raise RuntimeError(f'{ctx.layer_name}: parallelism must be resolved before scalar resolution.')
     scalars['padded_independent_extent'] = int(parallelism.padded_independent_extent)
     scalars['real_independent_extent'] = int(parallelism.independent_extent)
-    scalars['padded_in_features'] = int(parallelism.padded_in_features)
-    scalars['padded_out_features'] = int(parallelism.padded_out_features)
-    scalars['batch_size'] = int(ctx.node.inputs[0].shape[0])
+    scalars['padded_lhs_features'] = int(parallelism.padded_lhs_features)
+    scalars['padded_rhs_features'] = int(parallelism.padded_rhs_features)
+    batch_tensor = _input_tensor_for_roles(ctx, *ROLE_ALIASES['lhs'])
+    if batch_tensor is None:
+        batch_tensor = next((value for value in ctx.node.inputs if not value.is_parameter), None)
+    if batch_tensor is None:
+        raise RuntimeError(f'{ctx.layer_name}: missing dynamic input tensor for batch size resolution.')
+    scalars['batch_size'] = int(batch_tensor.shape[0])
     scalars['io_shapes'] = _resolve_io_shapes(ctx)
 
 
@@ -1004,6 +1131,8 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
     'Dense': LayerPolicy(
         namespaces=('numeric', 'tiling', 'parallelism', 'slices', 'flags', 'scalars'),
         requires_numeric=True,
+        op_family='dense',
+        static_parameter_roles=frozenset({'rhs', 'bias'}),
         resolvers=(
             resolve_numeric,
             resolve_tiling,
@@ -1015,14 +1144,11 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
         ),
     ),
     'Activation': LayerPolicy(
-        namespaces=('numeric', 'slices', 'flags', 'scalars'),
+        namespaces=('numeric', 'flags'),
         requires_numeric=False,
         resolvers=(
             resolve_numeric,
-            resolve_io_view,
-            resolve_parallelism,
             resolve_flags,
-            resolve_scalars,
         ),
     ),
 }

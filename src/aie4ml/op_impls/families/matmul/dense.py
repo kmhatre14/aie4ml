@@ -35,13 +35,13 @@ class DenseOpImplParameters:
     parallelism: MatmulParallelismConfig
     tiling: MatmulTilingConfig
     flags: DenseFlags
-    in_feat_slice: int
-    out_feat_slice: int
-    input_slice_raw: int
-    output_slice_raw: int
+    lhs_feat_slice: int
+    rhs_feat_slice: int
+    lhs_slice_raw: int
+    rhs_slice_raw: int
     padded_independent_extent: int
-    padded_in_features: int
-    padded_out_features: int
+    padded_lhs_features: int
+    padded_rhs_features: int
     shift: int
     accumulator_tag: Optional[str]
     rounding_mode: Optional[str]
@@ -82,12 +82,12 @@ class DenseOpImplVariant(OpImplVariant):
         tile_m = int(attrs.tiling['tile_m'])
         tile_k = int(attrs.tiling['tile_k'])
         tile_n = int(attrs.tiling['tile_n'])
-        input_key = tiling_key(attrs.numeric['input'])
-        weight_key = tiling_key(attrs.numeric['weight'])
+        lhs_key = tiling_key(attrs.numeric['lhs'])
+        rhs_key = tiling_key(attrs.numeric['rhs'])
 
-        if not all((tile_m, tile_k, tile_n, input_key, weight_key)):
+        if not all((tile_m, tile_k, tile_n, lhs_key, rhs_key)):
             return False
-        return (tile_m, tile_k, tile_n) in self.tiling_options(context.device_generation, (input_key, weight_key))
+        return (tile_m, tile_k, tile_n) in self.tiling_options(context.device_generation, (lhs_key, rhs_key))
 
     def build_config(self, context: OpImplSelectionContext) -> OpImplConfig:
         attrs = context.attributes
@@ -105,7 +105,7 @@ class DenseOpImplVariant(OpImplVariant):
         params = DenseOpImplParameters(
             precision={
                 key: attrs.numeric.get(key)
-                for key in ('input', 'weight', 'output', 'bias', 'acc')
+                for key in ('lhs', 'rhs', 'output', 'bias', 'acc')
                 if attrs.numeric.get(key) is not None
             },
             parallelism=MatmulParallelismConfig(
@@ -122,13 +122,13 @@ class DenseOpImplVariant(OpImplVariant):
                 transpose_input=bool(transpose_input),
                 use_bias=bool(context.node.metadata['use_bias']),
             ),
-            in_feat_slice=int(slices['input']),
-            out_feat_slice=int(slices['output']),
-            input_slice_raw=int(slices['input_raw']),
-            output_slice_raw=int(slices['output_raw']),
+            lhs_feat_slice=int(slices['lhs']),
+            rhs_feat_slice=int(slices['rhs']),
+            lhs_slice_raw=int(slices['lhs_raw']),
+            rhs_slice_raw=int(slices['rhs_raw']),
             padded_independent_extent=int(scalars['padded_independent_extent']),
-            padded_in_features=int(scalars['padded_in_features']),
-            padded_out_features=int(scalars['padded_out_features']),
+            padded_lhs_features=int(scalars['padded_lhs_features']),
+            padded_rhs_features=int(scalars['padded_rhs_features']),
             shift=int(scalars['shift']),
             accumulator_tag=scalars.get('accumulator_tag'),
             rounding_mode=scalars.get('rounding_mode'),
@@ -196,13 +196,13 @@ class DenseOpImplVariant(OpImplVariant):
             W,
             K=n_in,
             N=n_out,
-            K_slice=p.in_feat_slice,
-            N_slice=p.out_feat_slice,
+            K_slice=p.lhs_feat_slice,
+            N_slice=p.rhs_feat_slice,
             tile_k=p.tiling.tile_k,
             tile_n=p.tiling.tile_n,
             cas_length=p.parallelism.cas_length,
             cas_num=p.parallelism.cas_num,
-            dtype=np_dtype_for_spec(p.precision['weight']),
+            dtype=np_dtype_for_spec(p.precision['rhs']),
         )
         if isinstance(wi, FloatIntent) and wi.format == FloatFormat.BF16:
             packed_W = (packed_W.astype(np.uint32) << 16).view(np.float32)
@@ -210,7 +210,7 @@ class DenseOpImplVariant(OpImplVariant):
             pack_vector_by_n_slice(
                 b,
                 N=n_out,
-                N_slice=p.out_feat_slice,
+                N_slice=p.rhs_feat_slice,
                 cas_num=p.parallelism.cas_num,
                 dtype=np_bias_dtype_for_spec(p.precision['bias']),
             )
@@ -223,8 +223,8 @@ class DenseOpImplVariant(OpImplVariant):
         p = config.parameters
         tile_m = int(p.tiling.tile_m)
         tile_n = int(p.tiling.tile_n)
-        out_slice = int(p.out_feat_slice)
-        raw_out = int(p.output_slice_raw)
+        out_slice = int(p.rhs_feat_slice)
+        raw_out = int(p.rhs_slice_raw)
         view = self._io_view(node, tensor_name, 'outputs')
         shapes = p.io_shapes['outputs'][tensor_name]
         buffer_order = list(view['buffer_order'])
@@ -267,8 +267,8 @@ class DenseOpImplVariant(OpImplVariant):
         p = config.parameters
         tile_m = int(p.tiling.tile_m)
         tile_k = int(p.tiling.tile_k)
-        in_slice = int(p.in_feat_slice)
-        raw_in = int(p.input_slice_raw)
+        in_slice = int(p.lhs_feat_slice)
+        raw_in = int(p.lhs_slice_raw)
         view = self._io_view(consumer, tensor_name, 'inputs')
         shapes = p.io_shapes['inputs'][tensor_name]
         buffer_order = list(view['buffer_order'])
@@ -322,7 +322,7 @@ class DenseOpImplVariant(OpImplVariant):
                 'kind': '2d',
                 'storage': 'rom',
                 'array': inst.artifacts['packed_weights'],
-                'dtype': p.precision['weight'].c_type,
+                'dtype': p.precision['rhs'].c_type,
                 'filename': f'weights_{inst_name}.h',
                 'port': 'wts',
             }
@@ -333,7 +333,7 @@ class DenseOpImplVariant(OpImplVariant):
             # layers we feed an explicit zero bias matching the fixed kernel
             # interface instead of trying to specialize the graph signature.
             packed_bias = np.zeros(
-                (int(p.parallelism.cas_num), int(p.out_feat_slice)),
+                (int(p.parallelism.cas_num), int(p.rhs_feat_slice)),
                 dtype=np_bias_dtype_for_spec(p.precision['bias']),
             )
         artifacts.append(
