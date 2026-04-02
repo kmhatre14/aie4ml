@@ -19,12 +19,18 @@ from .graph import (
     ResolvedAttributes,
     TensorVar,
     TraitInstance,
+    input_role,
+    input_role_map,
+    input_tensor_for_role,
 )
 
 __all__ = [
     'AIEBackendContext',
     'AIEPipelineIR',
     'ExecutionIR',
+    'input_role',
+    'input_role_map',
+    'input_tensor_for_role',
     'LogicalIR',
     'PhysicalIR',
     'OpImplInstance',

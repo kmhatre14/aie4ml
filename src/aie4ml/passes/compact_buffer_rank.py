@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import logging
 from math import prod
 
 from ..ir import get_backend_context
 from .base import AIEPass
+
+log = logging.getLogger(__name__)
 
 
 class CompactBufferRank(AIEPass):
@@ -30,6 +33,7 @@ class CompactBufferRank(AIEPass):
 
             axis_pairs = self._axis_pairs(descriptors, rank)
             if axis_pairs is None:
+                self._warn_skip(buf, 'feature/independent axes are not collapsible to a 2D contract')
                 continue
 
             drop_axes = list(range(2, rank))
@@ -37,6 +41,7 @@ class CompactBufferRank(AIEPass):
                 continue
 
             if not self._is_legal_to_collapse(desc_entries, drop_axes):
+                self._warn_skip(buf, 'descriptor offsets/tiling/traversal prevent legal rank compaction')
                 continue
 
             old_buf_dim = [int(x) for x in buf['dimension']]
@@ -48,6 +53,7 @@ class CompactBufferRank(AIEPass):
             elif factor == 1:
                 merge_axis = 1
             else:
+                self._warn_skip(buf, 'independent axes disagree across descriptors, so collapse is unsafe')
                 continue
 
             buf['dimension'] = [old_buf_dim[0], old_buf_dim[1] * factor]
@@ -57,6 +63,13 @@ class CompactBufferRank(AIEPass):
                 self._collapse_descriptor(desc, drop_axes, factor, merge_axis=merge_axis, is_graph_io=is_graph_io)
 
         return changed
+
+    def _warn_skip(self, buf, reason: str) -> None:
+        log.warning(
+            '%s: skipping compact_buffer_rank because %s; x86 simulation may still work, but HW compilation may fail.',
+            buf.get('name', '<unnamed buffer>'),
+            reason,
+        )
 
     def _axis_pairs(self, descriptors, rank: int):
         pairs = []

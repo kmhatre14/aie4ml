@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from ..aie_types import AIEDataType, FloatFormat, FloatIntent, QuantIntent, RoundingMode, SaturationMode
-from ..ir import ResolvedAttributes, TraitInstance
+from ..ir import ResolvedAttributes, TraitInstance, input_role, input_role_map
 from ..op_impls import get_op_impl_registry
 from ..op_impls.families.matmul import tiling_key
 
@@ -104,13 +104,6 @@ class ParallelismResult:
     padded_rhs_features: int = 0
 
 
-ROLE_ALIASES: Dict[str, Tuple[str, ...]] = {
-    'lhs': ('lhs',),
-    'rhs': ('rhs',),
-    'bias': ('bias',),
-}
-
-
 OP_IMPL_REGISTRY = get_op_impl_registry()
 
 ACC_TAG_WIDTHS = {
@@ -137,22 +130,17 @@ def _normalize_precision_name(name: str) -> str:
     return name
 
 
-def _input_role_map(node) -> Dict[str, str]:
-    roles = list(node.metadata.get('input_roles') or [])
-    return {tensor.name: str(roles[index]) for index, tensor in enumerate(node.inputs) if index < len(roles)}
-
-
 def _input_tensor_for_roles(ctx: LayerResolveContext, *roles: str):
     wanted = set(roles)
-    role_map = _input_role_map(ctx.node)
+    role_map = input_role_map(ctx.node)
     for tensor in ctx.node.inputs:
         if role_map.get(tensor.name) in wanted:
             return tensor
     return None
 
 
-def _input_role(node, tensor_name: str) -> str:
-    return _input_role_map(node).get(tensor_name, '')
+def _input_tensor_for_role(ctx: LayerResolveContext, role: str):
+    return _input_tensor_for_roles(ctx, role)
 
 
 def _ctype_for_width(width: int, signed: bool) -> str:
@@ -563,7 +551,7 @@ def _aligned_batch_size(batch: int, independent_granularity: int) -> int:
 
 
 def _independent_extent(ctx: LayerResolveContext) -> Tuple[int, int]:
-    tensor = _input_tensor_for_roles(ctx, *ROLE_ALIASES['lhs'])
+    tensor = _input_tensor_for_role(ctx, 'lhs')
     if tensor is None:
         tensor = next((value for value in ctx.node.inputs if not value.is_parameter), None)
     if tensor is None:
@@ -592,12 +580,21 @@ def _pad_logical_shape(
 
 
 def _input_padded_features(ctx: LayerResolveContext, tensor) -> Optional[int]:
-    role = _input_role(ctx.node, tensor.name)
+    role = input_role(ctx.node, tensor.name)
     if tensor.is_parameter and role in ctx.policy.static_parameter_roles:
         return None
-    if role in ROLE_ALIASES['rhs']:
+    if role == 'rhs':
         return int(ctx.attributes.scalars['padded_rhs_features'])
     return int(ctx.attributes.scalars['padded_lhs_features'])
+
+
+def _padded_matmul_rhs_shape(ctx: LayerResolveContext, real: List[int]) -> List[int]:
+    if len(real) < 2:
+        raise ValueError(f'{ctx.layer_name}: matmul RHS must be rank >=2, got {len(real)}.')
+    padded = list(real)
+    padded[-2] = int(ctx.attributes.scalars['padded_lhs_features'])
+    padded[-1] = int(ctx.attributes.scalars['padded_rhs_features'])
+    return padded
 
 
 def _resolve_io_shapes(ctx: LayerResolveContext) -> Dict[str, Dict[str, Dict[str, List[int]]]]:
@@ -617,16 +614,22 @@ def _resolve_io_shapes(ctx: LayerResolveContext) -> Dict[str, Dict[str, Dict[str
             raise ValueError(f'{ctx.layer_name}: invalid io_view perm {perm} for rank {len(logical)}.')
         return [int(logical[i]) for i in perm]
 
+    def _input_padded_shape(tensor, real: List[int]) -> List[int]:
+        role = input_role(ctx.node, tensor.name)
+        if tensor.is_parameter and role in ctx.policy.static_parameter_roles:
+            return list(real)
+        if ctx.policy.op_family == 'matmul' and role == 'rhs':
+            return _padded_matmul_rhs_shape(ctx, real)
+        padded_feat = _input_padded_features(ctx, tensor)
+        if padded_feat is None:
+            return list(real)
+        return _pad_logical_shape(real, padded_feat=padded_feat, independent_granularity=rules['independent'])
+
     for t in ctx.node.inputs:
         view = views['inputs'][t.name]
         logical = [int(x) for x in t.shape]
         real = _view_shape(logical, view)
-        padded_feat = _input_padded_features(ctx, t)
-        padded = (
-            list(real)
-            if padded_feat is None
-            else _pad_logical_shape(real, padded_feat=padded_feat, independent_granularity=rules['independent'])
-        )
+        padded = _input_padded_shape(t, real)
         shapes['inputs'][t.name] = {'logical': logical, 'real': real, 'padded': padded}
 
     for t in ctx.node.outputs:
@@ -728,7 +731,12 @@ def _resolve_parallelism_numeric(
     if not ctx.node.inputs or not ctx.node.outputs:
         raise ValueError(f'{layer_name}: node is missing input or output tensors.')
 
-    in_shape = _effective_view_shape(ctx, ctx.node.inputs[0], 'inputs')[-1]
+    lhs_tensor = _input_tensor_for_role(ctx, 'lhs')
+    if lhs_tensor is None:
+        lhs_tensor = next((value for value in ctx.node.inputs if not value.is_parameter), None)
+    if lhs_tensor is None:
+        raise ValueError(f'{layer_name}: missing dynamic lhs tensor for parallelism resolution.')
+    in_shape = _effective_view_shape(ctx, lhs_tensor, 'inputs')[-1]
     out_shape = _effective_view_shape(ctx, ctx.node.outputs[0], 'outputs')[-1]
 
     parallel_cfg = ctx.node.directives.get('parallelism', {}) or {}
@@ -771,23 +779,6 @@ def _resolve_parallelism_numeric(
     padded_last = _aligned_batch_size(last_indep, rules['independent'])
     padded_indep = (indep_extent // max(1, last_indep)) * padded_last
 
-    if user_num_chains and int(user_num_chains) > max_out_ports:
-        log.warning(
-            '%s: cas_num override %s exceeds single memtile out-ports %s; '
-            'MemoryPlan will shard across multiple memtiles.',
-            layer_name,
-            user_num_chains,
-            max_out_ports,
-        )
-    if user_cas_length and int(user_cas_length) > max_in_ports:
-        log.warning(
-            '%s: cas_length override %s exceeds single memtile in-ports %s; '
-            'MemoryPlan will shard across multiple memtiles.',
-            layer_name,
-            user_cas_length,
-            max_in_ports,
-        )
-
     if user_num_chains and user_cas_length:
         override = _validate_parallel_override(
             layer_name,
@@ -814,8 +805,16 @@ def _resolve_parallelism_numeric(
             'parallel_factor': parallel_factor,
         }
     else:
-        chain_candidates = [int(user_num_chains)] if user_num_chains else list(range(1, max_out_ports + 1))
-        cas_candidates = [int(user_cas_length)] if user_cas_length else list(range(1, max_in_ports + 1))
+        max_chain_candidates = min(
+            max(1, int(ctx.device.rows)),
+            max(max_out_ports, int(math.ceil(float(out_shape) / max(1, rhs_align)))),
+        )
+        max_cas_candidates = min(
+            max(1, int(ctx.device.columns)),
+            max(max_in_ports, int(math.ceil(float(in_shape) / max(1, lhs_align)))),
+        )
+        chain_candidates = [int(user_num_chains)] if user_num_chains else list(range(1, max_chain_candidates + 1))
+        cas_candidates = [int(user_cas_length)] if user_cas_length else list(range(1, max_cas_candidates + 1))
 
         best_pair = None  # (score_tuple, cand_dict)
         for cas in cas_candidates:
@@ -859,13 +858,19 @@ def _resolve_parallelism_numeric(
                     score = (
                         exact_miss,
                         match_penalty,
-                        utilization_penalty,
+                        cas,
                         shape_penalty,
                         padding_waste,
-                        -parallel_factor,
+                        utilization_penalty,
                     )
                 else:
-                    score = (utilization_penalty, shape_penalty, padding_waste, -parallel_factor)
+                    score = (
+                        parallel_factor,
+                        cas,
+                        shape_penalty,
+                        padding_waste,
+                        utilization_penalty,
+                    )
 
                 if best_pair is None or score < best_pair[0]:
                     best_pair = (
@@ -879,9 +884,14 @@ def _resolve_parallelism_numeric(
                     )
 
         if best_pair is None:
+            padded_lhs_total = _aligned_lhs_features(in_shape, 1, rules['lhs'], ctx.device, lhs_bytes)
+            padded_rhs_total = _align_up(out_shape, rhs_align)
             raise ValueError(
                 f'{layer_name}: no valid (cas_num, cas_length) fits tile memory '
-                f'(n_in={in_shape}, n_out={out_shape}, bank limit={_bank_capacity_bytes(ctx.device)}B). '
+                f'(lhs_work_shape=({padded_indep}, {padded_lhs_total}), '
+                f'rhs_work_shape=({padded_lhs_total}, {padded_rhs_total}), '
+                f'out_work_shape=({padded_indep}, {padded_rhs_total}), '
+                f'bank limit={_bank_capacity_bytes(ctx.device)}B). '
                 'Try adjusting: parallelism, tiling, tensor shapes, precision, or device memory.'
             )
         candidate = best_pair[1]
@@ -902,6 +912,23 @@ def _resolve_parallelism_numeric(
     padded_lhs = _aligned_lhs_features(in_shape, cas_length, rules['lhs'], ctx.device, lhs_bytes)
     padded_lhs = max(padded_lhs, lhs_slice * max(1, cas_length))
     padded_rhs = rhs_slice * max(1, cas_num)
+
+    if cas_num > max_out_ports:
+        log.warning(
+            '%s: selected cas_num %s exceeds single memtile out-ports %s; '
+            'MemoryPlan will shard across multiple memtiles.',
+            layer_name,
+            cas_num,
+            max_out_ports,
+        )
+    if cas_length > max_in_ports:
+        log.warning(
+            '%s: selected cas_length %s exceeds single memtile in-ports %s; '
+            'MemoryPlan will shard across multiple memtiles.',
+            layer_name,
+            cas_length,
+            max_in_ports,
+        )
 
     return ParallelismResult(
         cas_num=cas_num,
@@ -1105,7 +1132,7 @@ def resolve_scalars(ctx: LayerResolveContext) -> None:
     scalars['real_independent_extent'] = int(parallelism.independent_extent)
     scalars['padded_lhs_features'] = int(parallelism.padded_lhs_features)
     scalars['padded_rhs_features'] = int(parallelism.padded_rhs_features)
-    batch_tensor = _input_tensor_for_roles(ctx, *ROLE_ALIASES['lhs'])
+    batch_tensor = _input_tensor_for_role(ctx, 'lhs')
     if batch_tensor is None:
         batch_tensor = next((value for value in ctx.node.inputs if not value.is_parameter), None)
     if batch_tensor is None:
@@ -1139,6 +1166,20 @@ LAYER_RESOLVE_REGISTRY: Dict[str, LayerPolicy] = {
             resolve_io_view,
             resolve_parallelism,
             resolve_flags,
+            resolve_io_route,
+            resolve_scalars,
+        ),
+    ),
+    'MatMul': LayerPolicy(
+        namespaces=('numeric', 'tiling', 'parallelism', 'slices', 'scalars'),
+        requires_numeric=True,
+        op_family='matmul',
+        static_parameter_roles=frozenset(),
+        resolvers=(
+            resolve_numeric,
+            resolve_tiling,
+            resolve_io_view,
+            resolve_parallelism,
             resolve_io_route,
             resolve_scalars,
         ),

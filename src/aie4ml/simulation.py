@@ -149,7 +149,7 @@ def compute_ops(model):
 
     ops = 0
     for node in ctx.ir.logical:
-        if node.op_type != 'dense':
+        if node.op_type not in ('dense', 'matmul'):
             continue
 
         n_in = int(node.metadata['n_in'])

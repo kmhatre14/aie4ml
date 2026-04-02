@@ -7,8 +7,13 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..aie_types import AIEDataType
-from ..ir import OpNode, get_backend_context
+from ..ir import OpNode, get_backend_context, input_role
 from .base import AIEPass
+from .boundary_sharding import (
+    graph_input_port_descriptor,
+    graph_input_writer_port_descriptor,
+    localize_graph_io_descriptor,
+)
 from .utils import sanitize_identifier
 
 
@@ -31,11 +36,16 @@ class _EdgeEntry:
     consumers: List[_Connection] = field(default_factory=list)
     graph_output: bool = False
     producer_port_ids: List[int] = field(default_factory=list)
+    producer_tensor_port_base: int = 0
     consumer_port_ids: List[int] = field(default_factory=list)
     shard_dim: Optional[int] = None
     shard_port_stride: Optional[int] = None
     shard_dim_base: int = 0
     shard_dim_size: Optional[int] = None
+    shard_offset_base: List[int] = field(default_factory=list)
+    shard_buffer_dimension: List[int] = field(default_factory=list)
+    graph_input_port_descs: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    graph_input_writer_port_descs: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     shard_index: int = 0
     shard_count: int = 1
 
@@ -216,7 +226,10 @@ class _CodegenPlanner:
             raise RuntimeError(f'{entry.tensor}: materializer does not accept mixed consumer + graph_output entry.')
         if not entry.producer_port_ids:
             raise RuntimeError(f'{entry.tensor}: missing producer_port_ids; run port-limit legalization first.')
-        if entry.shard_dim is None or entry.shard_port_stride is None or entry.shard_dim_size is None:
+        graph_input_generic = entry.producer is None and bool(entry.graph_input_port_descs)
+        if not graph_input_generic and (
+            entry.shard_dim is None or entry.shard_port_stride is None or entry.shard_dim_size is None
+        ):
             raise RuntimeError(f'{entry.tensor}: missing shard metadata; run port-limit legalization first.')
 
         p_ports = [int(x) for x in entry.producer_port_ids]
@@ -228,20 +241,19 @@ class _CodegenPlanner:
             and entry.producer
             and not entry.graph_output
             and len(entry.consumers) == 1
-            and len(p_ports) == 1
-            and len(c_ports) == 1
+            and len(p_ports) == len(c_ports)
             and entry.consumers[0].consumer.traits['io_view'].data['inputs'][entry.tensor].get('perm') is None
-            and self._direct_transport_supported(entry)
+            and self._direct_transport_supported(entry, p_ports, c_ports)
         )
 
         if route == 'direct':
             if not direct_eligible:
                 raise RuntimeError(f'{entry.tensor}: io_route=direct requested but direct transport is not legal.')
-            self._emit_direct(entry, 1)
+            self._emit_direct(entry, p_ports, c_ports)
             return
 
         if direct_eligible and route != 'memtile':
-            self._emit_direct(entry, 1)
+            self._emit_direct(entry, p_ports, c_ports)
         else:
             self._emit_memtile(entry, p_ports, c_ports)
 
@@ -254,16 +266,26 @@ class _CodegenPlanner:
             data['boundary_dimension'] = data['io_boundary_dimension']
         return data
 
-    def _direct_transport_supported(self, entry: _EdgeEntry) -> bool:
-        if entry.producer is None or len(entry.consumers) != 1:
+    def _direct_transport_supported(self, entry: _EdgeEntry, p_ports: List[int], c_ports: List[int]) -> bool:
+        if entry.producer is None or len(entry.consumers) != 1 or len(p_ports) != len(c_ports):
             return False
         src_inst = self._kernel_inst(entry.producer)
         dst_inst = self._kernel_inst(entry.consumers[0].consumer)
-        src_desc = src_inst.variant.describe_output_staging(entry.producer, src_inst.config, entry.tensor, 0, None)
-        dst_desc = dst_inst.variant.describe_input_staging(
-            entry.consumers[0].consumer, dst_inst.config, entry.tensor, 0, None, entry.producer
-        )
-        return self._normalized_direct_staging(src_desc) == self._normalized_direct_staging(dst_desc)
+        for p_port, c_port in zip(p_ports, c_ports):
+            src_desc = src_inst.variant.describe_output_staging(
+                entry.producer, src_inst.config, entry.tensor, int(p_port), None
+            )
+            dst_desc = dst_inst.variant.describe_input_staging(
+                entry.consumers[0].consumer,
+                dst_inst.config,
+                entry.tensor,
+                int(c_port),
+                None,
+                entry.producer,
+            )
+            if self._normalized_direct_staging(src_desc) != self._normalized_direct_staging(dst_desc):
+                return False
+        return True
 
     def _route_policy(self, entry: _EdgeEntry) -> str:
         if entry.producer is None or entry.graph_output:
@@ -294,15 +316,15 @@ class _CodegenPlanner:
     # Direct
     # ------------------------------------------------------------------
 
-    def _emit_direct(self, entry, ports):
+    def _emit_direct(self, entry, p_ports, c_ports):
         p = entry.producer
         c = entry.consumers[0]
 
-        for i in range(ports):
+        for p_port, c_port in zip(p_ports, c_ports):
             self.direct_edges.append(
                 {
-                    'source': f'{sanitize_identifier(p.name)}.{entry.producer_group}[{i}]',
-                    'target': f'{sanitize_identifier(c.consumer.name)}.{c.consumer_group}[{i}]',
+                    'source': f'{sanitize_identifier(p.name)}.{entry.producer_group}[{int(p_port)}]',
+                    'target': f'{sanitize_identifier(c.consumer.name)}.{c.consumer_group}[{int(c_port)}]',
                     'tensor': entry.tensor,
                 }
             )
@@ -315,15 +337,24 @@ class _CodegenPlanner:
         if entry.producer:
             inst = self._kernel_inst(entry.producer)
             base = inst.variant.describe_output_staging(entry.producer, inst.config, entry.tensor, 0, None)
+            shard_dim = int(entry.shard_dim)
+            port_stride = int(entry.shard_port_stride)
+            unit_base_dim0 = int(entry.shard_dim_base)
+            full_dims = list(base['buffer_dimension'])
+            buf_dims = list(full_dims)
+            buf_dims[shard_dim] = int(entry.shard_dim_size)
         else:
-            base = self._graph_input_writer_descriptor(entry)
-
-        shard_dim = int(entry.shard_dim)
-        port_stride = int(entry.shard_port_stride)
-        unit_base_dim0 = int(entry.shard_dim_base)
-        full_dims = list(base['buffer_dimension'])
-        buf_dims = list(full_dims)
-        buf_dims[shard_dim] = int(entry.shard_dim_size)
+            if entry.graph_input_port_descs:
+                base = graph_input_port_descriptor(entry, p_ports[0])
+                buf_dims = list(entry.shard_buffer_dimension)
+            else:
+                base = self._graph_input_writer_descriptor(entry)
+                shard_dim = int(entry.shard_dim)
+                port_stride = int(entry.shard_port_stride)
+                unit_base_dim0 = int(entry.shard_dim_base)
+                full_dims = list(base['buffer_dimension'])
+                buf_dims = list(full_dims)
+                buf_dims[shard_dim] = int(entry.shard_dim_size)
 
         name = self._next_buffer_name(entry)
         buffer = {
@@ -339,9 +370,16 @@ class _CodegenPlanner:
         base_p = p_ports[0]
         for slot, p in enumerate(p_ports):
             if entry.producer is None:
-                desc = self._graph_input_writer_descriptor(entry)
-                desc['buffer_dimension'] = list(buf_dims)
-                desc['offset'][shard_dim] = (int(p) - int(base_p)) * int(port_stride)
+                if entry.graph_input_port_descs:
+                    desc = localize_graph_io_descriptor(
+                        graph_input_writer_port_descriptor(entry, int(p)),
+                        list(entry.shard_offset_base),
+                        list(buf_dims),
+                    )
+                else:
+                    desc = self._graph_input_writer_descriptor(entry)
+                    desc['buffer_dimension'] = list(buf_dims)
+                    desc['offset'][shard_dim] = (int(p) - int(base_p)) * int(port_stride)
                 self._max_graph_input_port = max(self._max_graph_input_port, int(p))
             else:
                 inst = self._kernel_inst(entry.producer)
@@ -364,14 +402,21 @@ class _CodegenPlanner:
         if entry.consumers:
             consumer_conn = entry.consumers[0]
             for local_out, i in enumerate(c_ports):
-                inst = self._kernel_inst(consumer_conn.consumer)
-                desc = inst.variant.describe_input_staging(
-                    consumer_conn.consumer, inst.config, entry.tensor, i, buf_dims, entry.producer
-                )
-                desc['buffer_dimension'] = list(buf_dims)
-                desc['offset'][shard_dim] -= int(unit_base_dim0)
-                if int(entry.shard_count) > 1:
-                    desc['boundary_dimension'] = list(buf_dims)
+                if entry.producer is None and entry.graph_input_port_descs:
+                    desc = localize_graph_io_descriptor(
+                        graph_input_port_descriptor(entry, int(base_p + local_out)),
+                        list(entry.shard_offset_base),
+                        list(buf_dims),
+                    )
+                else:
+                    inst = self._kernel_inst(consumer_conn.consumer)
+                    desc = inst.variant.describe_input_staging(
+                        consumer_conn.consumer, inst.config, entry.tensor, i, buf_dims, entry.producer
+                    )
+                    desc['buffer_dimension'] = list(buf_dims)
+                    desc['offset'][shard_dim] -= int(unit_base_dim0)
+                    if int(entry.shard_count) > 1:
+                        desc['boundary_dimension'] = list(buf_dims)
 
                 buffer['readers'].append(
                     {
@@ -503,21 +548,34 @@ class _CodegenPlanner:
             'port': int(port),
         }
 
+    def _graph_input_role(self, entry: _EdgeEntry) -> str:
+        consumer = entry.consumers[0].consumer
+        role = input_role(consumer, entry.tensor)
+        return role or 'lhs'
+
     def _buffer_ctype(self, entry):
         if entry.producer is None:
             c = entry.consumers[0].consumer
-            return f'typename Cfg{self.layer_indices[c.name]}::data_t'
+            role = self._graph_input_role(entry)
+            suffix = 'rhs_t' if role == 'rhs' else 'data_t'
+            return f'typename Cfg{self.layer_indices[c.name]}::{suffix}'
         return f'typename Cfg{self.layer_indices[entry.producer.name]}::result_t'
 
     def _graph_input_dtype(self, entry: _EdgeEntry) -> AIEDataType:
         consumer = entry.consumers[0].consumer
         inst = self._kernel_inst(consumer)
-        return inst.config.parameters.precision['lhs']
+        role = self._graph_input_role(entry)
+        return inst.config.parameters.precision[role]
 
     def _graph_input_staging(self, entry: _EdgeEntry, port: int) -> Dict[str, Any]:
-        consumer = entry.consumers[0].consumer
-        inst = self._kernel_inst(consumer)
-        return inst.variant.describe_input_staging(consumer, inst.config, entry.tensor, port, None, None)
+        if entry.graph_input_port_descs:
+            return graph_input_writer_port_descriptor(entry, int(port))
+        desc = self._graph_input_writer_descriptor(entry)
+        shard_dim = int(entry.shard_dim)
+        port_stride = int(entry.shard_port_stride)
+        tensor_local_port = int(port) - int(entry.producer_tensor_port_base)
+        desc['offset'][shard_dim] = int(tensor_local_port) * int(port_stride)
+        return desc
 
     def _graph_output_dtype(self, entry: _EdgeEntry) -> AIEDataType:
         producer = entry.producer

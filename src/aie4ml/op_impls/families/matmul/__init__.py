@@ -10,12 +10,16 @@ from .common import (
     tiling_key,
 )
 from .dense import DenseFlags, DenseOpImplParameters, DenseOpImplVariant
+from .matmul import MatmulFlags, MatmulOpImplParameters, MatmulOpImplVariant
 from .types import MatmulParallelismConfig, MatmulTilingConfig
 
 __all__ = [
     'DenseFlags',
     'DenseOpImplParameters',
     'DenseOpImplVariant',
+    'MatmulFlags',
+    'MatmulOpImplParameters',
+    'MatmulOpImplVariant',
     'MatmulParallelismConfig',
     'MatmulTilingConfig',
     'TILING_OPTIONS',

@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from ....ir.graph import OpImplInstance, OpNode
+from ....ir.graph import OpImplInstance, OpNode, input_tensor_for_role
 from ....passes.utils import sanitize_identifier
 from ...base import (
     OpImplConfig,
@@ -14,7 +14,16 @@ from ...base import (
     OpImplSelectionContext,
     OpImplVariant,
 )
-from .common import TILING_OPTIONS, np_bias_dtype_for_spec, np_dtype_for_spec, select_generation_key, tiling_key
+from .common import (
+    TILING_OPTIONS,
+    describe_family_lhs_staging,
+    describe_family_output_staging,
+    np_bias_dtype_for_spec,
+    np_dtype_for_spec,
+    select_generation_key,
+    tiling_key,
+    validate_family_tile_contract,
+)
 from .types import MatmulParallelismConfig, MatmulTilingConfig
 
 
@@ -96,7 +105,8 @@ class DenseOpImplVariant(OpImplVariant):
         slices = dict(attrs.slices)
         scalars = dict(attrs.scalars)
         flags = dict(attrs.flags)
-        input_view = self._io_view(context.node, context.node.inputs[0].name, 'inputs')
+        lhs_tensor = input_tensor_for_role(context.node, 'lhs')
+        input_view = self._io_view(context.node, lhs_tensor.name, 'inputs')
         perm = input_view.get('perm')
         transpose_input = perm is not None and perm[-1] != (len(perm) - 1)
         cas = int(parallel['cas_length'])
@@ -220,94 +230,24 @@ class DenseOpImplVariant(OpImplVariant):
         return {'packed_weights': packed_W, 'packed_bias': packed_B}
 
     def _describe_dense_ofm(self, node, config, tensor_name, port, buf_dims=None):
-        p = config.parameters
-        tile_m = int(p.tiling.tile_m)
-        tile_n = int(p.tiling.tile_n)
-        out_slice = int(p.rhs_feat_slice)
-        raw_out = int(p.rhs_slice_raw)
-        view = self._io_view(node, tensor_name, 'outputs')
-        shapes = p.io_shapes['outputs'][tensor_name]
-        buffer_order = list(view['buffer_order'])
-        buffer_dimension = (
-            [int(shapes['padded'][i]) for i in buffer_order] if buf_dims is None else [int(x) for x in buf_dims]
-        )
-        io_boundary_dimension = [int(shapes['real'][i]) for i in buffer_order]
-        io_tiling_dimension = list(io_boundary_dimension)
-        feat_dim, indep_dim, traversal_dims = self._canonical_buffer_axes(view, len(buffer_dimension), buffer_order)
-        io_tiling_dimension[feat_dim] = raw_out
-        tiling_dimension = [1 for _ in buffer_dimension]
-        tiling_dimension[feat_dim] = tile_n
-        tiling_dimension[indep_dim] = tile_m
-        tile_traversal = []
-        for dim in traversal_dims:
-            if dim == feat_dim:
-                tile_traversal.append({'dimension': feat_dim, 'stride': tile_n, 'wrap': out_slice // tile_n})
-            elif dim == indep_dim:
-                tile_traversal.append(
-                    {'dimension': indep_dim, 'stride': tile_m, 'wrap': buffer_dimension[indep_dim] // tile_m}
-                )
-            else:
-                tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
-        offset = [0 for _ in buffer_dimension]
-        offset[feat_dim] = port * out_slice
-        return {
-            'access': 'write',
-            'buffer_dimension': buffer_dimension,
-            'tiling_dimension': tiling_dimension,
-            'offset': offset,
-            'tile_traversal': tile_traversal,
-            'io_tiling_dimension': io_tiling_dimension,
-            'io_boundary_dimension': io_boundary_dimension,
-            'slice_dimension': feat_dim,
-            'feature_dimension': feat_dim,
-            'independent_dimension': indep_dim,
-        }
+        return describe_family_output_staging(self, node, config, tensor_name, port, buf_dims)
 
     def _describe_dense_ifm(self, consumer, config, tensor_name, port, buf_dims=None):
+        return describe_family_lhs_staging(self, consumer, config, tensor_name, port, buf_dims)
+
+    def validate_config(self, context: OpImplSelectionContext, config: OpImplConfig) -> None:
         p = config.parameters
-        tile_m = int(p.tiling.tile_m)
-        tile_k = int(p.tiling.tile_k)
-        in_slice = int(p.lhs_feat_slice)
-        raw_in = int(p.lhs_slice_raw)
-        view = self._io_view(consumer, tensor_name, 'inputs')
-        shapes = p.io_shapes['inputs'][tensor_name]
-        buffer_order = list(view['buffer_order'])
-        buffer_dimension = (
-            [int(shapes['padded'][i]) for i in buffer_order] if buf_dims is None else [int(x) for x in buf_dims]
+        validate_family_tile_contract(
+            node_name=context.node.name,
+            precision=p.precision,
+            parallelism=p.parallelism,
+            tiling=p.tiling,
+            padded_independent_extent=p.padded_independent_extent,
+            lhs_feat_slice=p.lhs_feat_slice,
+            rhs_feat_slice=p.rhs_feat_slice,
+            padded_lhs_features=p.padded_lhs_features,
+            padded_rhs_features=p.padded_rhs_features,
         )
-        boundary_dimension = [int(shapes['logical'][i]) for i in buffer_order]
-        io_boundary_dimension = list(boundary_dimension)
-        io_tiling_dimension = list(io_boundary_dimension)
-        feat_dim, indep_dim, traversal_dims = self._canonical_buffer_axes(view, len(buffer_dimension), buffer_order)
-        io_tiling_dimension[feat_dim] = raw_in
-        tiling_dimension = [1 for _ in buffer_dimension]
-        tiling_dimension[feat_dim] = tile_k
-        tiling_dimension[indep_dim] = tile_m
-        tile_traversal = []
-        for dim in traversal_dims:
-            if dim == feat_dim:
-                tile_traversal.append({'dimension': feat_dim, 'stride': tile_k, 'wrap': in_slice // tile_k})
-            elif dim == indep_dim:
-                tile_traversal.append(
-                    {'dimension': indep_dim, 'stride': tile_m, 'wrap': buffer_dimension[indep_dim] // tile_m}
-                )
-            else:
-                tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
-        offset = [0 for _ in buffer_dimension]
-        offset[feat_dim] = port * in_slice
-        return {
-            'access': 'read',
-            'buffer_dimension': buffer_dimension,
-            'tiling_dimension': tiling_dimension,
-            'offset': offset,
-            'tile_traversal': tile_traversal,
-            'boundary_dimension': boundary_dimension,
-            'io_tiling_dimension': io_tiling_dimension,
-            'io_boundary_dimension': io_boundary_dimension,
-            'slice_dimension': feat_dim,
-            'feature_dimension': feat_dim,
-            'independent_dimension': indep_dim,
-        }
 
     def footprint(self, context: OpImplPlacementContext) -> OpImplFootprint:
         p = context.config.parameters

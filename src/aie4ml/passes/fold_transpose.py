@@ -37,9 +37,6 @@ class FoldTransposeViews(AIEPass):
                 raise ValueError(f'{node.name}: transpose rank mismatch between input and output.')
             if sorted(perm) != list(range(rank)):
                 raise ValueError(f'{node.name}: invalid permutation {perm} for rank {rank}.')
-            # TODO not needed if we plan to fuse batch axis in the future
-            if perm[0] != 0:
-                raise ValueError(f'{node.name}: transpose must preserve batch axis at position 0.')
             if (node.metadata.get('data_format', 'channels_last') or '').lower() != 'channels_last':
                 raise ValueError(f'{node.name}: only channels_last transpose is supported.')
 

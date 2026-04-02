@@ -56,10 +56,6 @@ def lower_onnx_model(
     for name, shape in raw_input_shapes.items():
         if not shape:
             raise ValueError(f'{name}: scalar inputs are not supported.')
-        if int(shape[0]) != batch_size:
-            raise ValueError(
-                f'{name}: input batch dimension {shape[0]} does not match AIEConfig.BatchSize={batch_size}.'
-            )
 
     for name, shape in raw_input_shapes.items():
         tensor = TensorVar(name=name, shape=tuple(int(x) for x in shape), precision=None)
@@ -288,11 +284,14 @@ def lower_onnx_model(
             if op_type == 'MatMul':
                 if len(node.input) != 2:
                     raise ValueError(f'{node_name}: MatMul must have exactly 2 inputs.')
-                act_name, weight_name = node.input
+                lhs_name, rhs_name = node.input
                 bias_name = None
                 trans_b = False
                 if attr(node, 'transA', 0) not in (0, False):
                     raise ValueError(f'{node_name}: transA is not supported.')
+                rhs_is_constant = rhs_name in initializers or (
+                    rhs_name in value_tensors and value_tensors[rhs_name].is_parameter
+                )
             else:
                 if len(node.input) not in (2, 3):
                     raise ValueError(f'{node_name}: Gemm must have 2 or 3 inputs.')
@@ -302,66 +301,134 @@ def lower_onnx_model(
                     raise ValueError(f'{node_name}: Gemm beta must be 1.')
                 if int(attr(node, 'transA', 0)) != 0:
                     raise ValueError(f'{node_name}: Gemm transA is not supported.')
-                act_name, weight_name = node.input[:2]
+                lhs_name, rhs_name = node.input[:2]
                 bias_name = node.input[2] if len(node.input) == 3 else None
                 trans_b = int(attr(node, 'transB', 0)) == 1
+                # NOTE: Gemm is currently normalized only through the static-RHS dense path.
+                # Dynamic RHS Gemm is intentionally unsupported here; add an explicit
+                # Gemm -> MatMul(+Add) canonicalization first if that subset is needed.
+                rhs_is_constant = True
 
-            act_tensor = _source_for(act_name, node_name)
-            weight_tensor = _parameter_source_for(weight_name, node_name)
-            if act_tensor.is_parameter:
+            lhs_tensor = _source_for(lhs_name, node_name)
+            if lhs_tensor.is_parameter:
                 raise ValueError(f'{node_name}: activation input cannot be constant.')
-            if not weight_tensor.is_parameter:
-                raise ValueError(f'{node_name}: weight input must be a constant initializer.')
 
-            act_shape = tuple(int(x) for x in shape_of[act_name])
-            weight_data = np.asarray(weight_tensor.data, dtype=np.float64)
-            if trans_b:
-                weight_data = np.transpose(weight_data)
-            if weight_data.ndim != 2:
-                raise ValueError(f'{node_name}: only rank-2 weight matrices are supported.')
-            if len(act_shape) < 1:
+            lhs_shape = tuple(int(x) for x in shape_of[lhs_name])
+            if len(lhs_shape) < 1:
                 raise ValueError(f'{node_name}: scalar activations are not supported.')
-            if int(act_shape[-1]) != int(weight_data.shape[0]):
-                raise ValueError(
-                    f'{node_name}: activation feature dimension {act_shape[-1]} '
-                    f'does not match weight input dimension {weight_data.shape[0]}.'
+
+            if rhs_is_constant:
+                rhs_tensor = _parameter_source_for(rhs_name, node_name)
+                if not rhs_tensor.is_parameter:
+                    raise ValueError(f'{node_name}: weight input must be a constant initializer.')
+
+                rhs_data = np.asarray(rhs_tensor.data, dtype=np.float64)
+                if trans_b:
+                    rhs_data = np.transpose(rhs_data)
+                if rhs_data.ndim != 2:
+                    raise ValueError(f'{node_name}: only rank-2 weight matrices are supported.')
+                if int(lhs_shape[-1]) != int(rhs_data.shape[0]):
+                    raise ValueError(
+                        f'{node_name}: activation feature dimension {lhs_shape[-1]} '
+                        f'does not match weight input dimension {rhs_data.shape[0]}.'
+                    )
+
+                n_in = int(rhs_data.shape[0])
+                n_out = int(rhs_data.shape[1])
+                out_shape = tuple(list(lhs_shape[:-1]) + [n_out])
+
+                rhs_param = _param_tensor(f'{node_name}_weight', rhs_data, rhs_tensor.precision)
+                op = OpNode(name=f'{node_name}_aie', op_type='dense', dialect=ctx.device.dialect)
+                op.metadata.update(
+                    attach_quant_role_bindings(
+                        {
+                            'n_in': n_in,
+                            'n_out': n_out,
+                            'use_bias': False,
+                            'layer_class': 'Dense',
+                            'source_class': op_type,
+                            'source_layer': node_name,
+                            'input_roles': ['lhs', 'rhs'],
+                        }
+                    )
                 )
+                op.directives.update(directives)
+                lhs_tensor.consumers.append(op)
+                op.inputs.extend([lhs_tensor, rhs_param])
 
-            n_in = int(weight_data.shape[0])
-            n_out = int(weight_data.shape[1])
-            out_shape = tuple(list(act_shape[:-1]) + [n_out])
+                if bias_name is not None:
+                    bias_tensor = _parameter_source_for(bias_name, node_name)
+                    if not bias_tensor.is_parameter:
+                        raise ValueError(f'{node_name}: Gemm bias must be constant.')
+                    bias_data = np.asarray(bias_tensor.data, dtype=np.float64).reshape(-1)
+                    if int(bias_data.size) != n_out:
+                        raise ValueError(f'{node_name}: Gemm bias must contain exactly {n_out} elements.')
+                    bias_param = _param_tensor(f'{node_name}_bias', bias_data, bias_tensor.precision)
+                    op.inputs.append(bias_param)
+                    op.metadata['use_bias'] = True
+                    op.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
+                    attach_quant_role_bindings(op.metadata)
+            else:
+                if bias_name is not None:
+                    raise ValueError(f'{node_name}: dynamic MatMul does not support fused bias.')
+                rhs_tensor = _source_for(rhs_name, node_name)
+                if rhs_tensor.is_parameter:
+                    raise ValueError(f'{node_name}: dynamic MatMul RHS must be a runtime tensor.')
+                if isinstance(rhs_tensor.precision, QuantIntent) and not rhs_tensor.precision.signed:
+                    raise ValueError(f'{node_name}: dynamic MatMul RHS must use a signed integer quantization.')
 
-            weight_param = _param_tensor(f'{node_name}_weight', weight_data, weight_tensor.precision)
-            op = OpNode(name=f'{node_name}_aie', op_type='dense', dialect=ctx.device.dialect)
-            op.metadata.update(
-                attach_quant_role_bindings(
-                    {
-                        'n_in': n_in,
-                        'n_out': n_out,
-                        'use_bias': False,
-                        'layer_class': 'Dense',
-                        'source_class': op_type,
-                        'source_layer': node_name,
-                        'input_roles': ['lhs', 'rhs'],
-                    }
+                if len(lhs_shape) < 2:
+                    raise ValueError(f'{node_name}: dynamic MatMul LHS rank must be >=2, got {len(lhs_shape)}.')
+                rhs_shape = tuple(int(x) for x in shape_of[rhs_name])
+                if len(rhs_shape) < 2:
+                    raise ValueError(f'{node_name}: dynamic MatMul RHS rank must be >=2, got {len(rhs_shape)}.')
+
+                if len(rhs_shape) == 2:
+                    n_in = int(rhs_shape[0])
+                    n_out = int(rhs_shape[1])
+                    out_shape = tuple(list(lhs_shape[:-1]) + [n_out])
+                else:
+                    if len(rhs_shape) != len(lhs_shape):
+                        raise ValueError(
+                            f'{node_name}: dynamic MatMul only supports rank-2 RHS or '
+                            f'LHS/RHS with the same rank; got lhs rank {len(lhs_shape)} '
+                            f'and rhs rank {len(rhs_shape)}.'
+                        )
+                    lhs_leading = tuple(int(x) for x in lhs_shape[:-2])
+                    rhs_leading = tuple(int(x) for x in rhs_shape[:-2])
+                    if rhs_leading != lhs_leading:
+                        raise ValueError(
+                            f'{node_name}: dynamic MatMul requires rhs leading dimensions '
+                            f'{rhs_leading} to match lhs leading dimensions {lhs_leading}.'
+                        )
+                    n_in = int(rhs_shape[-2])
+                    n_out = int(rhs_shape[-1])
+                    out_shape = tuple(list(lhs_shape[:-2]) + [int(lhs_shape[-2]), n_out])
+
+                if int(lhs_shape[-1]) != n_in:
+                    raise ValueError(
+                        f'{node_name}: activation feature dimension {lhs_shape[-1]} '
+                        f'does not match RHS input dimension {n_in}.'
+                    )
+
+                op = OpNode(name=f'{node_name}_aie', op_type='matmul', dialect=ctx.device.dialect)
+                op.metadata.update(
+                    attach_quant_role_bindings(
+                        {
+                            'n_in': n_in,
+                            'n_out': n_out,
+                            'use_bias': False,
+                            'layer_class': 'MatMul',
+                            'source_class': 'MatMul',
+                            'source_layer': node_name,
+                            'input_roles': ['lhs', 'rhs'],
+                        }
+                    )
                 )
-            )
-            op.directives.update(directives)
-            act_tensor.consumers.append(op)
-            op.inputs.extend([act_tensor, weight_param])
-
-            if bias_name is not None:
-                bias_tensor = _parameter_source_for(bias_name, node_name)
-                if not bias_tensor.is_parameter:
-                    raise ValueError(f'{node_name}: Gemm bias must be constant.')
-                bias_data = np.asarray(bias_tensor.data, dtype=np.float64).reshape(-1)
-                if int(bias_data.size) != n_out:
-                    raise ValueError(f'{node_name}: Gemm bias must contain exactly {n_out} elements.')
-                bias_param = _param_tensor(f'{node_name}_bias', bias_data, bias_tensor.precision)
-                op.inputs.append(bias_param)
-                op.metadata['use_bias'] = True
-                op.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
-                attach_quant_role_bindings(op.metadata)
+                op.directives.update(directives)
+                lhs_tensor.consumers.append(op)
+                rhs_tensor.consumers.append(op)
+                op.inputs.extend([lhs_tensor, rhs_tensor])
 
             out_tensor = TensorVar(name=node.output[0], shape=out_shape, precision=None, producer=op)
             graph.add_tensor(out_tensor)
@@ -445,6 +512,31 @@ def lower_onnx_model(
             tensor.name = output.name
             graph.tensors[output.name] = tensor
         graph.mark_graph_output(output.name)
+
+    def _lhs_consumed(tensor, seen=None) -> bool:
+        seen = set() if seen is None else seen
+        tid = id(tensor)
+        if tid in seen:
+            return False
+        seen.add(tid)
+        for consumer in tensor.consumers:
+            if consumer.op_type == 'transpose' and consumer.outputs:
+                if _lhs_consumed(consumer.outputs[0], seen):
+                    return True
+                continue
+            roles = list(consumer.metadata.get('input_roles') or [])
+            for index, bound in enumerate(consumer.inputs):
+                if bound is tensor and index < len(roles) and roles[index] == 'lhs':
+                    return True
+        return False
+
+    for tensor in graph.graph_inputs():
+        input_name = tensor.name
+        lhs_consumed = _lhs_consumed(tensor)
+        if lhs_consumed and int(tensor.shape[0]) != batch_size:
+            raise ValueError(
+                f'{input_name}: input batch dim. {tensor.shape[0]} does not match AIEConfig.BatchSize={batch_size}.'
+            )
 
     for tensor in graph.tensors.values():
         if tensor.is_parameter:

@@ -4,6 +4,12 @@ import copy
 
 from ..ir import get_backend_context
 from .base import AIEPass
+from .boundary_sharding import (
+    graph_input_full_descriptor,
+    graph_input_port_descs,
+    graph_input_unit_box,
+    graph_input_writer_port_descs,
+)
 
 
 class LegalizeMemtilePortLimits(AIEPass):
@@ -19,6 +25,7 @@ class LegalizeMemtilePortLimits(AIEPass):
         max_out = int(ctx.device.max_mem_out_ports)
         rewritten = []
         changed = False
+        next_graph_input_port = 0
 
         for entry in entries:
             if len(entry.consumers) > 1:
@@ -33,17 +40,33 @@ class LegalizeMemtilePortLimits(AIEPass):
             c = self._consumer_ports(entry, p, ctx)
             units = max((p + max_in - 1) // max_in, (c + max_out - 1) // max_out)
 
-            shard_dim, port_stride, full_dim = self._shard_params(entry, p, ctx)
+            port_base = next_graph_input_port if entry.producer is None else 0
+            if entry.producer is None:
+                next_graph_input_port += p
+
+            graph_input_descs = None if entry.producer is not None else graph_input_port_descs(entry, ctx, port_base)
+            if entry.producer is None:
+                shard_dim = port_stride = full_dim = None
+            else:
+                shard_dim, port_stride, full_dim = self._shard_params(entry, p, ctx)
 
             if units == 1:
                 legal = copy.copy(entry)
                 legal.producer_ports = p
-                legal.producer_port_ids = list(range(p))
+                legal.producer_port_ids = [port_base + i for i in range(p)]
+                legal.producer_tensor_port_base = int(port_base)
                 legal.consumer_port_ids = list(range(c)) if entry.consumers else []
-                legal.shard_dim = int(shard_dim)
-                legal.shard_port_stride = int(port_stride)
-                legal.shard_dim_base = 0
-                legal.shard_dim_size = int(full_dim)
+                if graph_input_descs is not None:
+                    full = graph_input_full_descriptor(entry, ctx)
+                    legal.shard_offset_base = [0 for _ in full['offset']]
+                    legal.shard_buffer_dimension = list(full['buffer_dimension'])
+                    legal.graph_input_port_descs = dict(graph_input_descs)
+                    legal.graph_input_writer_port_descs = graph_input_writer_port_descs(graph_input_descs)
+                else:
+                    legal.shard_dim = int(shard_dim)
+                    legal.shard_port_stride = int(port_stride)
+                    legal.shard_dim_base = 0
+                    legal.shard_dim_size = int(full_dim)
                 legal.shard_index = 0
                 legal.shard_count = 1
                 self._validate_limits(legal, max_in, max_out)
@@ -54,19 +77,35 @@ class LegalizeMemtilePortLimits(AIEPass):
             if entry.consumers:
                 if c < p:
                     raise ValueError(
-                        f'{entry.tensor}: units={units} requires consumer_ports >= producer_ports ' f'(p={p}, c={c}).'
+                        f'{entry.tensor}: units={units} requires consumer_ports to be >= producer_ports '
+                        f'for automatic sharding (p={p}, c={c}). '
+                        'Current one-stage sharding only supports regular producer-to-consumer expansion per shard; '
+                        'port contraction/regrouping is not implemented.'
                     )
                 if c % p != 0:
                     raise ValueError(
-                        f'{entry.tensor}: units={units} requires consumer_ports be a multiple of producer_ports '
-                        f'(p={p}, c={c}).'
+                        f'{entry.tensor}: units={units} requires consumer_ports to be a clean multiple of '
+                        f'producer_ports for automatic sharding (p={p}, c={c}). '
+                        'Current one-stage sharding requires each producer port to map to the same number '
+                        'of consumer ports in every shard.'
                     )
 
             p_chunks = self._split_ports_serial(p, units)
+            if entry.producer is None:
+                p_chunks = [[port_base + i for i in chunk] for chunk in p_chunks]
             if entry.consumers:
                 c_per_p = c // p
                 if c_per_p * p != c:
                     raise ValueError(f'{entry.tensor}: invalid consumer/producer port ratio (c={c}, p={p}).')
+                if entry.producer is not None:
+                    per_shard_out = max((len(p_ports) * c_per_p for p_ports in p_chunks), default=0)
+                    if per_shard_out > max_out:
+                        raise ValueError(
+                            f'{entry.tensor}: one-stage sharding cannot realize producer_ports={p} '
+                            f'-> consumer_ports={c} under memtile out-port limit {max_out}; '
+                            f'each producer port maps to {c_per_p} consumer ports, '
+                            f'so relay expansion would be required.'
+                        )
                 c_chunks = []
                 start = 0
                 for p_ports in p_chunks:
@@ -78,22 +117,34 @@ class LegalizeMemtilePortLimits(AIEPass):
             else:
                 c_chunks = [[] for _ in range(units)]
 
-            unit_sizes = [len(chunk) * int(port_stride) for chunk in p_chunks]
-            unit_bases = []
-            acc = 0
-            for sz in unit_sizes:
-                unit_bases.append(acc)
-                acc += int(sz)
+            unit_boxes = None
+            if graph_input_descs is None:
+                unit_sizes = [len(chunk) * int(port_stride) for chunk in p_chunks]
+                unit_bases = []
+                acc = 0
+                for sz in unit_sizes:
+                    unit_bases.append(acc)
+                    acc += int(sz)
+            else:
+                unit_boxes = [graph_input_unit_box(graph_input_descs, chunk) for chunk in p_chunks]
 
             for unit, (p_ports, c_ports) in enumerate(zip(p_chunks, c_chunks)):
                 legal = copy.copy(entry)
                 legal.producer_ports = len(p_ports)
                 legal.producer_port_ids = list(p_ports)
+                legal.producer_tensor_port_base = int(port_base)
                 legal.consumer_port_ids = list(c_ports)
-                legal.shard_dim = int(shard_dim)
-                legal.shard_port_stride = int(port_stride)
-                legal.shard_dim_base = int(unit_bases[unit])
-                legal.shard_dim_size = int(unit_sizes[unit])
+                if graph_input_descs is not None:
+                    base, dims = unit_boxes[unit]
+                    legal.shard_offset_base = list(base)
+                    legal.shard_buffer_dimension = list(dims)
+                    legal.graph_input_port_descs = dict(graph_input_descs)
+                    legal.graph_input_writer_port_descs = graph_input_writer_port_descs(graph_input_descs)
+                else:
+                    legal.shard_dim = int(shard_dim)
+                    legal.shard_port_stride = int(port_stride)
+                    legal.shard_dim_base = int(unit_bases[unit])
+                    legal.shard_dim_size = int(unit_sizes[unit])
                 legal.shard_index = int(unit)
                 legal.shard_count = int(units)
                 self._validate_limits(legal, max_in, max_out)

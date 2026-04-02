@@ -119,6 +119,22 @@ class OpNode:
         return self.traits.get(name, TraitInstance(name)).data
 
 
+def input_role_map(node: OpNode) -> Dict[str, str]:
+    roles = list(node.metadata.get('input_roles') or [])
+    return {tensor.name: str(roles[index]) for index, tensor in enumerate(node.inputs) if index < len(roles)}
+
+
+def input_role(node: OpNode, tensor_name: str) -> str:
+    return input_role_map(node).get(tensor_name, '')
+
+
+def input_tensor_for_role(node: OpNode, role: str) -> TensorVar:
+    for tensor in node.inputs:
+        if input_role(node, tensor.name) == role:
+            return tensor
+    raise ValueError(f'{node.name}: missing {role} tensor.')
+
+
 @dataclass
 class LogicalIR:
     """
