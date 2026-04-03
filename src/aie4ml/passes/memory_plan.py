@@ -16,6 +16,8 @@ from .boundary_sharding import (
 )
 from .utils import sanitize_identifier
 
+TRANSPORT_TOPOLOGY_KINDS = ('direct', 'shard', 'split', 'join', 'boundary', 'relay')
+
 
 @dataclass
 class _Connection:
@@ -48,6 +50,9 @@ class _EdgeEntry:
     graph_input_writer_port_descs: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     shard_index: int = 0
     shard_count: int = 1
+    topology_kind: Optional[str] = None
+    staging_compatible: Optional[bool] = None
+    realization_kind: Optional[str] = None
 
 
 class BuildMemoryPlan(AIEPass):
@@ -98,7 +103,7 @@ class _CodegenPlanner:
 
     def build(self, nodes):
         state = self.collect(nodes)
-        return self.materialize(state)
+        return self.materialize(_legalize_collected_entries(self.ctx, state))
 
     def collect(self, nodes):
         idx = 0
@@ -226,91 +231,51 @@ class _CodegenPlanner:
             raise RuntimeError(f'{entry.tensor}: materializer does not accept mixed consumer + graph_output entry.')
         if not entry.producer_port_ids:
             raise RuntimeError(f'{entry.tensor}: missing producer_port_ids; run port-limit legalization first.')
+        p_ports = [int(x) for x in entry.producer_port_ids]
+        c_ports = [int(x) for x in entry.consumer_port_ids]
+        realization = self._route(entry)
+        if realization == 'direct':
+            if (
+                entry.shard_count != 1
+                or entry.producer is None
+                or entry.graph_output
+                or len(entry.consumers) != 1
+                or len(p_ports) != len(c_ports)
+            ):
+                raise RuntimeError(f'{entry.tensor}: direct realization invariant violated.')
+            self._emit_direct(entry, p_ports, c_ports)
+            return
+        if realization != 'memtile':
+            raise RuntimeError(f'{entry.tensor}: unsupported transport realization {realization!r}.')
         graph_input_generic = entry.producer is None and bool(entry.graph_input_port_descs)
         if not graph_input_generic and (
             entry.shard_dim is None or entry.shard_port_stride is None or entry.shard_dim_size is None
         ):
             raise RuntimeError(f'{entry.tensor}: missing shard metadata; run port-limit legalization first.')
+        self._emit_memtile(entry, p_ports, c_ports)
 
-        p_ports = [int(x) for x in entry.producer_port_ids]
-        c_ports = [int(x) for x in entry.consumer_port_ids]
-
-        route = self._route_policy(entry)
-        direct_eligible = (
-            entry.shard_count == 1
-            and entry.producer
-            and not entry.graph_output
-            and len(entry.consumers) == 1
-            and len(p_ports) == len(c_ports)
-            and entry.consumers[0].consumer.traits['io_view'].data['inputs'][entry.tensor].get('perm') is None
-            and self._direct_transport_supported(entry, p_ports, c_ports)
-        )
-
-        if route == 'direct':
-            if not direct_eligible:
-                raise RuntimeError(f'{entry.tensor}: io_route=direct requested but direct transport is not legal.')
-            self._emit_direct(entry, p_ports, c_ports)
-            return
-
-        if direct_eligible and route != 'memtile':
-            self._emit_direct(entry, p_ports, c_ports)
-        else:
-            self._emit_memtile(entry, p_ports, c_ports)
-
-    @staticmethod
-    def _normalized_direct_staging(desc: Dict[str, Any] | None) -> Dict[str, Any] | None:
-        if desc is None:
-            return None
-        data = {k: v for k, v in desc.items() if k not in ('access', 'boundary_dimension')}
-        if 'io_boundary_dimension' in data and 'boundary_dimension' not in data:
-            data['boundary_dimension'] = data['io_boundary_dimension']
-        return data
-
-    def _direct_transport_supported(self, entry: _EdgeEntry, p_ports: List[int], c_ports: List[int]) -> bool:
-        if entry.producer is None or len(entry.consumers) != 1 or len(p_ports) != len(c_ports):
-            return False
-        src_inst = self._kernel_inst(entry.producer)
-        dst_inst = self._kernel_inst(entry.consumers[0].consumer)
-        for p_port, c_port in zip(p_ports, c_ports):
-            src_desc = src_inst.variant.describe_output_staging(
-                entry.producer, src_inst.config, entry.tensor, int(p_port), None
+    def _route(self, entry: _EdgeEntry) -> str:
+        if entry.realization_kind is None:
+            raise RuntimeError(f'{entry.tensor}: missing transport realization; run transport classification first.')
+        if entry.topology_kind is None:
+            raise RuntimeError(f'{entry.tensor}: missing transport topology; run transport classification first.')
+        if entry.topology_kind not in TRANSPORT_TOPOLOGY_KINDS:
+            raise RuntimeError(f'{entry.tensor}: unsupported transport topology {entry.topology_kind!r}.')
+        if entry.topology_kind == 'relay':
+            raise NotImplementedError(f'{entry.tensor}: transport topology relay is not implemented.')
+        if entry.topology_kind == 'split':
+            raise NotImplementedError(f'{entry.tensor}: transport topology split is not implemented.')
+        if entry.topology_kind == 'join':
+            raise NotImplementedError(f'{entry.tensor}: transport topology join is not implemented.')
+        if entry.topology_kind != 'direct' and entry.staging_compatible is not None:
+            raise RuntimeError(
+                f'{entry.tensor}: non-direct transport topology {entry.topology_kind} cannot carry staging_compatible.'
             )
-            dst_desc = dst_inst.variant.describe_input_staging(
-                entry.consumers[0].consumer,
-                dst_inst.config,
-                entry.tensor,
-                int(c_port),
-                None,
-                entry.producer,
-            )
-            if self._normalized_direct_staging(src_desc) != self._normalized_direct_staging(dst_desc):
-                return False
-        return True
-
-    def _route_policy(self, entry: _EdgeEntry) -> str:
-        if entry.producer is None or entry.graph_output:
-            return 'memtile'
-
-        modes = set()
-        p_inst = self._kernel_inst(entry.producer)
-        p_mode = p_inst.config.io_route.get('outputs', {}).get(entry.tensor)
-        if p_mode:
-            modes.add(str(p_mode))
-
-        for c in entry.consumers:
-            c_inst = self._kernel_inst(c.consumer)
-            c_mode = c_inst.config.io_route.get('inputs', {}).get(entry.tensor)
-            if c_mode:
-                modes.add(str(c_mode))
-
-        bad = [m for m in modes if m not in ('direct', 'memtile', 'auto')]
-        if bad:
-            raise ValueError(f'{entry.tensor}: unsupported io_route mode(s) {bad}.')
-        if 'memtile' in modes:
-            return 'memtile'
-        if modes == {'direct'}:
-            return 'direct'
-        return 'auto'
+        if entry.topology_kind == 'direct' and entry.staging_compatible is None:
+            raise RuntimeError(f'{entry.tensor}: direct transport topology requires staging_compatible to be set.')
+        if entry.realization_kind not in ('direct', 'memtile'):
+            raise RuntimeError(f'{entry.tensor}: unsupported transport realization {entry.realization_kind!r}.')
+        return entry.realization_kind
 
     # ------------------------------------------------------------------
     # Direct
@@ -602,3 +567,18 @@ class _CodegenPlanner:
 
         stem = f'buffer_{base}{suffix}'
         return stem if idx == 1 else f'{stem}_{idx}'
+
+
+def _legalize_collected_entries(ctx, state):
+    ctx.ir.physical.plan = {'_memory_plan_state': state}
+
+    from .fanout_legalize import LegalizeFanoutEntries
+    from .memtile_legalize import LegalizeMemtilePortLimits
+    from .placement import PlaceKernels
+    from .transport_classify import ClassifyTransportEntries
+
+    LegalizeFanoutEntries().transform(ctx)
+    ClassifyTransportEntries().transform(ctx)
+    PlaceKernels().transform(ctx)
+    LegalizeMemtilePortLimits().transform(ctx)
+    return ctx.ir.physical.plan['_memory_plan_state']

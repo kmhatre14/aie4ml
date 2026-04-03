@@ -28,16 +28,57 @@ class LegalizeMemtilePortLimits(AIEPass):
         next_graph_input_port = 0
 
         for entry in entries:
+            if entry.topology_kind is None:
+                raise RuntimeError(f'{entry.tensor}: missing transport topology; run transport classification first.')
+            if entry.realization_kind is None:
+                raise RuntimeError(
+                    f'{entry.tensor}: missing transport realization; run transport classification first.'
+                )
+            if entry.topology_kind == 'relay':
+                raise NotImplementedError(f'{entry.tensor}: transport topology relay is not implemented.')
+            if entry.topology_kind == 'split':
+                raise NotImplementedError(f'{entry.tensor}: transport topology split is not implemented.')
+            if entry.topology_kind == 'join':
+                raise NotImplementedError(f'{entry.tensor}: transport topology join is not implemented.')
             if len(entry.consumers) > 1:
-                raise ValueError(
-                    f'{entry.tensor}: LegalizeMemtilePortLimits received an entry with '
-                    f'{len(entry.consumers)} consumers. LegalizeFanoutEntries must run first.'
+                raise RuntimeError(
+                    f'{entry.tensor}: unsupported join transport; memtile legalization requires '
+                    f'post-fanout single-consumer entries, got {len(entry.consumers)} consumers.'
                 )
             if entry.consumers and entry.graph_output:
-                raise ValueError(f'{entry.tensor}: mixed consumer + graph_output entry is not legal.')
+                raise RuntimeError(
+                    f'{entry.tensor}: unsupported boundary transport mix; '
+                    'memtile legalization requires graph-output legs to be separated from consumer legs.'
+                )
 
             p = max(1, int(entry.producer_ports))
             c = self._consumer_ports(entry, p, ctx)
+            if entry.realization_kind == 'direct':
+                if entry.producer is None or entry.graph_output:
+                    raise RuntimeError(f'{entry.tensor}: direct realization is only valid for internal consumer edges.')
+                if c != p:
+                    raise RuntimeError(
+                        f'{entry.tensor}: direct realization requires matching producer/consumer '
+                        f'port counts ({p} != {c}).'
+                    )
+                legal = copy.copy(entry)
+                legal.producer_ports = p
+                legal.producer_port_ids = list(range(p))
+                legal.producer_tensor_port_base = 0
+                legal.consumer_port_ids = list(range(c))
+                legal.shard_dim = None
+                legal.shard_port_stride = None
+                legal.shard_dim_base = 0
+                legal.shard_dim_size = None
+                legal.shard_offset_base = []
+                legal.shard_buffer_dimension = []
+                legal.graph_input_port_descs = {}
+                legal.graph_input_writer_port_descs = {}
+                legal.shard_index = 0
+                legal.shard_count = 1
+                rewritten.append(legal)
+                continue
+
             units = max((p + max_in - 1) // max_in, (c + max_out - 1) // max_out)
 
             port_base = next_graph_input_port if entry.producer is None else 0
@@ -76,18 +117,14 @@ class LegalizeMemtilePortLimits(AIEPass):
             changed = True
             if entry.consumers:
                 if c < p:
-                    raise ValueError(
-                        f'{entry.tensor}: units={units} requires consumer_ports to be >= producer_ports '
-                        f'for automatic sharding (p={p}, c={c}). '
-                        'Current one-stage sharding only supports regular producer-to-consumer expansion per shard; '
-                        'port contraction/regrouping is not implemented.'
+                    raise NotImplementedError(
+                        f'{entry.tensor}: shard transport requires relay; '
+                        f'one-stage sharding cannot contract producer_ports={p} to consumer_ports={c}.'
                     )
                 if c % p != 0:
-                    raise ValueError(
-                        f'{entry.tensor}: units={units} requires consumer_ports to be a clean multiple of '
-                        f'producer_ports for automatic sharding (p={p}, c={c}). '
-                        'Current one-stage sharding requires each producer port to map to the same number '
-                        'of consumer ports in every shard.'
+                    raise NotImplementedError(
+                        f'{entry.tensor}: shard transport requires relay; '
+                        f'one-stage sharding cannot regroup producer_ports={p} to consumer_ports={c}.'
                     )
 
             p_chunks = self._split_ports_serial(p, units)
@@ -96,15 +133,17 @@ class LegalizeMemtilePortLimits(AIEPass):
             if entry.consumers:
                 c_per_p = c // p
                 if c_per_p * p != c:
-                    raise ValueError(f'{entry.tensor}: invalid consumer/producer port ratio (c={c}, p={p}).')
+                    raise RuntimeError(
+                        f'{entry.tensor}: shard transport internal error; '
+                        f'invalid consumer/producer port ratio (c={c}, p={p}).'
+                    )
                 if entry.producer is not None:
                     per_shard_out = max((len(p_ports) * c_per_p for p_ports in p_chunks), default=0)
                     if per_shard_out > max_out:
-                        raise ValueError(
-                            f'{entry.tensor}: one-stage sharding cannot realize producer_ports={p} '
-                            f'-> consumer_ports={c} under memtile out-port limit {max_out}; '
-                            f'each producer port maps to {c_per_p} consumer ports, '
-                            f'so relay expansion would be required.'
+                        raise NotImplementedError(
+                            f'{entry.tensor}: shard transport requires relay; '
+                            f'one-stage sharding cannot realize producer_ports={p} -> consumer_ports={c} '
+                            f'under memtile out-port limit {max_out}.'
                         )
                 c_chunks = []
                 start = 0
@@ -113,7 +152,10 @@ class LegalizeMemtilePortLimits(AIEPass):
                     c_chunks.append(list(range(start, start + size)))
                     start += size
                 if start != c:
-                    raise ValueError(f'{entry.tensor}: internal consumer chunking mismatch ({start} != {c}).')
+                    raise RuntimeError(
+                        f'{entry.tensor}: shard transport internal error; '
+                        f'consumer chunking mismatch ({start} != {c}).'
+                    )
             else:
                 c_chunks = [[] for _ in range(units)]
 
@@ -178,7 +220,10 @@ class LegalizeMemtilePortLimits(AIEPass):
     def _validate_limits(entry, max_in: int, max_out: int) -> None:
         in_ports = len(entry.producer_port_ids)
         if in_ports > max_in:
-            raise ValueError(f'{entry.tensor}: shard exceeds memtile in-port limit ({in_ports} > {max_in}).')
+            raise RuntimeError(
+                f'{entry.tensor}: shard transport internal error; '
+                f'shard exceeds memtile in-port limit ({in_ports} > {max_in}).'
+            )
 
         out_ports = (
             len(entry.consumer_port_ids)
@@ -186,7 +231,10 @@ class LegalizeMemtilePortLimits(AIEPass):
             else (len(entry.producer_port_ids) if entry.graph_output else 0)
         )
         if out_ports > max_out:
-            raise ValueError(f'{entry.tensor}: shard exceeds memtile out-port limit ({out_ports} > {max_out}).')
+            raise RuntimeError(
+                f'{entry.tensor}: shard transport internal error; '
+                f'shard exceeds memtile out-port limit ({out_ports} > {max_out}).'
+            )
 
     @staticmethod
     def _shard_params(entry, producer_ports: int, ctx):
@@ -219,8 +267,8 @@ class LegalizeMemtilePortLimits(AIEPass):
         full_dim = int(d0['buffer_dimension'][shard_dim])
 
         if full_dim != port_stride * int(producer_ports):
-            raise ValueError(
-                f'{entry.tensor}: cannot shard dim{shard_dim}; '
+            raise RuntimeError(
+                f'{entry.tensor}: shard transport is not legal on dim{shard_dim}; '
                 f'expected buffer_dimension[{shard_dim}] == port_stride * ports '
                 f'({full_dim} != {port_stride} * {producer_ports}).'
             )

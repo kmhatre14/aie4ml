@@ -12,6 +12,7 @@ from .memtile_legalize import LegalizeMemtilePortLimits
 from .pack import PackKernelArtifacts
 from .placement import PlaceKernels
 from .resolve import Resolve
+from .transport_classify import ClassifyTransportEntries
 
 __all__ = [
     'AIEPass',
@@ -27,6 +28,7 @@ __all__ = [
     'PackKernelArtifacts',
     'PlaceKernels',
     'CollectMemoryEntries',
+    'ClassifyTransportEntries',
     'MaterializeMemoryPlan',
     'BuildMemoryPlan',
 ]

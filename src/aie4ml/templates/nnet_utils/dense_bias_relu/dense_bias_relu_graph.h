@@ -29,30 +29,38 @@ public:
   output_port out1[CAS_NUM];
   kernel kk[CAS_NUM * CAS_LENGTH]; // row wise
 
-  void place_graph(int COL_START, int ROW_START)
+void place_graph(int COL_START, int ROW_START)
+{
+  for (int idx = 0; idx < CAS_NUM * CAS_LENGTH; ++idx)
   {
-    // NOTE this placement works only for BufferOptLevel8
-    // TODO find why the rtp buffers need one additional bank
-    // TODO examine if co-locating this bank with another bank introduces memory delays
-    for (int idx = 0; idx < CAS_NUM * CAS_LENGTH; ++idx)
-    {
-      int tileRow = ROW_START + (idx / CAS_LENGTH);
-      int tileCol = COL_START + (idx % CAS_LENGTH);
-      adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
-      // place buffers on west tile because each AI Engine-ML accesses its own memory to the east
-      adf::location<adf::buffer>(kk[idx].in[0]) = { adf::bank(tileCol-1, tileRow, 0), adf::bank(tileCol-1, tileRow, 3) };
-      adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol-1, tileRow, 1);
-      adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol-1, tileRow, 2);
-      if (idx % CAS_LENGTH == CAS_LENGTH - 1){
-          adf::location<adf::buffer>(kk[idx].out[0]) = { adf::bank(tileCol, tileRow, 1), adf::bank(tileCol, tileRow, 2) };
-          if (CAS_LENGTH == 1){ // match the bias argument for kernel dense_first/dense_last
-              adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, 0);
-          }else{
-              adf::location<adf::buffer>(kk[idx].in[3]) = adf::bank(tileCol, tileRow, 0);
-          }
+    const int tileRow = ROW_START + (idx / CAS_LENGTH);
+    const int tileCol = COL_START + (idx % CAS_LENGTH);
+    const bool is_last = (idx % CAS_LENGTH) == (CAS_LENGTH - 1);
+
+    adf::location<adf::kernel>(kk[idx]) = adf::tile(tileCol, tileRow);
+
+    adf::location<adf::buffer>(kk[idx].in[0]) = {
+      adf::bank(tileCol - 1, tileRow, 0),
+      adf::bank(tileCol - 1, tileRow, 3)
+    };
+
+    adf::location<adf::stack>(kk[idx]) = adf::bank(tileCol, tileRow, 1);
+    adf::location<adf::buffer>(kk[idx].in[1]) = adf::bank(tileCol, tileRow, 2);
+
+    if (is_last) {
+      adf::location<adf::buffer>(kk[idx].out[0]) = {
+        adf::bank(tileCol, tileRow, 0),
+        adf::bank(tileCol, tileRow, 3)
+      };
+
+      if constexpr (CAS_LENGTH == 1) {
+        adf::location<adf::buffer>(kk[idx].in[2]) = adf::bank(tileCol, tileRow, 1);
+      } else {
+        adf::location<adf::buffer>(kk[idx].in[3]) = adf::bank(tileCol, tileRow, 1);
       }
     }
   }
+}
 
   dense_bias_relu_graph( void )
   {

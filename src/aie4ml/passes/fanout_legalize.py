@@ -44,8 +44,14 @@ class LegalizeFanoutEntries(AIEPass):
 
         for entry in state['entries']:
             if len(entry.consumers) > 1:
-                raise ValueError(f'{entry.tensor}: fanout legalization incomplete.')
+                raise RuntimeError(
+                    f'{entry.tensor}: unsupported split transport; '
+                    f'fanout legalization left {len(entry.consumers)} consumers on one entry.'
+                )
             if entry.consumers and entry.graph_output:
-                raise ValueError(f'{entry.tensor}: output leg was not separated from consumer leg.')
+                raise RuntimeError(
+                    f'{entry.tensor}: unsupported boundary transport mix; '
+                    'fanout legalization must separate graph-output legs from consumer legs.'
+                )
 
         return changed

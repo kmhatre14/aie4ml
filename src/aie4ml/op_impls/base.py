@@ -62,6 +62,7 @@ class OpImplFootprint:
 
     width: int
     height: int
+    extras: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

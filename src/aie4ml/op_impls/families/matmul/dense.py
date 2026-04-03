@@ -251,7 +251,11 @@ class DenseOpImplVariant(OpImplVariant):
 
     def footprint(self, context: OpImplPlacementContext) -> OpImplFootprint:
         p = context.config.parameters
-        return OpImplFootprint(width=p.parallelism.cas_length, height=p.parallelism.cas_num)
+        return OpImplFootprint(
+            width=p.parallelism.cas_length,
+            height=p.parallelism.cas_num,
+            extras={'keepout_left': 1},
+        )
 
     def get_artifacts(self, inst: OpImplInstance):
         inst_name = sanitize_identifier(inst.name)

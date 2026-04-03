@@ -1,6 +1,7 @@
 """Core AIE compiler pipeline definition."""
 
 from .passes import (
+    ClassifyTransportEntries,
     CollectMemoryEntries,
     CompactBufferRank,
     FoldApplyAlpha,
@@ -22,9 +23,10 @@ HLS4ML_FLOW_SPEC = (
     ('fold_views', FoldTransposeViews),
     ('resolve', Resolve),
     ('pack', PackKernelArtifacts),
-    ('placement', PlaceKernels),
     ('memory_collect', CollectMemoryEntries),
     ('fanout_legalize', LegalizeFanoutEntries),
+    ('transport_classify', ClassifyTransportEntries),
+    ('placement', PlaceKernels),
     ('memtile_legalize', LegalizeMemtilePortLimits),
     ('memory_plan', MaterializeMemoryPlan),
     ('compact_batch', CompactBufferRank),
