@@ -143,15 +143,15 @@ def initializer_map(graph, numpy_helper) -> Dict[str, np.ndarray]:
     return {init.name: np.asarray(numpy_helper.to_array(init)) for init in graph.initializer}
 
 
-def input_maps(graph, helper, initializer_names) -> Tuple[Dict[str, Tuple[int, ...]], Dict[str, np.dtype]]:
+def input_maps(graph, initializer_names) -> Tuple[Dict[str, Tuple[int, ...]], Dict[str, int]]:
     shapes: Dict[str, Tuple[int, ...]] = {}
-    dtypes: Dict[str, np.dtype] = {}
+    elem_types: Dict[str, int] = {}
     for value_info in graph.input:
         if value_info.name in initializer_names:
             continue
         shapes[value_info.name] = shape_from_value_info(value_info)
-        dtypes[value_info.name] = np.dtype(helper.tensor_dtype_to_np_dtype(value_info.type.tensor_type.elem_type))
-    return shapes, dtypes
+        elem_types[value_info.name] = value_info.type.tensor_type.elem_type
+    return shapes, elem_types
 
 
 def scalar_tensor(initializers: Dict[str, np.ndarray], name: str, node_name: str) -> np.ndarray:
@@ -210,8 +210,10 @@ def intent_from_initializer(data: np.ndarray, node_name: str):
         return FloatIntent(width=32, format=FloatFormat.FP32)
     if str(dtype) == 'bfloat16':
         return FloatIntent(width=16, format=FloatFormat.BF16)
+    if str(dtype) == 'float8_e4m3fn':
+        return FloatIntent(width=8, format=FloatFormat.FP8_E4M3)
     raise ValueError(
-        f'{node_name}: direct initializer inputs must be float32/bfloat16, '
+        f'{node_name}: direct initializer inputs must be float32/bfloat16/fp8_e4m3, '
         f'or quantized via DequantizeLinear; got {dtype}.'
     )
 

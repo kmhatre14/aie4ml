@@ -19,11 +19,12 @@ class AddOpImplVariant(OpImplVariant):
     param_template = 'elementwise_add'
     supported_generations = ('AIE-ML', 'AIE-MLV2')
     supported_precisions = (
-        {'lhs': 8, 'rhs': 8, 'output': 8},
-        {'lhs': 16, 'rhs': 16, 'output': 16},
-        {'lhs': 32, 'rhs': 32, 'output': 32},
-        {'lhs': 16, 'rhs': 16, 'output': 16, 'lhs_c_type': 'bfloat16', 'rhs_c_type': 'bfloat16'},
-        {'lhs': 32, 'rhs': 32, 'output': 32, 'lhs_c_type': 'float', 'rhs_c_type': 'float'},
+        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int8'},
+        {'lhs': 'int16', 'rhs': 'int16', 'output': 'int16'},
+        {'lhs': 'int32', 'rhs': 'int32', 'output': 'int32'},
+        {'lhs': 'bfloat16', 'rhs': 'bfloat16', 'output': 'bfloat16'},
+        {'lhs': 'float32', 'rhs': 'float32', 'output': 'float32'},
+        {'lhs': 'fp8_e4m3', 'rhs': 'fp8_e4m3', 'output': 'fp8_e4m3'},
     )
     supported_input_modes = ('direct', 'memtile', 'plio', 'auto')
     supported_output_modes = ('direct', 'memtile', 'plio', 'auto')

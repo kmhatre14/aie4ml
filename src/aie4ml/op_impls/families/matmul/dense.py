@@ -73,20 +73,21 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
     param_template = 'dense_bias_relu'
     supported_generations = ('AIE-ML', 'AIE-MLV2')
     supported_precisions = (
-        {'lhs': 8, 'rhs': 8, 'output': 8, 'acc': 32, 'bias': 32},
-        {'lhs': 8, 'rhs': 8, 'output': 16, 'acc': 32, 'bias': 32},
-        {'lhs': 8, 'rhs': 8, 'output': 32, 'acc': 32, 'bias': 32},
-        {'lhs': 16, 'rhs': 8, 'output': 8, 'acc': 32, 'bias': 32},
-        {'lhs': 16, 'rhs': 16, 'output': 16, 'acc': 64, 'bias': 32},
-        {'lhs': 16, 'rhs': 16, 'output': 32, 'acc': 64, 'bias': 32},
-        {'lhs': 16, 'rhs': 16, 'output': 16, 'acc': 32, 'bias': 32, 'lhs_c_type': 'bfloat16'},
-        {'lhs': 32, 'rhs': 32, 'output': 32, 'acc': 32, 'bias': 32, 'lhs_c_type': 'float'},
+        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int8', 'acc': 'int32', 'bias': 'int32'},
+        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int16', 'acc': 'int32', 'bias': 'int32'},
+        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int32', 'acc': 'int32', 'bias': 'int32'},
+        {'lhs': 'int16', 'rhs': 'int8', 'output': 'int8', 'acc': 'int32', 'bias': 'int32'},
+        {'lhs': 'int16', 'rhs': 'int16', 'output': 'int16', 'acc': 'int64', 'bias': 'int32'},
+        {'lhs': 'int16', 'rhs': 'int16', 'output': 'int32', 'acc': 'int64', 'bias': 'int32'},
+        {'lhs': 'bfloat16', 'rhs': 'bfloat16', 'output': 'bfloat16', 'acc': 'accfloat', 'bias': 'float32'},
+        {'lhs': 'float32', 'rhs': 'float32', 'output': 'float32', 'acc': 'accfloat', 'bias': 'float32'},
+        {'lhs': 'fp8_e4m3', 'rhs': 'fp8_e4m3', 'output': 'fp8_e4m3', 'acc': 'accfloat', 'bias': 'float32'},
     )
     supported_input_modes = ('direct', 'memtile', 'plio', 'auto')
     supported_output_modes = ('direct', 'memtile', 'plio', 'auto')
 
     def pack(self, inst: OpImplInstance) -> Dict[str, Any]:
-        from ....aie_types import FloatFormat, FloatIntent
+        from ....aie_types import FloatIntent
 
         p = inst.config
         input_tensor = inst.node.inputs[0]
@@ -140,8 +141,6 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
             cas_num=p.parallelism.cas_num,
             dtype=np_dtype_for_spec(p.precision['rhs']),
         )
-        if isinstance(wi, FloatIntent) and wi.format == FloatFormat.BF16:
-            packed_W = (packed_W.astype(np.uint32) << 16).view(np.float32)
         packed_B = (
             pack_vector_by_n_slice(
                 b,
@@ -188,6 +187,7 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
                 'storage': 'rom',
                 'array': inst.artifacts['packed_weights'],
                 'dtype': p.precision['rhs'].c_type,
+                'storage_dtype': p.precision['rhs'].storage_dtype,
                 'filename': f'weights_{inst_name}.h',
                 'port': 'wts',
             }
@@ -208,6 +208,7 @@ class DenseOpImplVariant(_BaseDenseMatmulVariant):
                 'storage': 'rom',
                 'array': packed_bias,
                 'dtype': p.precision['bias'].c_type,
+                'storage_dtype': p.precision['bias'].storage_dtype,
                 'filename': f'bias_{inst_name}.h',
                 'port': 'bias',
             }

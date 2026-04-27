@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
-from ...aie_types import AIEDataType, FloatFormat, FloatIntent, QuantIntent, RoundingMode
+from ...aie_types import FLOAT_FORMATS, AIEDataType, FloatIntent, QuantIntent, RoundingMode
 
 ACC_TAG_WIDTHS = {
     'acc32': 32,
@@ -19,31 +19,6 @@ ROUNDING_TOKEN_MAP: Dict[RoundingMode, str] = {
     RoundingMode.RND_ZERO: 'symmetric_zero',
     RoundingMode.RND_CONV: 'conv_even',
 }
-
-
-def ctype_for_width(width: int, signed: bool) -> str:
-    width = max(1, int(width))
-    if signed:
-        if width <= 8:
-            return 'int8_t'
-        if width <= 16:
-            return 'int16_t'
-        if width <= 32:
-            return 'int32_t'
-        return 'int64_t'
-    if width <= 8:
-        return 'uint8_t'
-    if width <= 16:
-        return 'uint16_t'
-    if width <= 32:
-        return 'uint32_t'
-    return 'uint64_t'
-
-
-def ctype_for_float(fmt: FloatFormat) -> str:
-    if fmt == FloatFormat.BF16:
-        return 'bfloat16'
-    return 'float'
 
 
 def to_quant_intent(precision: Any) -> QuantIntent:
@@ -79,18 +54,18 @@ def resolve_storage_dtype(
 ) -> AIEDataType:
     storage_width = resolve_storage_width(intent.width, allowed=allowed, namespace=namespace, layer_name=layer_name)
     return AIEDataType(
-        width=storage_width,
-        signed=bool(intent.signed),
+        format=f'{"int" if intent.signed else "uint"}{storage_width}',
         frac=int(intent.frac),
         rounding=intent.rounding,
         saturation=intent.saturation,
-        c_type=ctype_for_width(storage_width, bool(intent.signed)),
     )
 
 
 def resolve_exact_storage_dtype(precision: Any, *, namespace: str, layer_name: str) -> AIEDataType:
     if isinstance(precision, FloatIntent):
-        return AIEDataType(width=int(precision.width), signed=True, frac=0, c_type=ctype_for_float(precision.format))
+        return AIEDataType(
+            format=precision.format.value,
+        )
     return resolve_storage_dtype(
         to_quant_intent(precision), allowed=(4, 8, 16, 32), namespace=namespace, layer_name=layer_name
     )
@@ -102,7 +77,9 @@ def infer_accumulator_tag(
     rhs_dtype: Optional[AIEDataType],
     acc_precision: Optional[AIEDataType],
 ) -> Optional[str]:
-    if acc_precision is not None and acc_precision.width:
+    if acc_precision is not None:
+        if acc_precision.format == 'accfloat':
+            return 'accfloat'
         for tag, bits in ACC_TAG_WIDTHS.items():
             if bits == int(acc_precision.width):
                 return tag
@@ -112,6 +89,14 @@ def infer_accumulator_tag(
 
     if lhs_dtype is None or rhs_dtype is None:
         return None
+
+    if lhs_dtype.format in FLOAT_FORMATS or rhs_dtype.format in FLOAT_FORMATS:
+        if lhs_dtype.format not in FLOAT_FORMATS or rhs_dtype.format not in FLOAT_FORMATS:
+            raise ValueError(
+                f'No accumulator tag registered for mixed float/integer precisions '
+                f'({lhs_dtype.format!r}, {rhs_dtype.format!r}).'
+            )
+        return 'accfloat'
 
     lhs_w = int(getattr(lhs_dtype, 'width', 0) or 0)
     rhs_w = int(getattr(rhs_dtype, 'width', 0) or 0)

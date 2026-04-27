@@ -97,7 +97,7 @@ class AIEProjectEmitter:
                         inst_name=L['inst_name'],
                         artifact_name=spec['name'],
                         data=spec['array'],
-                        dtype=spec['dtype'],
+                        dtype=spec.get('storage_dtype', spec['dtype']),
                     )
                 )
 

@@ -1,37 +1,41 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 
-from ....aie_types import FloatFormat
+from ....aie_types import FLOAT_FORMATS
 from ....quant_utils import apply_rounding, dtype_for_precision, handle_overflow
 from ...utils import TensorView, canonical_buffer_axes, make_staging_descriptor, ordered_view_shape
 from ...utils.precision import storage_bytes_for_spec
 
-MICROTILE_OPTIONS: Dict[str, Dict[Tuple[Any, Any], List[Tuple[int, int, int]]]] = {
+# Keys are canonical format-string pairs (lhs_format, rhs_format).
+# Integer formats: 'int8', 'int16' (sign-agnostic — both int8_t and uint8_t map here).
+# Float formats: 'bfloat16', 'float32', 'fp8_e4m3'.
+MICROTILE_OPTIONS: Dict[str, Dict[Tuple[str, str], List[Tuple[int, int, int]]]] = {
     'AIE': {
-        (8, 8): [(2, 8, 8), (2, 16, 8), (4, 8, 4), (4, 8, 8), (4, 16, 4), (4, 16, 8), (8, 8, 4)],
-        (16, 8): [(4, 4, 4), (4, 4, 8), (4, 8, 4), (8, 4, 4)],
-        (8, 16): [(4, 4, 8), (4, 4, 4), (8, 8, 1)],
-        (16, 16): [(4, 4, 8), (2, 4, 8), (4, 2, 8), (4, 4, 4), (8, 8, 1)],
-        ('float', 'float'): [(2, 4, 4)],
+        ('int8', 'int8'): [(2, 8, 8), (2, 16, 8), (4, 8, 4), (4, 8, 8), (4, 16, 4), (4, 16, 8), (8, 8, 4)],
+        ('int16', 'int8'): [(4, 4, 4), (4, 4, 8), (4, 8, 4), (8, 4, 4)],
+        ('int8', 'int16'): [(4, 4, 8), (4, 4, 4), (8, 8, 1)],
+        ('int16', 'int16'): [(4, 4, 8), (2, 4, 8), (4, 2, 8), (4, 4, 4), (8, 8, 1)],
+        ('float32', 'float32'): [(2, 4, 4)],
     },
     'AIE-ML': {
-        (8, 8): [(4, 8, 8), (2, 8, 8), (2, 16, 8), (4, 8, 4), (4, 16, 4), (4, 16, 8), (8, 8, 4), (8, 8, 8)],
-        (16, 8): [(4, 4, 8), (2, 8, 8), (4, 4, 4), (4, 8, 4), (8, 4, 4), (8, 4, 8)],
-        (8, 16): [(4, 4, 4), (4, 4, 8)],
-        (16, 16): [(4, 4, 4), (2, 4, 8), (4, 2, 8), (4, 4, 8), (8, 1, 8), (8, 2, 8)],
+        ('int8', 'int8'): [(4, 8, 8), (2, 8, 8), (2, 16, 8), (4, 8, 4), (4, 16, 4), (4, 16, 8), (8, 8, 4), (8, 8, 8)],
+        ('int16', 'int8'): [(4, 4, 8), (2, 8, 8), (4, 4, 4), (4, 8, 4), (8, 4, 4), (8, 4, 8)],
+        ('int8', 'int16'): [(4, 4, 4), (4, 4, 8)],
+        ('int16', 'int16'): [(4, 4, 4), (2, 4, 8), (4, 2, 8), (4, 4, 8), (8, 1, 8), (8, 2, 8)],
         ('bfloat16', 'bfloat16'): [(4, 8, 4)],
-        ('float', 'float'): [(4, 8, 4)],
+        ('float32', 'float32'): [(4, 8, 4)],
     },
     'AIE-MLV2': {
-        (8, 8): [(8, 8, 8), (4, 8, 8)],
-        (16, 8): [(4, 4, 8), (8, 2, 8)],
-        (8, 16): [(4, 4, 8), (8, 2, 8)],
-        (16, 16): [(8, 2, 8)],
+        ('int8', 'int8'): [(8, 8, 8), (4, 8, 8)],
+        ('int16', 'int8'): [(4, 4, 8), (8, 2, 8)],
+        ('int8', 'int16'): [(4, 4, 8), (8, 2, 8)],
+        ('int16', 'int16'): [(8, 2, 8)],
         ('bfloat16', 'bfloat16'): [(4, 8, 8)],
-        ('float', 'float'): [(4, 8, 4)],
+        ('float32', 'float32'): [(4, 8, 4)],
+        ('fp8_e4m3', 'fp8_e4m3'): [(8, 8, 8)],
     },
 }
 
@@ -42,13 +46,6 @@ def select_generation_key(generation: str) -> str:
         if key in norm:
             return key
     return 'AIE'
-
-
-def microtile_key(dtype) -> Any:
-    c_type = getattr(dtype, 'c_type', '') or ''
-    if c_type in ('bfloat16', 'float', 'float32'):
-        return c_type
-    return int(dtype.width)
 
 
 def describe_family_lhs_staging(view: TensorView, microtiling, port: int, buf_dims=None):
@@ -236,28 +233,56 @@ def validate_family_tile_contract(
 
 
 def np_dtype_for_spec(spec) -> np.dtype:
-    c_type = getattr(spec, 'c_type', '') or ''
-    if c_type == 'bfloat16':
+    fmt = getattr(spec, 'format', '') or ''
+    if fmt == 'bfloat16':
         return np.uint16
-    if c_type in ('float', 'float32'):
+    if fmt in ('float32', 'accfloat'):
         return np.float32
+    if fmt == 'fp8_e4m3':
+        return np.uint8
+    if fmt.startswith('uint'):
+        return np.uint8 if int(spec.width) <= 8 else np.uint16
     return np.int8 if int(spec.width) <= 8 else np.int16
 
 
 def np_bias_dtype_for_spec(spec) -> np.dtype:
-    c_type = getattr(spec, 'c_type', '') or ''
-    if c_type in ('bfloat16', 'float', 'float32'):
+    fmt = getattr(spec, 'format', '') or ''
+    if fmt in FLOAT_FORMATS:
         return np.float32
     return np.int16 if int(spec.width) <= 16 else np.int32
 
 
-def pack_as_float(array: np.ndarray, fmt: FloatFormat) -> np.ndarray:
+def pack_as_float(array: np.ndarray, fmt) -> np.ndarray:
     """Cast weight/bias data to the float storage format required by mmul kernels."""
     if array is None:
         return None
-    if fmt == FloatFormat.BF16:
+    from ....aie_types import FloatFormat
+
+    fmt_value = getattr(fmt, 'value', fmt)
+
+    def _float32_to_fp8_scalar(f: np.float32) -> np.uint8:
+        h = int(np.float32(f).view(np.uint32))
+        h = (h + 0x00080000) & 0xFFFFFFFF
+        e = (h & 0x7F800000) >> 23
+        m = h & 0x007FFFFF
+        sign = (h & 0x80000000) >> 24
+        if e > 135:
+            result = sign | 0x7F
+        elif e > 120:
+            result = sign | (((e - 120) << 3) & 0x78) | (m >> 20)
+        elif e > 116:
+            result = sign | (((0x00780000 + m) >> (140 - e)) + 1) >> 1
+        else:
+            result = sign
+        return np.uint8(result & 0xFF)
+
+    if fmt_value == FloatFormat.BF16.value:
         f32 = np.asarray(array, dtype=np.float32)
         return (f32.view(np.uint32) >> 16).astype(np.uint16)
+    if fmt_value == FloatFormat.FP8_E4M3.value:
+        vfloat32_to_fp8 = np.vectorize(_float32_to_fp8_scalar, otypes=[np.uint8])
+        f32 = np.asarray(array, dtype=np.float32)
+        return np.asarray(vfloat32_to_fp8(f32), dtype=np.uint8)
     return np.asarray(array, dtype=np.float32)
 
 

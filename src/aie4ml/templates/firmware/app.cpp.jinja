@@ -93,22 +93,30 @@ int main() {
       int idx = ch * {{ L.struct_name }}::CAS_LENGTH + col;
       dut.update(
         dut.{{ spec.port }}{{ Lidx }}[idx],
+        {% if spec.storage_dtype and spec.storage_dtype != spec.dtype %}
+        reinterpret_cast<{{ spec.dtype }} const*>({{ spec.name }}_{{ L.inst_name }}[ch][col]),
+        {% else %}
         {{ spec.name }}_{{ L.inst_name }}[ch][col],
+        {% endif %}
         {{ L.struct_name }}::IN_FEAT_SLICE * {{ L.struct_name }}::OUT_FEAT_SLICE
       );
     }
   }
   {% endif %}
 
-	  {% if spec.kind == "1d" %}
-	  for (int ch = 0; ch < {{ L.struct_name }}::CAS_NUM; ++ch) {
-	    dut.update(
-	      dut.{{ spec.port }}{{ Lidx }}[ch],
-	      {{ spec.name }}_{{ L.inst_name }}[ch],
-	      {{ L.struct_name }}::OUT_FEAT_SLICE
-	    );
-	  }
-	  {% endif %}
+  {% if spec.kind == "1d" %}
+  for (int ch = 0; ch < {{ L.struct_name }}::CAS_NUM; ++ch) {
+    dut.update(
+      dut.{{ spec.port }}{{ Lidx }}[ch],
+      {% if spec.storage_dtype and spec.storage_dtype != spec.dtype %}
+      reinterpret_cast<{{ spec.dtype }} const*>({{ spec.name }}_{{ L.inst_name }}[ch]),
+      {% else %}
+      {{ spec.name }}_{{ L.inst_name }}[ch],
+      {% endif %}
+      {{ L.struct_name }}::OUT_FEAT_SLICE
+    );
+  }
+  {% endif %}
 
   {% endfor %}
 {% endfor %}

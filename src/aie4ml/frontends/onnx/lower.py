@@ -26,6 +26,11 @@ from .utils import (
     node_name as onnx_node_name,
 )
 
+_ONNX_FLOAT = 1
+_ONNX_BFLOAT16 = 16
+_ONNX_FP8E4M3FN = 17
+_ONNX_INT_ELEM_TYPE_TO_NP = {2: np.uint8, 3: np.int8, 4: np.uint16, 5: np.int16, 6: np.int32, 7: np.int64}
+
 
 def lower_onnx_model(
     model_or_path,
@@ -52,7 +57,7 @@ def lower_onnx_model(
 
     batch_size = int(ctx.aie_config['BatchSize'])
     initializers = initializer_map(graph_proto, numpy_helper)
-    raw_input_shapes, raw_input_dtypes = input_maps(graph_proto, helper, set(initializers))
+    raw_input_shapes, raw_input_dtypes = input_maps(graph_proto, set(initializers))
     for name, shape in raw_input_shapes.items():
         if not shape:
             raise ValueError(f'{name}: scalar inputs are not supported.')
@@ -96,6 +101,11 @@ def lower_onnx_model(
 
     def _source_for(name: str, node_name: str) -> TensorVar:
         if name not in value_tensors:
+            if name in raw_input_shapes:
+                tensor = _any_source_for(name, node_name)
+                if tensor.is_parameter:
+                    raise ValueError(f'{node_name}: activation input {name} cannot be constant.')
+                return tensor
             raise ValueError(f'{node_name}: unsupported input {name}. Expected a dequantized activation tensor.')
         return value_tensors[name]
 
@@ -117,14 +127,16 @@ def lower_onnx_model(
             return _parameter_source_for(name, node_name)
         # Direct float graph input (bfloat16 / float32) — no QDQ wrapper.
         if name in raw_input_shapes:
-            dtype = raw_input_dtypes[name]
-            if dtype == np.float32:
+            elem_type = raw_input_dtypes[name]
+            if elem_type == _ONNX_FLOAT:
                 intent = FloatIntent(width=32, format=FloatFormat.FP32)
-            elif str(dtype) in ('bfloat16', 'float16'):
+            elif elem_type == _ONNX_BFLOAT16:
                 intent = FloatIntent(width=16, format=FloatFormat.BF16)
+            elif elem_type == _ONNX_FP8E4M3FN:
+                intent = FloatIntent(width=8, format=FloatFormat.FP8_E4M3)
             else:
                 raise ValueError(
-                    f'{node_name}: graph input "{name}" has unsupported dtype {dtype}. '
+                    f'{node_name}: graph input "{name}" has unsupported ONNX elem_type {elem_type}. '
                     'Use QDQ wrapping for integer inputs.'
                 )
             tensor = _graph_tensor(name, raw_input_shapes[name], intent)
@@ -241,12 +253,13 @@ def lower_onnx_model(
                 continue
 
             if src_name in raw_input_shapes:
-                raw_dtype = raw_input_dtypes[src_name]
-                if not np.issubdtype(raw_dtype, np.integer):
+                raw_elem_type = raw_input_dtypes[src_name]
+                raw_np_dtype = _ONNX_INT_ELEM_TYPE_TO_NP.get(raw_elem_type)
+                if raw_np_dtype is None:
                     raise ValueError(
                         f'{node_name}: direct DequantizeLinear on graph input requires integer input type.'
                     )
-                intent = intent_from_qparams(initializers, scale_name, zero_name, raw_dtype, node_name)
+                intent = intent_from_qparams(initializers, scale_name, zero_name, raw_np_dtype, node_name)
                 tensor = _graph_tensor(src_name, raw_input_shapes[src_name], intent)
                 value_tensors[out_name] = tensor
                 shape_of[out_name] = raw_input_shapes[src_name]
@@ -445,7 +458,8 @@ def lower_onnx_model(
                 rhs_tensor.consumers.append(op)
                 op.inputs.extend([lhs_tensor, rhs_tensor])
 
-            out_tensor = TensorVar(name=node.output[0], shape=out_shape, precision=None, producer=op)
+            out_precision = lhs_tensor.precision if isinstance(lhs_tensor.precision, FloatIntent) else None
+            out_tensor = TensorVar(name=node.output[0], shape=out_shape, precision=out_precision, producer=op)
             graph.add_tensor(out_tensor)
             op.outputs.append(out_tensor)
             graph.add_node(op)

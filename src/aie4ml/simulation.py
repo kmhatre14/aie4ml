@@ -10,17 +10,15 @@ from typing import Dict, List, Tuple, Union
 
 import numpy as np
 
-from .aie_types import AIEDataType
+from .aie_types import FLOAT_FORMATS, AIEDataType
 from .ir import get_backend_context
 from .quant_utils import apply_rounding, dtype_for_precision, handle_overflow
 
 log = logging.getLogger(__name__)
 
-_FLOAT_C_TYPES = frozenset({'bfloat16', 'float', 'float32'})
 
-
-def _is_float_c_type(c_type: str) -> bool:
-    return (c_type or '') in _FLOAT_C_TYPES
+def _is_float_format(fmt: str) -> bool:
+    return (fmt or '') in FLOAT_FORMATS
 
 
 def read_aie_report(model_or_path: Union[object, str, Path]) -> Dict:
@@ -326,7 +324,7 @@ def prepare_inputs(layout: IOLayout, X, iterations: int, quantize: bool = True) 
         if tuple(arr.shape[1:]) != expected:
             raise ValueError(f'{tensor}: expected input shape {expected}, got {tuple(arr.shape[1:])}')
 
-        if _is_float_c_type(p0.dtype.c_type):
+        if _is_float_format(p0.dtype.format):
             prepared[tensor] = np.asarray(arr, dtype=np.float32)
         elif quantize:
             prepared[tensor] = _quantize_to_int(
@@ -377,7 +375,7 @@ def collect_outputs(output_dir: Path, sim_mode: str, layout: IOLayout) -> Dict[s
     for tensor, ports in layout.outputs.items():
         first = ports[0]
         first_tile = _read_output_file(data_dir / f'y_p{first.port}.txt', first)
-        buf_dtype = np.float64 if _is_float_c_type(first.dtype.c_type) else np.int64
+        buf_dtype = np.float64 if _is_float_format(first.dtype.format) else np.int64
         out = np.zeros((first_tile.shape[0], *first.numpy_boundary_shape), dtype=buf_dtype)
         _insert_port_tile(out, first_tile, first)
 
@@ -469,7 +467,7 @@ def _read_output_file(path: Path, port: IOPortLayout) -> np.ndarray:
         clean.append(tok)
         i += 1
 
-    if _is_float_c_type(port.dtype.c_type):
+    if _is_float_format(port.dtype.format):
         values = np.array([float(t) for t in clean], dtype=np.float64)
     else:
         values = np.array([int(t) for t in clean], dtype=np.int64)

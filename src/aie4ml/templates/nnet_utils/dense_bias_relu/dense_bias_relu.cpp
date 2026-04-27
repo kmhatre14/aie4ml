@@ -46,10 +46,17 @@ struct row_replicator<4, VT, N> {
   }
 };
 
+template<typename VT, int N>
+struct row_replicator<8, VT, N> {
+  static inline aie::vector<VT, 8 * N> run(const aie::vector<VT, N>& row) {
+    return aie::concat(row, row, row, row, row, row, row, row);
+  }
+};
+
 template<int M, typename VT, int N>
 static inline aie::vector<VT, M * N>
 replicate_rows(const aie::vector<VT, N>& row) {
-  static_assert(M == 2 || M == 4, "Unsupported M; add more specializations.");
+  static_assert(M == 2 || M == 4 || M == 8, "Unsupported M; add more specializations.");
   return row_replicator<M, VT, N>::run(row);
 }
 

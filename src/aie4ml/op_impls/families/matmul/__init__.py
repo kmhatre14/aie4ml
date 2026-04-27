@@ -1,7 +1,6 @@
 from . import resolver  # noqa: F401
 from .common import (
     MICROTILE_OPTIONS,
-    microtile_key,
     np_bias_dtype_for_spec,
     np_dtype_for_spec,
     pack_as_float,
@@ -31,5 +30,4 @@ __all__ = [
     'pack_vector_by_n_slice',
     'quantize_to_int',
     'select_generation_key',
-    'microtile_key',
 ]

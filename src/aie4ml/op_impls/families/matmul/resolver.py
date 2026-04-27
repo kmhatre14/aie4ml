@@ -4,7 +4,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ....aie_types import AIEDataType, FloatIntent
+from ....aie_types import AIEDataType, FloatIntent, legality_format
 from ....ir import input_role, input_tensor_for_role
 from ...family_registry import family_resolver
 from ...registry import get_op_impl_registry
@@ -18,7 +18,6 @@ from ...utils.precision import (
     resolve_exact_storage_dtype,
     to_quant_intent,
 )
-from .common import microtile_key
 from .config import (
     DenseConfig,
     DenseFlags,
@@ -73,7 +72,7 @@ def _tile_bank_usage(
 
 def _supported_microtile_options(op_type: str, generation: str, lhs_dtype, rhs_dtype):
     return get_op_impl_registry().supported_microtilings(
-        op_type, generation, (microtile_key(lhs_dtype), microtile_key(rhs_dtype))
+        op_type, generation, (legality_format(lhs_dtype.format), legality_format(rhs_dtype.format))
     )
 
 
@@ -87,7 +86,7 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype) -> MatmulMicrotileConf
     if not options:
         raise ValueError(
             f'{node.name}: no supported tile configs are registered for Generation={device.generation} and '
-            f'(input={microtile_key(lhs_dtype)!r}, weight={microtile_key(rhs_dtype)!r}).'
+            f'(input={lhs_dtype.format!r}, weight={rhs_dtype.format!r}).'
         )
 
     user_specified = (raw['microtile_m'] > 0) and (raw['microtile_k'] > 0) and (raw['microtile_n'] > 0)
@@ -96,7 +95,7 @@ def _resolve_tile_cfg(node, device, lhs_dtype, rhs_dtype) -> MatmulMicrotileConf
         if candidate not in options:
             raise ValueError(
                 f'{node.name}: microtiling {candidate} not supported for Generation={device.generation} and '
-                f'(input={microtile_key(lhs_dtype)!r}, weight={microtile_key(rhs_dtype)!r}). Allowed: {options}'
+                f'(input={lhs_dtype.format!r}, weight={rhs_dtype.format!r}). Allowed: {options}'
             )
         return MatmulMicrotileConfig(microtile_m=candidate[0], microtile_k=candidate[1], microtile_n=candidate[2])
 
@@ -122,9 +121,9 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
     if isinstance(lhs_tensor.precision, FloatIntent):
         if not all(isinstance(t.precision, FloatIntent) for t in (lhs_tensor, rhs_tensor, out_tensor)):
             raise ValueError(f'{node.name}: float {node.op_type} requires lhs/rhs/output to share float precision.')
-        resolved['acc'] = AIEDataType(width=32, signed=True, frac=0, c_type='accfloat')
+        resolved['acc'] = AIEDataType(format='accfloat', frac=0)
         if node.op_type == 'dense':
-            resolved['bias'] = AIEDataType(width=32, signed=True, frac=0, c_type='float')
+            resolved['bias'] = AIEDataType(format='float32', frac=0)
         return resolved
 
     lhs_intent = to_quant_intent(lhs_tensor.precision)
@@ -141,25 +140,19 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
         if bias_tensor is not None and bias_tensor.precision is not None:
             bias_intent = to_quant_intent(bias_tensor.precision)
             resolved['bias'] = AIEDataType(
-                width=32,
-                signed=bool(bias_intent.signed),
+                format='int32',
                 frac=int(lhs_intent.frac + rhs_intent.frac),
                 rounding=bias_intent.rounding,
                 saturation=bias_intent.saturation,
-                c_type='int32_t',
             )
         else:
-            resolved['bias'] = AIEDataType(
-                width=32, signed=True, frac=int(lhs_intent.frac + rhs_intent.frac), c_type='int32_t'
-            )
+            resolved['bias'] = AIEDataType(format='int32', frac=int(lhs_intent.frac + rhs_intent.frac))
 
     acc_tag = infer_accumulator_tag(device, resolved['lhs'], resolved['rhs'], None)
     acc_width = {'acc32': 32, 'acc48': 48, 'acc64': 64}[acc_tag]
     resolved['acc'] = AIEDataType(
-        width=acc_width,
-        signed=True,
+        format=f'int{acc_width}',
         frac=int(lhs_intent.frac + rhs_intent.frac),
-        c_type={32: 'int32_t', 48: 'int64_t', 64: 'int64_t'}[acc_width],
     )
     return resolved
 

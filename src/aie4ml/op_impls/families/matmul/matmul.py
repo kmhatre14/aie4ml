@@ -25,14 +25,15 @@ class MatmulOpImplVariant(_BaseDenseMatmulVariant):
     param_template = 'matmul'
     supported_generations = ('AIE-ML', 'AIE-MLV2')
     supported_precisions = (
-        {'lhs': 8, 'rhs': 8, 'output': 8, 'acc': 32, 'rhs_c_type': 'int8_t'},
-        {'lhs': 8, 'rhs': 8, 'output': 16, 'acc': 32, 'rhs_c_type': 'int8_t'},
-        {'lhs': 8, 'rhs': 8, 'output': 32, 'acc': 32, 'rhs_c_type': 'int8_t'},
-        {'lhs': 16, 'rhs': 8, 'output': 8, 'acc': 32, 'rhs_c_type': 'int8_t'},
-        {'lhs': 16, 'rhs': 16, 'output': 16, 'acc': 64, 'rhs_c_type': 'int16_t'},
-        {'lhs': 16, 'rhs': 16, 'output': 32, 'acc': 64, 'rhs_c_type': 'int16_t'},
-        {'lhs': 16, 'rhs': 16, 'output': 16, 'acc': 32, 'lhs_c_type': 'bfloat16', 'rhs_c_type': 'bfloat16'},
-        {'lhs': 32, 'rhs': 32, 'output': 32, 'acc': 32, 'lhs_c_type': 'float', 'rhs_c_type': 'float'},
+        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int8', 'acc': 'int32'},
+        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int16', 'acc': 'int32'},
+        {'lhs': 'int8', 'rhs': 'int8', 'output': 'int32', 'acc': 'int32'},
+        {'lhs': 'int16', 'rhs': 'int8', 'output': 'int8', 'acc': 'int32'},
+        {'lhs': 'int16', 'rhs': 'int16', 'output': 'int16', 'acc': 'int64'},
+        {'lhs': 'int16', 'rhs': 'int16', 'output': 'int32', 'acc': 'int64'},
+        {'lhs': 'bfloat16', 'rhs': 'bfloat16', 'output': 'bfloat16', 'acc': 'accfloat'},
+        {'lhs': 'float32', 'rhs': 'float32', 'output': 'float32', 'acc': 'accfloat'},
+        {'lhs': 'fp8_e4m3', 'rhs': 'fp8_e4m3', 'output': 'fp8_e4m3', 'acc': 'accfloat'},
     )
     supported_input_modes = ('direct', 'memtile', 'plio', 'auto')
     supported_output_modes = ('direct', 'memtile', 'plio', 'auto')

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Dict, Iterable, List, Tuple
 
+from ..aie_types import legality_format
 from .base import OpImplVariant
 
 
@@ -42,11 +43,7 @@ def register_variant(cls):
 
 
 def select_variant(op_type: str, config, generation: str) -> OpImplVariant:
-    precision_query: Dict[str, object] = {key: int(dtype.width) for key, dtype in config.precision.items()}
-    for key in ('lhs', 'rhs'):
-        c_type = getattr(config.precision.get(key), 'c_type', '') or ''
-        if c_type:
-            precision_query[f'{key}_c_type'] = c_type
+    precision_query: Dict[str, object] = {key: legality_format(dtype.format) for key, dtype in config.precision.items()}
 
     for variant in _GLOBAL_OP_IMPL_REGISTRY.variants(op_type):
         if not variant.supports_generation(generation):
