@@ -53,6 +53,7 @@ def describe_family_lhs_staging(view: TensorView, microtiling, port: int, buf_di
     microtile_m = int(microtiling.microtile_m)
     microtile_k = int(microtiling.microtile_k)
     in_slice = view.tile_inner
+    outer_slice = view.tile_outer
     raw_in = view.tile_raw_inner
     buffer_dimension = ordered_view_shape(view, 'full') if buf_dims is None else [int(x) for x in buf_dims]
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
@@ -66,9 +67,7 @@ def describe_family_lhs_staging(view: TensorView, microtiling, port: int, buf_di
         if dim == inner_dim:
             tile_traversal.append({'dimension': inner_dim, 'stride': microtile_k, 'wrap': in_slice // microtile_k})
         elif dim == outer_dim:
-            tile_traversal.append(
-                {'dimension': outer_dim, 'stride': microtile_m, 'wrap': buffer_dimension[outer_dim] // microtile_m}
-            )
+            tile_traversal.append({'dimension': outer_dim, 'stride': microtile_m, 'wrap': outer_slice // microtile_m})
         else:
             tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
     offset = [0 for _ in buffer_dimension]
@@ -92,6 +91,7 @@ def describe_family_output_staging(view: TensorView, microtiling, port: int, buf
     microtile_m = int(microtiling.microtile_m)
     microtile_n = int(microtiling.microtile_n)
     out_slice = view.tile_inner
+    outer_slice = view.tile_outer
     raw_out = view.tile_raw_inner
     buffer_dimension = ordered_view_shape(view, 'full') if buf_dims is None else [int(x) for x in buf_dims]
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
@@ -105,9 +105,7 @@ def describe_family_output_staging(view: TensorView, microtiling, port: int, buf
         if dim == inner_dim:
             tile_traversal.append({'dimension': inner_dim, 'stride': microtile_n, 'wrap': out_slice // microtile_n})
         elif dim == outer_dim:
-            tile_traversal.append(
-                {'dimension': outer_dim, 'stride': microtile_m, 'wrap': buffer_dimension[outer_dim] // microtile_m}
-            )
+            tile_traversal.append({'dimension': outer_dim, 'stride': microtile_m, 'wrap': outer_slice // microtile_m})
         else:
             tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
     offset = [0 for _ in buffer_dimension]

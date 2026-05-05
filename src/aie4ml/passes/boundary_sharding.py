@@ -103,5 +103,8 @@ def localize_graph_io_descriptor(base: Dict[str, Any], unit_base: List[int], buf
         boundary[dim] = min(int(buf_dims[dim]), max(0, int(boundary[dim]) - int(unit_base[dim])))
     desc['buffer_dimension'] = list(buf_dims)
     desc['offset'] = offset
-    desc['boundary_dimension'] = boundary
+    if desc.get('access') == 'read':
+        desc['boundary_dimension'] = boundary
+    else:
+        desc.pop('boundary_dimension', None)
     return desc

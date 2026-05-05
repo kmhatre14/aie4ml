@@ -385,11 +385,34 @@ def _build_io_views(node, microtiling: MatmulMicrotileConfig, tiling: MatmulTili
     return shapes
 
 
+def _validate_matmul_family_rank_contract(node) -> None:
+    """Reject batched RHS MatMul until a batched_matmul lowering is explicit.
+
+    The dense/matmul family exposes a 2-D GEMM ABI. Leading LHS/output axes may be compacted
+    into M only when RHS is a single broadcastable KxN matrix. A non-broadcast
+    RHS leading axis means each compacted M block needs a different KxN tile,
+    which must be lowered as parallel rank-2 MatMuls or a batched variant.
+    """
+    lhs_tensor = input_tensor_for_role(node, 'lhs')
+    rhs_tensor = input_tensor_for_role(node, 'rhs')
+
+    lhs_shape = tuple(int(x) for x in view_shape(node, lhs_tensor, 'inputs'))
+    rhs_shape = tuple(int(x) for x in view_shape(node, rhs_tensor, 'inputs'))
+    rhs_batch = rhs_shape[:-2] if len(rhs_shape) > 2 else ()
+    if rhs_batch and any(int(dim) != 1 for dim in rhs_batch):
+        raise ValueError(
+            f'{node.name}: matmul.v1 does not support batched RHS MatMul with non-broadcast leading axes; '
+            f'lhs shape {lhs_shape}, rhs shape {rhs_shape}. Lower to parallel rank-2 MatMul ops or add a '
+            'batched_matmul variant.'
+        )
+
+
 @family_resolver('dense')
 class DenseResolver:
     op_type = 'dense'
 
     def resolve(self, node, device, directives=None) -> DenseConfig:
+        _validate_matmul_family_rank_contract(node)
         io_route = dict((directives or {}).get('io_route', {}))
         precision = _resolve_numeric(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])
@@ -441,6 +464,7 @@ class MatmulResolver:
     op_type = 'matmul'
 
     def resolve(self, node, device, directives=None) -> MatmulConfig:
+        _validate_matmul_family_rank_contract(node)
         io_route = dict((directives or {}).get('io_route', {}))
         precision = _resolve_numeric(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])

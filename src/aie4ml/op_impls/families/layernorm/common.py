@@ -1,0 +1,108 @@
+from __future__ import annotations
+
+from typing import Any, Dict
+
+import numpy as np
+
+from ...utils.precision import storage_bytes_for_spec
+
+__all__ = [
+    'GAMMA_FRAC_BITS',
+    'BETA_FRAC_BITS',
+    'DEFAULT_ISQRT_NR_ITERS',
+    'DEFAULT_USE_AIE_INVSQRT',
+    'layernorm_vec_size',
+    'validate_layernorm_tile_contract',
+    'pack_layernorm_param',
+]
+
+
+# Fixed-point conventions baked into the integer LayerNorm kernel.
+# gamma is multiplied by inv_std (Q15) and right-shifted by GAMMA_SHIFT, so
+# gamma must be stored at frac=GAMMA_SHIFT for fscale to land in Q15.
+# beta is added to the Q15 accumulator before the final right-shift, so beta
+# is stored at frac=NORM_SHIFT (Q15).
+GAMMA_FRAC_BITS = 7
+BETA_FRAC_BITS = 15
+DEFAULT_ISQRT_NR_ITERS = 1
+DEFAULT_USE_AIE_INVSQRT = False
+
+
+def layernorm_vec_size(precision, device) -> int:
+    """Vector lane count for the fully-integer LayerNorm kernel.
+
+    The kernel computes sum/sum-of-squares with aie::accum<acc32, VEC> over
+    int8 inputs, so VEC is the int8 lane count of acc32 (32 on AIE-ML).
+    Float variants will override this when added.
+    """
+    elem_bytes = storage_bytes_for_spec(precision)
+    if elem_bytes <= 1:
+        return 32
+    return int(device.vector_bytes) // max(1, elem_bytes)
+
+
+def validate_layernorm_tile_contract(
+    *,
+    node_name: str,
+    precision: Dict[str, Any],
+    tile_outer: int,
+    full_inner: int,
+    bank_bytes: int,
+    vec_size: int,
+) -> None:
+    if full_inner % vec_size != 0:
+        raise ValueError(
+            f'{node_name}: full_inner={full_inner} is not a multiple of vec_size={vec_size}; '
+            'the resolver must align full_inner before building the view.'
+        )
+    if full_inner <= 0 or (full_inner & (full_inner - 1)) != 0:
+        raise ValueError(
+            f'{node_name}: full_inner={full_inner} must be a power of two for the integer LayerNorm kernel.'
+        )
+
+    in_bytes = tile_outer * full_inner * storage_bytes_for_spec(precision['lhs'])
+    out_bytes = tile_outer * full_inner * storage_bytes_for_spec(precision['output'])
+    gamma_bytes = full_inner * storage_bytes_for_spec(precision['gamma'])
+    beta_bytes = full_inner * storage_bytes_for_spec(precision['beta'])
+    if in_bytes > bank_bytes:
+        raise ValueError(f'{node_name}: input tile uses {in_bytes}B, exceeds one {bank_bytes}B bank.')
+    if out_bytes > bank_bytes:
+        raise ValueError(f'{node_name}: output tile uses {out_bytes}B, exceeds one {bank_bytes}B bank.')
+    if gamma_bytes > bank_bytes:
+        raise ValueError(f'{node_name}: gamma tile uses {gamma_bytes}B, exceeds one {bank_bytes}B bank.')
+    if beta_bytes > bank_bytes:
+        raise ValueError(f'{node_name}: beta tile uses {beta_bytes}B, exceeds one {bank_bytes}B bank.')
+
+
+def pack_layernorm_param(
+    values,
+    *,
+    full_inner: int,
+    frac: int,
+    cas_num: int,
+    width: int = 16,
+    signed: bool = True,
+    dtype=np.int16,
+) -> np.ndarray:
+    """Quantize a 1-D float param (gamma or beta) and replicate across cas_num kernels.
+
+    The kernel signature takes the full COLS-length array on every kernel, so
+    each cas_num row receives the same packed values. Saturation matches the
+    SAT mode used elsewhere in the compiler.
+    """
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if int(arr.shape[0]) != int(full_inner):
+        raise ValueError(f'LayerNorm parameter length {arr.shape[0]} does not match full_inner={int(full_inner)}.')
+    scale = float(1 << int(frac)) if int(frac) > 0 else 1.0
+    scaled = np.rint(arr * scale).astype(np.int64, copy=False)
+
+    if signed:
+        lo = -(1 << (int(width) - 1))
+        hi = (1 << (int(width) - 1)) - 1
+    else:
+        lo = 0
+        hi = (1 << int(width)) - 1
+    clipped = np.clip(scaled, lo, hi).astype(dtype, copy=False)
+
+    length = int(arr.shape[0])
+    return np.broadcast_to(clipped.reshape(1, length), (int(cas_num), length)).copy()

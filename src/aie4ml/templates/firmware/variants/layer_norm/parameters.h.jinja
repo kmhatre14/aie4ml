@@ -1,0 +1,23 @@
+{% set P = L.op_impl.parameters %}
+struct {{L.struct_name}} {
+  using input_t  = {{P.precision.lhs.c_type}};
+  using output_t = {{P.precision.output.c_type}};
+  static constexpr int CAS_NUM = {{P.parallelism.cas_num}};
+  static constexpr int CAS_LENGTH = {{P.parallelism.cas_length}};
+  static constexpr int ROWS = {{P.rows}};
+  static constexpr int COLS = {{P.cols}};
+  static constexpr int VEC  = {{P.vec_size}};
+  static constexpr int GAMMA_SHIFT = {{P.gamma_shift}};
+  static constexpr int OUT_SHIFT   = {{P.out_shift}};
+  static constexpr int EPS_Q0      = {{P.eps_q0}};
+  static constexpr int ISQRT_NR_ITERS  = {{P.isqrt_nr_iters}};
+  static constexpr bool USE_AIE_INVSQRT = {{ 'true' if P.use_aie_invsqrt else 'false' }};
+  static constexpr const char* ROUNDING_TOKEN = "{{ P.rounding_mode }}";
+  static constexpr const char* SATURATION_TOKEN = "saturate";
+#if __cplusplus >= 202002L
+  static constexpr auto ROUNDING   = aie::rounding_mode::{{ P.rounding_mode }};
+  static constexpr auto SATURATION = aie::saturation_mode::saturate;
+#endif
+  static constexpr int col_placement = {{L.placement.col}};
+  static constexpr int row_placement = {{L.placement.row}};
+};

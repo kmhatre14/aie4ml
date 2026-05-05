@@ -1,5 +1,5 @@
 """Op-implementation families."""
 
-from . import elementwise, matmul
+from . import elementwise, layernorm, matmul
 
-__all__ = ['elementwise', 'matmul']
+__all__ = ['elementwise', 'layernorm', 'matmul']

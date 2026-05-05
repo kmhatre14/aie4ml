@@ -91,6 +91,25 @@ class LowerToAieIr(ModelOptimizerPass):
                 weight_tv, bias_tv = _create_weight_tensors(layer, graph)
                 param_tensors[layer.name] = (weight_tv, bias_tv)
 
+            if node.op_type == 'layer_norm':
+                for weight_name, role in (('scale', 'gamma'), ('bias', 'beta')):
+                    wvar = layer.weights.get(weight_name)
+                    if wvar is None:
+                        raise RuntimeError(f'{layer.name}: LayerNormalization missing {weight_name!r} weight.')
+                    intent = _precision_of(wvar)
+                    tv = TensorVar(
+                        name=f'{layer.name}_{role}',
+                        shape=np.asarray(wvar.data).shape,
+                        precision=intent,
+                        data=wvar.data,
+                    )
+                    graph.add_tensor(tv)
+                    if weight_name == 'scale':
+                        gamma_tv = tv
+                    else:
+                        beta_tv = tv
+                param_tensors[layer.name] = (gamma_tv, beta_tv)
+
             var = model.output_vars[layer.name]
             tv = graph.tensors[var.name]
             tv.producer = node
@@ -146,6 +165,12 @@ class LowerToAieIr(ModelOptimizerPass):
             scale = layer.get_attr('scale_data')
             if scale is not None:
                 meta['scale'] = np.asarray(scale, dtype=np.float64).flatten().tolist()
+
+        if layer.class_name == 'LayerNormalization':
+            meta['input_roles'] = ['lhs', 'gamma', 'beta']
+            epsilon = layer.get_attr('epsilon')
+            if epsilon is not None:
+                meta['epsilon'] = float(epsilon)
 
         if layer.class_name == 'Activation':
             meta['input_roles'] = ['lhs']
@@ -208,6 +233,8 @@ class LowerToAieIr(ModelOptimizerPass):
             return 'dense'
         if layer.class_name == 'Transpose':
             return 'transpose'
+        if layer.class_name == 'LayerNormalization':
+            return 'layer_norm'
         return layer.class_name.lower()
 
     def _normalize_transpose_perm(self, node: OpNode, output_shape) -> None:

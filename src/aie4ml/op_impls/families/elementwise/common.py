@@ -90,7 +90,7 @@ def describe_elementwise_staging(view, port: int, access: str, contract: str, bu
         inner_dim=inner_dim,
         outer_dim=outer_dim,
         slice_dim=partition_dim,
-        boundary_shape='tile_raw' if access == 'read' else None,
+        boundary_shape='real' if access == 'read' else None,
         io_boundary_shape='real',
         io_tiling_dimension=raw_slice,
     )

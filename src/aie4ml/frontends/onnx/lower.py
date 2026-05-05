@@ -528,6 +528,78 @@ def lower_onnx_model(
             shape_of[node.output[0]] = tuple(int(x) for x in dense_tensor.shape)
             continue
 
+        if op_type == 'LayerNormalization':
+            if len(node.input) not in (2, 3):
+                raise ValueError(f'{node_name}: LayerNormalization must have 2 or 3 inputs.')
+            x_name = node.input[0]
+            scale_name = node.input[1]
+            bias_name = node.input[2] if len(node.input) == 3 else None
+            x_shape = tuple(int(x) for x in shape_of[x_name])
+            if len(x_shape) < 2:
+                raise ValueError(f'{node_name}: LayerNormalization requires rank>=2 inputs, got {len(x_shape)}.')
+
+            axis = int(attr(node, 'axis', -1))
+            if axis < 0:
+                axis += len(x_shape)
+            if axis != len(x_shape) - 1:
+                raise ValueError(
+                    f'{node_name}: only last-axis LayerNormalization is supported; got axis={axis} '
+                    f'for rank {len(x_shape)}.'
+                )
+            epsilon = float(attr(node, 'epsilon', 1e-5))
+
+            x_tensor = _source_for(x_name, node_name)
+            scale_tensor = _parameter_source_for(scale_name, node_name)
+            if not scale_tensor.is_parameter:
+                raise ValueError(f'{node_name}: LayerNormalization Scale must be a constant initializer.')
+            scale_data = np.asarray(scale_tensor.data, dtype=np.float64).reshape(-1)
+            if int(scale_data.size) != int(x_shape[-1]):
+                raise ValueError(
+                    f'{node_name}: LayerNormalization Scale length {scale_data.size} '
+                    f'does not match feature dim {x_shape[-1]}.'
+                )
+
+            if bias_name is not None:
+                bias_tensor = _parameter_source_for(bias_name, node_name)
+                if not bias_tensor.is_parameter:
+                    raise ValueError(f'{node_name}: LayerNormalization Bias must be a constant initializer.')
+                bias_data = np.asarray(bias_tensor.data, dtype=np.float64).reshape(-1)
+                if int(bias_data.size) != int(x_shape[-1]):
+                    raise ValueError(
+                        f'{node_name}: LayerNormalization Bias length {bias_data.size} '
+                        f'does not match feature dim {x_shape[-1]}.'
+                    )
+            else:
+                zeros = np.zeros((int(x_shape[-1]),), dtype=np.float64)
+                bias_tensor = _param_tensor(f'{node_name}_beta_zero', zeros, scale_tensor.precision)
+
+            op = OpNode(name=f'{node_name}_aie', op_type='layer_norm', dialect=ctx.device.dialect)
+            inputs = [x_tensor, scale_tensor, bias_tensor]
+
+            op.metadata.update(
+                attach_quant_role_bindings(
+                    {
+                        'layer_class': 'LayerNormalization',
+                        'source_class': 'LayerNormalization',
+                        'source_layer': node_name,
+                        'input_roles': ['lhs', 'gamma', 'beta'],
+                        'epsilon': epsilon,
+                    }
+                )
+            )
+            op.directives.update(directives)
+            x_tensor.consumers.append(op)
+            op.inputs.extend(inputs)
+
+            out_precision = x_tensor.precision if isinstance(x_tensor.precision, FloatIntent) else None
+            out_tensor = TensorVar(name=node.output[0], shape=x_shape, precision=out_precision, producer=op)
+            graph.add_tensor(out_tensor)
+            op.outputs.append(out_tensor)
+            graph.add_node(op)
+            value_tensors[node.output[0]] = out_tensor
+            shape_of[node.output[0]] = x_shape
+            continue
+
         if op_type == 'Relu':
             if len(node.input) != 1:
                 raise ValueError(f'{node_name}: Relu must have exactly 1 input.')
