@@ -77,6 +77,7 @@ def validate_layernorm_tile_contract(
 def pack_layernorm_param(
     values,
     *,
+    name: str,
     full_inner: int,
     frac: int,
     cas_num: int,
@@ -84,15 +85,15 @@ def pack_layernorm_param(
     signed: bool = True,
     dtype=np.int16,
 ) -> np.ndarray:
-    """Quantize a 1-D float param (gamma or beta) and replicate across cas_num kernels.
-
-    The kernel signature takes the full COLS-length array on every kernel, so
-    each cas_num row receives the same packed values. Saturation matches the
-    SAT mode used elsewhere in the compiler.
-    """
+    """Quantize a 1-D float param (gamma or beta) and replicate across cas_num kernels."""
     arr = np.asarray(values, dtype=np.float64).reshape(-1)
     if int(arr.shape[0]) != int(full_inner):
-        raise ValueError(f'LayerNorm parameter length {arr.shape[0]} does not match full_inner={int(full_inner)}.')
+        raise ValueError(
+            f'LayerNorm parameter {name!r} length {arr.shape[0]} does not match full_inner={int(full_inner)}.'
+        )
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f'LayerNorm parameter {name!r} contains non-finite values.')
+
     scale = float(1 << int(frac)) if int(frac) > 0 else 1.0
     scaled = np.rint(arr * scale).astype(np.int64, copy=False)
 
@@ -102,7 +103,17 @@ def pack_layernorm_param(
     else:
         lo = 0
         hi = (1 << int(width)) - 1
-    clipped = np.clip(scaled, lo, hi).astype(dtype, copy=False)
+    if np.any((scaled < lo) | (scaled > hi)):
+        min_value = float(lo) / scale
+        max_value = float(hi) / scale
+        raise ValueError(
+            f'LayerNorm parameter {name!r} cannot be represented as '
+            f'{"signed" if signed else "unsigned"} int{int(width)} Q{int(frac)}: '
+            f'value range [{float(np.min(arr))}, {float(np.max(arr))}], '
+            f'representable range [{min_value}, {max_value}].'
+        )
+
+    packed = scaled.astype(dtype, copy=False)
 
     length = int(arr.shape[0])
-    return np.broadcast_to(clipped.reshape(1, length), (int(cas_num), length)).copy()
+    return np.broadcast_to(packed.reshape(1, length), (int(cas_num), length)).copy()

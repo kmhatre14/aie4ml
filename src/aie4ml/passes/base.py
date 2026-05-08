@@ -28,5 +28,6 @@ class AIEPass:
 
 def run_aie_passes(ctx: AIEBackendContext, passes: Iterable[AIEPass]) -> None:
     """Run a sequence of AIE passes once in the declared pipeline order."""
+    ctx.ir.logical.verify()
     for p in passes:
         p.transform(ctx)

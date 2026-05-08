@@ -12,9 +12,9 @@ from ...utils.io import resolve_input_contract, view_shape
 from ...utils.precision import (
     aie_rounding_token,
     infer_accumulator_tag,
+    resolve_accumulator_output_shift,
     resolve_exact_storage_dtype,
     storage_bytes_for_spec,
-    to_quant_intent,
 )
 from .common import elementwise_vec_size
 from .config import AddConfig, ElementwiseParallelismConfig
@@ -227,9 +227,7 @@ class AddResolver:
             accumulator_tag = 'accfloat'
             rounding_mode = 'conv_even'
         else:
-            lhs_frac = to_quant_intent(lhs_tensor.precision).frac
-            output_frac = to_quant_intent(node.outputs[0].precision).frac
-            shift = max(0, int(lhs_frac - output_frac))
+            shift = resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision)
             accumulator_tag = infer_accumulator_tag(device, precision['lhs'], precision['rhs'], precision.get('acc'))
             rounding_mode = aie_rounding_token(precision['output'])
 

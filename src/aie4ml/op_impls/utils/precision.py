@@ -135,6 +135,21 @@ def aie_rounding_token(source) -> str:
     return token
 
 
+def resolve_accumulator_output_shift(
+    lhs_precision: Any,
+    output_precision: Any,
+    rhs_precision: Any = None,
+) -> int:
+    """Right-shift from accumulator fixed-point to output fixed-point.
+
+    For matmul: acc_frac = lhs_frac + rhs_frac; for elementwise add: rhs_precision=None → rhs_frac=0.
+    """
+    lhs_frac = to_quant_intent(lhs_precision).frac
+    out_frac = to_quant_intent(output_precision).frac
+    rhs_frac = to_quant_intent(rhs_precision).frac if rhs_precision is not None else 0
+    return max(0, int(lhs_frac + rhs_frac - out_frac))
+
+
 def element_bytes(dtype: Optional[AIEDataType]) -> int:
     if not dtype or not getattr(dtype, 'width', None):
         return 1

@@ -15,6 +15,7 @@ from ...utils.precision import (
     aie_rounding_token,
     element_bytes,
     infer_accumulator_tag,
+    resolve_accumulator_output_shift,
     resolve_exact_storage_dtype,
     to_quant_intent,
 )
@@ -107,8 +108,6 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
     lhs_tensor = input_tensor_for_role(node, 'lhs')
     rhs_tensor = input_tensor_for_role(node, 'rhs')
     out_tensor = node.outputs[0]
-    if lhs_tensor is None or rhs_tensor is None:
-        raise ValueError(f'{node.name}: missing lhs/rhs tensor roles for {node.op_type}.')
     if any(t.precision is None for t in (lhs_tensor, rhs_tensor, out_tensor)):
         raise ValueError(f'{node.name}: missing precision metadata for {node.op_type}.')
 
@@ -424,12 +423,11 @@ class DenseResolver:
         lhs_perm = io_views[lhs_tensor.name].perm
         is_float = isinstance(lhs_tensor.precision, FloatIntent)
 
-        if is_float:
-            shift = 0
-        else:
-            lhs_frac = to_quant_intent(lhs_tensor.precision).frac
-            rhs_frac = to_quant_intent(rhs_tensor.precision).frac
-            shift = max(0, int(lhs_frac + rhs_frac - to_quant_intent(node.outputs[0].precision).frac))
+        shift = (
+            0
+            if is_float
+            else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
+        )
 
         fused_act = node.traits.get('fused_activation')
         use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
@@ -477,12 +475,11 @@ class MatmulResolver:
         rhs_perm = io_views[rhs_tensor.name].perm
         is_float = isinstance(rhs_tensor.precision, FloatIntent)
 
-        if is_float:
-            shift = 0
-        else:
-            lhs_frac = to_quant_intent(lhs_tensor.precision).frac
-            rhs_frac = to_quant_intent(rhs_tensor.precision).frac
-            shift = max(0, int(lhs_frac + rhs_frac - to_quant_intent(node.outputs[0].precision).frac))
+        shift = (
+            0
+            if is_float
+            else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
+        )
 
         return MatmulConfig(
             precision=precision,

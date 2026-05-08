@@ -22,6 +22,7 @@ from .graph import (
     input_role,
     input_role_map,
     input_tensor_for_role,
+    set_input_roles,
 )
 
 __all__ = [
@@ -36,6 +37,7 @@ __all__ = [
     'PhysicalIR',
     'OpImplInstance',
     'OpNode',
+    'set_input_roles',
     'TensorVar',
     'BackendPolicies',
     'DeviceSpec',

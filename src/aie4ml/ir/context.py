@@ -72,11 +72,7 @@ class DeviceSpec:
     max_mem_in_ports: int
     max_mem_out_ports: int
     dialect: str
-
-    @property
-    def vector_bytes(self) -> int:
-        """Full vector register width in bytes — 512-bit for AIE-ML (64 bytes)."""
-        return 64
+    vector_bytes: int = 64
 
     @classmethod
     def from_config(cls, platform: str, cfg: Dict[str, Any]) -> 'DeviceSpec':
@@ -102,6 +98,7 @@ class DeviceSpec:
             max_mem_in_ports=_require_int(cfg, 'MaxMemTileInPorts'),
             max_mem_out_ports=_require_int(cfg, 'MaxMemTileOutPorts'),
             dialect=detect_dialect(str(cfg['Generation'])),
+            vector_bytes=int(cfg.get('VectorBytes', 64)),
         )
 
 

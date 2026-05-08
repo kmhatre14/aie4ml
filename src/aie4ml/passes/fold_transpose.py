@@ -41,8 +41,6 @@ class FoldTransposeViews(AIEPass):
                 raise ValueError(f'{node.name}: only channels_last transpose is supported.')
 
             in_view = {
-                'layout': 'channels_last',
-                'independent_axes': [int(i) for i in range(rank - 1)],
                 'buffer_order': [int(i) for i in reversed(range(rank))],
                 'perm': [int(p) for p in perm],
             }
@@ -51,6 +49,8 @@ class FoldTransposeViews(AIEPass):
                 cons_view = self._io_view_data(consumer)
                 cons_view['inputs'][in_tv.name] = dict(in_view)
                 cons_view['inputs'].pop(out_tv.name, None)
+                if out_tv.name in consumer.roles:
+                    consumer.roles[in_tv.name] = consumer.roles.pop(out_tv.name)
 
             graph.remove_node(node, mode='bypass')
             changed = True

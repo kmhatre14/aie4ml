@@ -135,15 +135,6 @@ def describe_family_rhs_staging(view: TensorView, microtiling, parallelism, port
     raw_k = view.tile_raw_outer
     n_slice = view.tile_inner
     raw_n = view.tile_raw_inner
-    perm = view.perm
-    if perm is not None:
-        allowed = [list(range(len(perm)))]
-        if len(perm) >= 2:
-            swap_last_two = list(range(len(perm)))
-            swap_last_two[-2], swap_last_two[-1] = swap_last_two[-1], swap_last_two[-2]
-            allowed.append(swap_last_two)
-        if list(perm) not in allowed:
-            raise ValueError(f'matmul RHS does not support io_view permutation {perm}.')
     buffer_dimension = ordered_view_shape(view, 'full') if buf_dims is None else [int(x) for x in buf_dims]
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
     io_tiling_dimension = ordered_view_shape(view, 'logical')

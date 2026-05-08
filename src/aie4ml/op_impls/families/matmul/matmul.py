@@ -56,14 +56,28 @@ class MatmulOpImplVariant(_BaseDenseMatmulVariant):
         lhs_tensor = input_tensor_for_role(node, 'lhs')
         rhs_tensor = input_tensor_for_role(node, 'rhs')
         lhs_view = p.io_views[lhs_tensor.name]
+        rhs_view = p.io_views[rhs_tensor.name]
         output_view = p.io_views[node.outputs[0].name]
+
+        rhs_perm = rhs_view.perm
+        if rhs_perm is not None:
+            rank = len(rhs_perm)
+            identity = list(range(rank))
+            if rank >= 2:
+                swapped = list(range(rank))
+                swapped[-2], swapped[-1] = swapped[-1], swapped[-2]
+                allowed = [identity, swapped]
+            else:
+                allowed = [identity]
+            if list(rhs_perm) not in allowed:
+                raise ValueError(f'{node.name}: matmul RHS does not support io_view permutation {rhs_perm}.')
 
         rhs_prec = p.precision['rhs']
         rhs_is_float = isinstance(rhs_tensor.precision, FloatIntent)
         if not rhs_is_float and not bool(rhs_prec.signed):
             raise ValueError(f'{node.name}: matmul RHS must use a signed integer precision.')
 
-        rhs_shape = tuple(int(x) for x in p.io_views[rhs_tensor.name].logical)
+        rhs_shape = tuple(int(x) for x in rhs_view.logical)
         if len(rhs_shape) < 2:
             raise ValueError(f'{node.name}: matmul RHS must be rank >=2, got {len(rhs_shape)}.')
         validate_family_tile_contract(

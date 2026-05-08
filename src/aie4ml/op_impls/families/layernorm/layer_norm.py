@@ -74,12 +74,14 @@ class LayerNormI8OpImplVariant(OpImplVariant):
         return {
             'packed_gamma': pack_layernorm_param(
                 gamma_tensor.data,
+                name='gamma',
                 full_inner=int(p.cols),
                 frac=int(p.precision['gamma'].frac),
                 cas_num=cas_num,
             ),
             'packed_beta': pack_layernorm_param(
                 beta_tensor.data,
+                name='beta',
                 full_inner=int(p.cols),
                 frac=int(p.precision['beta'].frac),
                 cas_num=cas_num,

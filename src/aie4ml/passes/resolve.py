@@ -35,16 +35,7 @@ def _resolved_input_contracts(ctx, node) -> dict[str, TensorContract]:
 
 
 def _same_execution_entry(inst, variant, ports, config) -> bool:
-    return (
-        inst.variant.variant_id == variant.variant_id
-        and inst.ports == ports
-        and inst.io_route == config.io_route
-        and inst.io_views == config.io_views
-        and inst.config == config
-        and inst.graph_header == variant.graph_header
-        and inst.graph_name == variant.graph_name
-        and inst.param_template == variant.param_template
-    )
+    return inst.variant is variant and inst.ports == ports and inst.config == config
 
 
 class Resolve(AIEPass):
@@ -56,13 +47,14 @@ class Resolve(AIEPass):
 
     def transform(self, model_or_ctx) -> bool:
         ctx = get_backend_context(model_or_ctx)
+        ctx.ir.logical.verify()
         changed = False
         visited = set()
 
         ctx.ir.execution.tensor_contracts.clear()
 
         for node in ctx.ir.logical:
-            if node.metadata['layer_class'] == 'Input':
+            if node.is_placeholder:
                 continue
 
             resolver = self._registry.get(node.op_type)

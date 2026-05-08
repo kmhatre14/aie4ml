@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -66,6 +66,8 @@ class OpNode:
     traits: Dict[str, TraitInstance] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
     directives: Dict[str, Any] = field(default_factory=dict)
+    roles: Dict[str, str] = field(default_factory=dict)
+    is_placeholder: bool = False
 
     def add_trait(self, trait: TraitInstance) -> None:
         self.traits[trait.name] = trait
@@ -74,18 +76,23 @@ class OpNode:
         return self.traits.get(name, TraitInstance(name)).data
 
 
+def set_input_roles(node: OpNode, tensors: Sequence[TensorVar], role_names: Sequence[str]) -> None:
+    if len(tensors) != len(role_names):
+        raise ValueError(f'{node.name}: set_input_roles got {len(tensors)} tensors but {len(role_names)} role names.')
+    node.roles = {tensor.name: str(role) for tensor, role in zip(tensors, role_names)}
+
+
 def input_role_map(node: OpNode) -> Dict[str, str]:
-    roles = list(node.metadata.get('input_roles') or [])
-    return {tensor.name: str(roles[index]) for index, tensor in enumerate(node.inputs) if index < len(roles)}
+    return dict(node.roles)
 
 
-def input_role(node: OpNode, tensor_name: str) -> str:
-    return input_role_map(node).get(tensor_name, '')
+def input_role(node: OpNode, tensor_name: str) -> Optional[str]:
+    return node.roles.get(tensor_name)
 
 
 def input_tensor_for_role(node: OpNode, role: str) -> TensorVar:
     for tensor in node.inputs:
-        if input_role(node, tensor.name) == role:
+        if node.roles.get(tensor.name) == role:
             return tensor
     raise ValueError(f'{node.name}: missing {role} tensor.')
 
@@ -207,6 +214,42 @@ class LogicalIR:
             raise ValueError('LogicalIR.graph_outputs requires explicit output_tensor_names.')
         return [self.tensors[name] for name in self.output_tensor_names]
 
+    def verify(self) -> None:
+        """Assert structural invariants."""
+        self._verify_unique_node_names()
+        self._verify_topological_order()
+        self._verify_tensor_producers()
+
+    def _verify_unique_node_names(self) -> None:
+        seen: set = set()
+        for node in self.nodes:
+            if node.name in seen:
+                raise RuntimeError(f'LogicalIR has duplicate node name {node.name!r}.')
+            seen.add(node.name)
+
+    def _verify_topological_order(self) -> None:
+        seen: set = set()
+        for node in self.nodes:
+            for tensor in node.inputs:
+                if tensor.producer is not None and tensor.producer.name not in seen:
+                    raise RuntimeError(
+                        f'LogicalIR is not in topological order: {node.name!r} consumes {tensor.name!r} '
+                        f'whose producer {tensor.producer.name!r} has not yet been visited.'
+                    )
+            seen.add(node.name)
+
+    def _verify_tensor_producers(self) -> None:
+        graph_input_names = set(self.input_tensor_names)
+        for node in self.nodes:
+            for tensor in node.inputs:
+                if tensor.is_parameter:
+                    continue
+                if tensor.producer is None and tensor.name not in graph_input_names:
+                    raise RuntimeError(
+                        f'{node.name}: activation input {tensor.name!r} has no producer '
+                        'and is not a declared graph input.'
+                    )
+
     def __iter__(self):
         return iter(self.nodes)
 
@@ -216,6 +259,9 @@ class LogicalIR:
 
 STAGING_CONTRACTS: frozenset = frozenset({'outer', 'inner'})
 """Compiler-wide vocabulary of valid 2D execution partition-axis contracts."""
+
+ROUTE_MODES: frozenset = frozenset({'direct', 'memtile', 'plio', 'auto'})
+"""Compiler-wide vocabulary of valid IO route modes."""
 
 
 @dataclass(frozen=True)

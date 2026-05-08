@@ -20,8 +20,6 @@ def ensure_io_view(node, generation: str) -> None:
 
     def _default_view(rank: int) -> Dict[str, Any]:
         return {
-            'layout': 'channels_last',
-            'independent_axes': list(range(rank - 1)),
             'buffer_order': list(reversed(range(rank))),
         }
 
@@ -75,10 +73,19 @@ def resolve_input_contract(
     return contract, patches
 
 
+_STAGING_COMPAT_STRIP = frozenset({'access', 'boundary_dimension'})
+"""Keys stripped from staging descriptors before compatibility comparison.
+
+'access' is read/write direction — irrelevant for shape compatibility.
+'boundary_dimension' is a per-shard override computed by the planner and absent
+from the canonical per-port descriptor; consumers must not compare it.
+"""
+
+
 def normalized_staging(desc: Dict[str, Any] | None) -> Dict[str, Any] | None:
     if desc is None:
         return None
-    data = {k: v for k, v in desc.items() if k not in ('access', 'boundary_dimension')}
+    data = {k: v for k, v in desc.items() if k not in _STAGING_COMPAT_STRIP}
     if 'io_boundary_dimension' in data and 'boundary_dimension' not in data:
         data['boundary_dimension'] = data['io_boundary_dimension']
     return data

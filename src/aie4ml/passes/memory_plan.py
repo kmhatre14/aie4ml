@@ -516,7 +516,12 @@ class _CodegenPlanner:
     def _graph_input_role(self, entry: _EdgeEntry) -> str:
         consumer = entry.consumers[0].consumer
         role = input_role(consumer, entry.tensor)
-        return role or 'lhs'
+        if not role:
+            raise RuntimeError(
+                f'{entry.tensor}: no role assigned on consumer {consumer.name!r}; '
+                'frontend must call set_input_roles before building memory plan.'
+            )
+        return role
 
     def _buffer_ctype(self, entry):
         if entry.producer is None:

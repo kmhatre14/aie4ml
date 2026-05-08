@@ -65,11 +65,7 @@ class CompactBufferRank(AIEPass):
         return changed
 
     def _warn_skip(self, buf, reason: str) -> None:
-        log.warning(
-            '%s: skipping compact_buffer_rank because %s; x86 simulation may still work, but HW compilation may fail.',
-            buf.get('name', '<unnamed buffer>'),
-            reason,
-        )
+        raise RuntimeError(f'{buf.get("name", "<unnamed buffer>")}: compact_buffer_rank failed because {reason}.')
 
     def _axis_pairs(self, descriptors, rank: int):
         pairs = []

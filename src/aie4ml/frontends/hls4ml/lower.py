@@ -18,10 +18,11 @@ from ...ir import (
     OpNode,
     TensorVar,
     ensure_backend_context,
+    set_input_roles,
 )
 from ...ir.context import AIEBackendContext, DeviceSpec, ProjectConfig
 from ...passes.utils import is_pointwise_dense
-from ..common import attach_quant_role_bindings, register_default_traits
+from ..common import register_default_traits
 from .utils import _create_weight_tensors, _get_post_activation_precision, _precision_of, extract_layer_directives
 
 
@@ -84,6 +85,8 @@ class LowerToAieIr(ModelOptimizerPass):
                 op_type=self._map_op_type(layer),
                 dialect=ctx.device.dialect,
             )
+            if layer.class_name.lower() == 'input':
+                node.is_placeholder = True
             self._collect_metadata(layer, node)
             node.directives.update(extract_layer_directives(layer, model))
 
@@ -139,6 +142,10 @@ class LowerToAieIr(ModelOptimizerPass):
                 if bias_tv is not None:
                     node.inputs.append(bias_tv)
 
+            role_names = list(node.metadata.get('input_roles') or [])
+            if role_names:
+                set_input_roles(node, node.inputs, role_names)
+
         for out_var in model.get_output_variables():
             graph.mark_graph_output(out_var.name)
 
@@ -190,7 +197,6 @@ class LowerToAieIr(ModelOptimizerPass):
             meta['source_class'] = layer.class_name
             meta['layer_class'] = 'Dense'
         meta['source_layer'] = layer.name
-        attach_quant_role_bindings(meta)
 
         if meta:
             node.metadata.update(meta)

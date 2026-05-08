@@ -45,14 +45,24 @@ def register_variant(cls):
 def select_variant(op_type: str, config, generation: str) -> OpImplVariant:
     precision_query: Dict[str, object] = {key: legality_format(dtype.format) for key, dtype in config.precision.items()}
 
+    matched: List[OpImplVariant] = []
     for variant in _GLOBAL_OP_IMPL_REGISTRY.variants(op_type):
         if not variant.supports_generation(generation):
             continue
         if not variant.supports_io_route(config.io_route):
             continue
         if variant.supports_precisions(precision_query):
-            return variant
-    raise RuntimeError(f'No implementation variant satisfies resolved {op_type} config.')
+            matched.append(variant)
+
+    if not matched:
+        raise RuntimeError(f'No implementation variant satisfies resolved {op_type} config.')
+    if len(matched) > 1:
+        ids = ', '.join(v.variant_id for v in matched)
+        raise RuntimeError(
+            f'Ambiguous {op_type} variant selection — multiple variants match: {ids}. '
+            'Use a compiler directive to specify the variant explicitly.'
+        )
+    return matched[0]
 
 
 from . import families  # noqa: E402,F401

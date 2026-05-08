@@ -6,10 +6,9 @@ from typing import Any, Dict, Optional, Tuple
 import numpy as np
 
 from ...aie_types import FloatFormat, FloatIntent, QuantIntent
-from ...ir import LogicalIR, OpNode, TensorVar
+from ...ir import LogicalIR, OpNode, TensorVar, set_input_roles
 from ...ir.context import AIEBackendContext
 from ...model import AIEModel
-from ..common import attach_quant_role_bindings
 from .utils import (
     attr,
     create_context,
@@ -287,16 +286,15 @@ def lower_onnx_model(
 
             op = OpNode(name=f'{node_name}_aie', op_type='transpose', dialect=ctx.device.dialect)
             op.metadata.update(
-                attach_quant_role_bindings(
-                    {
-                        'perm': perm,
-                        'data_format': 'channels_last',
-                        'layer_class': 'Transpose',
-                        'source_layer': node_name,
-                        'input_roles': ['lhs'],
-                    }
-                )
+                {
+                    'perm': perm,
+                    'data_format': 'channels_last',
+                    'layer_class': 'Transpose',
+                    'source_layer': node_name,
+                    'input_roles': ['lhs'],
+                }
             )
+
             op.directives.update(directives)
             src.consumers.append(op)
             op.inputs.append(src)
@@ -368,18 +366,17 @@ def lower_onnx_model(
                 rhs_param = _param_tensor(f'{node_name}_weight', rhs_data, rhs_tensor.precision)
                 op = OpNode(name=f'{node_name}_aie', op_type='dense', dialect=ctx.device.dialect)
                 op.metadata.update(
-                    attach_quant_role_bindings(
-                        {
-                            'n_in': n_in,
-                            'n_out': n_out,
-                            'use_bias': False,
-                            'layer_class': 'Dense',
-                            'source_class': op_type,
-                            'source_layer': node_name,
-                            'input_roles': ['lhs', 'rhs'],
-                        }
-                    )
+                    {
+                        'n_in': n_in,
+                        'n_out': n_out,
+                        'use_bias': False,
+                        'layer_class': 'Dense',
+                        'source_class': op_type,
+                        'source_layer': node_name,
+                        'input_roles': ['lhs', 'rhs'],
+                    }
                 )
+
                 op.directives.update(directives)
                 lhs_tensor.consumers.append(op)
                 op.inputs.extend([lhs_tensor, rhs_param])
@@ -395,7 +392,6 @@ def lower_onnx_model(
                     op.inputs.append(bias_param)
                     op.metadata['use_bias'] = True
                     op.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
-                    attach_quant_role_bindings(op.metadata)
             else:
                 if bias_name is not None:
                     raise ValueError(f'{node_name}: dynamic MatMul does not support fused bias.')
@@ -441,18 +437,17 @@ def lower_onnx_model(
 
                 op = OpNode(name=f'{node_name}_aie', op_type='matmul', dialect=ctx.device.dialect)
                 op.metadata.update(
-                    attach_quant_role_bindings(
-                        {
-                            'n_in': n_in,
-                            'n_out': n_out,
-                            'use_bias': False,
-                            'layer_class': 'MatMul',
-                            'source_class': 'MatMul',
-                            'source_layer': node_name,
-                            'input_roles': ['lhs', 'rhs'],
-                        }
-                    )
+                    {
+                        'n_in': n_in,
+                        'n_out': n_out,
+                        'use_bias': False,
+                        'layer_class': 'MatMul',
+                        'source_class': 'MatMul',
+                        'source_layer': node_name,
+                        'input_roles': ['lhs', 'rhs'],
+                    }
                 )
+
                 op.directives.update(directives)
                 lhs_tensor.consumers.append(op)
                 rhs_tensor.consumers.append(op)
@@ -488,15 +483,14 @@ def lower_onnx_model(
                     )
                 op = OpNode(name=f'{node_name}_aie', op_type='add', dialect=ctx.device.dialect)
                 op.metadata.update(
-                    attach_quant_role_bindings(
-                        {
-                            'layer_class': 'Add',
-                            'source_class': 'Add',
-                            'source_layer': node_name,
-                            'input_roles': ['lhs', 'rhs'],
-                        }
-                    )
+                    {
+                        'layer_class': 'Add',
+                        'source_class': 'Add',
+                        'source_layer': node_name,
+                        'input_roles': ['lhs', 'rhs'],
+                    }
                 )
+
                 op.directives.update(directives)
                 lhs.consumers.append(op)
                 rhs.consumers.append(op)
@@ -523,7 +517,6 @@ def lower_onnx_model(
             dense_node.inputs.append(bias_param)
             dense_node.metadata['use_bias'] = True
             dense_node.metadata['input_roles'] = ['lhs', 'rhs', 'bias']
-            attach_quant_role_bindings(dense_node.metadata)
             value_tensors[node.output[0]] = dense_tensor
             shape_of[node.output[0]] = tuple(int(x) for x in dense_tensor.shape)
             continue
@@ -577,16 +570,15 @@ def lower_onnx_model(
             inputs = [x_tensor, scale_tensor, bias_tensor]
 
             op.metadata.update(
-                attach_quant_role_bindings(
-                    {
-                        'layer_class': 'LayerNormalization',
-                        'source_class': 'LayerNormalization',
-                        'source_layer': node_name,
-                        'input_roles': ['lhs', 'gamma', 'beta'],
-                        'epsilon': epsilon,
-                    }
-                )
+                {
+                    'layer_class': 'LayerNormalization',
+                    'source_class': 'LayerNormalization',
+                    'source_layer': node_name,
+                    'input_roles': ['lhs', 'gamma', 'beta'],
+                    'epsilon': epsilon,
+                }
             )
+
             op.directives.update(directives)
             x_tensor.consumers.append(op)
             op.inputs.extend(inputs)
@@ -608,15 +600,14 @@ def lower_onnx_model(
             out_shape = tuple(int(x) for x in shape_of[node.input[0]])
             op = OpNode(name=f'{node_name}_aie', op_type='activation', dialect=ctx.device.dialect)
             op.metadata.update(
-                attach_quant_role_bindings(
-                    {
-                        'activation': 'relu',
-                        'layer_class': 'Activation',
-                        'source_layer': node_name,
-                        'input_roles': ['lhs'],
-                    }
-                )
+                {
+                    'activation': 'relu',
+                    'layer_class': 'Activation',
+                    'source_layer': node_name,
+                    'input_roles': ['lhs'],
+                }
             )
+
             op.directives.update(directives)
             src.consumers.append(op)
             op.inputs.append(src)
@@ -645,6 +636,11 @@ def lower_onnx_model(
             graph.tensors[output.name] = tensor
         graph.mark_graph_output(output.name)
 
+    for node in graph.nodes:
+        role_names = list(node.metadata.get('input_roles') or [])
+        if role_names:
+            set_input_roles(node, node.inputs, role_names)
+
     def _lhs_consumed(tensor, seen=None) -> bool:
         seen = set() if seen is None else seen
         tid = id(tensor)
@@ -656,10 +652,8 @@ def lower_onnx_model(
                 if _lhs_consumed(consumer.outputs[0], seen):
                     return True
                 continue
-            roles = list(consumer.metadata.get('input_roles') or [])
-            for index, bound in enumerate(consumer.inputs):
-                if bound is tensor and index < len(roles) and roles[index] == 'lhs':
-                    return True
+            if consumer.roles.get(tensor.name) == 'lhs':
+                return True
         return False
 
     for tensor in graph.graph_inputs():
