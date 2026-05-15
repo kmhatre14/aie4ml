@@ -7,32 +7,40 @@
 [![PyPI - Downloads](https://img.shields.io/pypi/dm/aie4ml.svg)](https://pypi.org/project/aie4ml/)
 [![arXiv](https://img.shields.io/badge/arXiv-2512.15946-b31b1b.svg)](https://arxiv.org/abs/2512.15946)
 
-`aie4ml` is an end-to-end compiler that generates **optimized** AIE firmware automatically, which can be then built and simulated directly using **AMD Vitis**. Currently, it is developed as a plugin that extends the backends for [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) in order to target the **AMD AI Engine (AIE)**.
+`aie4ml` is an end-to-end compiler that generates **optimized** AIE firmware automatically, which can be then built and simulated directly using **AMD Vitis**. It targets the **AMD AI Engine (AIE)** from model-level frontends and lowers supported operators into AIE graphs and kernels as a standalone AIE project.
 
-- Current support: dense (linear) layers with optional bias & ReLU. Support for AIE-ML/AIE-MLv2 devices.
+- Current hardware targets: AIE-ML and AIE-MLv2 devices.
+- Current frontend paths: ONNX for explicit operator graphs, and an optional [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) frontend path.
+- Current operator support: dense/linear, ReLU, matrix multiplication, elementwise add, quantized LayerNorm, Permute, graph branch/fanout, and softmax (in progress).
 
 ## Prerequisites
 
 - AMD Vitis 2025.2 and a valid AIE tools license.
-- Python 3.10+ and the latest version of [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) package.
+- Python 3.10+.
+- Optional: [`hls4ml`](https://github.com/fastmachinelearning/hls4ml) if using the hls4ml frontend integration.
 
-# Frontend Compatibility
+## Frontend Compatibility
 
-Operates on the intermediate model representation produced by hls4ml, therefore independent of the frontend (i.e., PyTorch, QKeras, etc.).
+The ONNX path is the recommended route for operator-level compiler development and for models that already express quantized tensors and Q/DQ boundaries explicitly. The hls4ml path is intended for MLP-style pipelines at the moment.
 
-# Installation
+## Installation
 
 ```bash
-pip install hls4ml
 pip install aie4ml
 ```
 
-# Documentation & Tutorials
+Install hls4ml only if you need the hls4ml frontend/backend integration:
+
+```bash
+pip install hls4ml
+```
+
+## Documentation & Tutorials
 
 Documentation and usage: [https://github.com/dimdano/aie4ml](https://github.com/dimdano/aie4ml)
 
-Tutorial 1 : [`tutorials/tutorial_1.ipynb`](tutorials/tutorial_1.ipynb)
-Tutorial 2 : [`tutorials/tutorial_2.ipynb`](tutorials/tutorial_2.ipynb)
+Tutorial 1: [`tutorials/tutorial_1.ipynb`](tutorials/tutorial_1.ipynb)
+Tutorial 2: [`tutorials/tutorial_2.ipynb`](tutorials/tutorial_2.ipynb)
 
 General `hls4ml` concepts: [https://fastmachinelearning.org/hls4ml](https://fastmachinelearning.org/hls4ml)
 
