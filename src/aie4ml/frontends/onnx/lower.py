@@ -31,6 +31,56 @@ _ONNX_FP8E4M3FN = 17
 _ONNX_INT_ELEM_TYPE_TO_NP = {2: np.uint8, 3: np.int8, 4: np.uint16, 5: np.int16, 6: np.int32, 7: np.int64}
 
 
+def _normalize_axis(axis: int, rank: int, node_name: str, op_type: str) -> int:
+    if rank < 1:
+        raise ValueError(f'{node_name}: {op_type} does not accept scalar tensors.')
+    normalized = int(axis)
+    if normalized < 0:
+        normalized += int(rank)
+    if normalized < 0 or normalized >= int(rank):
+        raise ValueError(f'{node_name}: {op_type} axis {axis} is out of range for rank {rank}.')
+    return normalized
+
+
+def _broadcast_prefix(lhs: Tuple[int, ...], rhs: Tuple[int, ...], node_name: str) -> Tuple[int, ...]:
+    out = []
+    lhs_rev = list(reversed(lhs))
+    rhs_rev = list(reversed(rhs))
+    for index in range(max(len(lhs_rev), len(rhs_rev))):
+        lhs_dim = lhs_rev[index] if index < len(lhs_rev) else 1
+        rhs_dim = rhs_rev[index] if index < len(rhs_rev) else 1
+        if lhs_dim == 1:
+            out.append(int(rhs_dim))
+        elif rhs_dim == 1 or lhs_dim == rhs_dim:
+            out.append(int(lhs_dim))
+        else:
+            raise ValueError(f'{node_name}: ONNX MatMul leading dimensions are not broadcastable: {lhs} and {rhs}.')
+    return tuple(reversed(out))
+
+
+def _matmul_output_shape(lhs_shape: Tuple[int, ...], rhs_shape: Tuple[int, ...], node_name: str) -> Tuple[int, ...]:
+    """Apply ONNX MatMul shape semantics only; implementation legality is resolver-owned."""
+    if len(lhs_shape) < 1 or len(rhs_shape) < 1:
+        raise ValueError(f'{node_name}: ONNX MatMul does not accept scalar inputs.')
+
+    lhs_is_vector = len(lhs_shape) == 1
+    rhs_is_vector = len(rhs_shape) == 1
+
+    lhs_k = int(lhs_shape[-1])
+    rhs_k = int(rhs_shape[0] if rhs_is_vector else rhs_shape[-2])
+    if lhs_k != rhs_k:
+        raise ValueError(f'{node_name}: ONNX MatMul K dimensions do not match: {lhs_k} and {rhs_k}.')
+
+    lhs_prefix = () if lhs_is_vector else tuple(int(x) for x in lhs_shape[:-2])
+    rhs_prefix = () if rhs_is_vector else tuple(int(x) for x in rhs_shape[:-2])
+    out = list(_broadcast_prefix(lhs_prefix, rhs_prefix, node_name))
+    if not lhs_is_vector:
+        out.append(int(lhs_shape[-2]))
+    if not rhs_is_vector:
+        out.append(int(rhs_shape[-1]))
+    return tuple(out)
+
+
 def lower_onnx_model(
     model_or_path,
     config: Dict[str, Any],
@@ -54,7 +104,6 @@ def lower_onnx_model(
     ctx = create_context(config, output_dir, resolved_project_name, stamp, custom_sources)
     graph: LogicalIR = ctx.ir.logical
 
-    batch_size = int(ctx.aie_config['BatchSize'])
     initializers = initializer_map(graph_proto, numpy_helper)
     raw_input_shapes, raw_input_dtypes = input_maps(graph_proto, set(initializers))
     for name, shape in raw_input_shapes.items():
@@ -340,8 +389,6 @@ def lower_onnx_model(
                 raise ValueError(f'{node_name}: activation input cannot be constant.')
 
             lhs_shape = tuple(int(x) for x in shape_of[lhs_name])
-            if len(lhs_shape) < 1:
-                raise ValueError(f'{node_name}: scalar activations are not supported.')
 
             if rhs_is_constant:
                 rhs_tensor = _parameter_source_for(rhs_name, node_name)
@@ -352,16 +399,38 @@ def lower_onnx_model(
                 if trans_b:
                     rhs_data = np.transpose(rhs_data)
                 if rhs_data.ndim != 2:
-                    raise ValueError(f'{node_name}: only rank-2 weight matrices are supported.')
-                if int(lhs_shape[-1]) != int(rhs_data.shape[0]):
-                    raise ValueError(
-                        f'{node_name}: activation feature dimension {lhs_shape[-1]} '
-                        f'does not match weight input dimension {rhs_data.shape[0]}.'
+                    if op_type == 'Gemm':
+                        raise ValueError(f'{node_name}: ONNX Gemm weight matrix must be rank-2.')
+                    out_shape = _matmul_output_shape(lhs_shape, tuple(int(x) for x in rhs_data.shape), node_name)
+                    n_in = int(rhs_data.shape[0] if rhs_data.ndim == 1 else rhs_data.shape[-2])
+                    n_out = int(1 if rhs_data.ndim == 1 else rhs_data.shape[-1])
+                    rhs_param = _param_tensor(f'{node_name}_rhs', rhs_data, rhs_tensor.precision)
+                    op = OpNode(name=f'{node_name}_aie', op_type='matmul', dialect=ctx.device.dialect)
+                    op.metadata.update(
+                        {
+                            'n_in': n_in,
+                            'n_out': n_out,
+                            'use_bias': False,
+                            'layer_class': 'MatMul',
+                            'source_class': 'MatMul',
+                            'source_layer': node_name,
+                            'input_roles': ['lhs', 'rhs'],
+                        }
                     )
-
+                    op.directives.update(directives)
+                    lhs_tensor.consumers.append(op)
+                    op.inputs.extend([lhs_tensor, rhs_param])
+                    out_precision = lhs_tensor.precision if isinstance(lhs_tensor.precision, FloatIntent) else None
+                    out_tensor = TensorVar(name=node.output[0], shape=out_shape, precision=out_precision, producer=op)
+                    graph.add_tensor(out_tensor)
+                    op.outputs.append(out_tensor)
+                    graph.add_node(op)
+                    value_tensors[node.output[0]] = out_tensor
+                    shape_of[node.output[0]] = out_shape
+                    continue
+                out_shape = _matmul_output_shape(lhs_shape, tuple(int(x) for x in rhs_data.shape), node_name)
                 n_in = int(rhs_data.shape[0])
                 n_out = int(rhs_data.shape[1])
-                out_shape = tuple(list(lhs_shape[:-1]) + [n_out])
 
                 rhs_param = _param_tensor(f'{node_name}_weight', rhs_data, rhs_tensor.precision)
                 op = OpNode(name=f'{node_name}_aie', op_type='dense', dialect=ctx.device.dialect)
@@ -396,44 +465,10 @@ def lower_onnx_model(
                 if bias_name is not None:
                     raise ValueError(f'{node_name}: dynamic MatMul does not support fused bias.')
                 rhs_tensor = _source_for(rhs_name, node_name)
-                if rhs_tensor.is_parameter:
-                    raise ValueError(f'{node_name}: dynamic MatMul RHS must be a runtime tensor.')
-                if isinstance(rhs_tensor.precision, QuantIntent) and not rhs_tensor.precision.signed:
-                    raise ValueError(f'{node_name}: dynamic MatMul RHS must use a signed integer quantization.')
-
-                if len(lhs_shape) < 2:
-                    raise ValueError(f'{node_name}: dynamic MatMul LHS rank must be >=2, got {len(lhs_shape)}.')
                 rhs_shape = tuple(int(x) for x in shape_of[rhs_name])
-                if len(rhs_shape) < 2:
-                    raise ValueError(f'{node_name}: dynamic MatMul RHS rank must be >=2, got {len(rhs_shape)}.')
-
-                if len(rhs_shape) == 2:
-                    n_in = int(rhs_shape[0])
-                    n_out = int(rhs_shape[1])
-                    out_shape = tuple(list(lhs_shape[:-1]) + [n_out])
-                else:
-                    if len(rhs_shape) != len(lhs_shape):
-                        raise ValueError(
-                            f'{node_name}: dynamic MatMul only supports rank-2 RHS or '
-                            f'LHS/RHS with the same rank; got lhs rank {len(lhs_shape)} '
-                            f'and rhs rank {len(rhs_shape)}.'
-                        )
-                    lhs_leading = tuple(int(x) for x in lhs_shape[:-2])
-                    rhs_leading = tuple(int(x) for x in rhs_shape[:-2])
-                    if rhs_leading != lhs_leading:
-                        raise ValueError(
-                            f'{node_name}: dynamic MatMul requires rhs leading dimensions '
-                            f'{rhs_leading} to match lhs leading dimensions {lhs_leading}.'
-                        )
-                    n_in = int(rhs_shape[-2])
-                    n_out = int(rhs_shape[-1])
-                    out_shape = tuple(list(lhs_shape[:-2]) + [int(lhs_shape[-2]), n_out])
-
-                if int(lhs_shape[-1]) != n_in:
-                    raise ValueError(
-                        f'{node_name}: activation feature dimension {lhs_shape[-1]} '
-                        f'does not match RHS input dimension {n_in}.'
-                    )
+                out_shape = _matmul_output_shape(lhs_shape, rhs_shape, node_name)
+                n_in = int(rhs_shape[0] if len(rhs_shape) == 1 else rhs_shape[-2])
+                n_out = int(1 if len(rhs_shape) == 1 else rhs_shape[-1])
 
                 op = OpNode(name=f'{node_name}_aie', op_type='matmul', dialect=ctx.device.dialect)
                 op.metadata.update(
@@ -528,42 +563,22 @@ def lower_onnx_model(
             scale_name = node.input[1]
             bias_name = node.input[2] if len(node.input) == 3 else None
             x_shape = tuple(int(x) for x in shape_of[x_name])
-            if len(x_shape) < 2:
-                raise ValueError(f'{node_name}: LayerNormalization requires rank>=2 inputs, got {len(x_shape)}.')
 
-            axis = int(attr(node, 'axis', -1))
-            if axis < 0:
-                axis += len(x_shape)
-            if axis != len(x_shape) - 1:
-                raise ValueError(
-                    f'{node_name}: only last-axis LayerNormalization is supported; got axis={axis} '
-                    f'for rank {len(x_shape)}.'
-                )
+            axis = _normalize_axis(int(attr(node, 'axis', -1)), len(x_shape), node_name, 'LayerNormalization')
+            norm_shape = tuple(int(x) for x in x_shape[axis:])
             epsilon = float(attr(node, 'epsilon', 1e-5))
 
             x_tensor = _source_for(x_name, node_name)
             scale_tensor = _parameter_source_for(scale_name, node_name)
             if not scale_tensor.is_parameter:
                 raise ValueError(f'{node_name}: LayerNormalization Scale must be a constant initializer.')
-            scale_data = np.asarray(scale_tensor.data, dtype=np.float64).reshape(-1)
-            if int(scale_data.size) != int(x_shape[-1]):
-                raise ValueError(
-                    f'{node_name}: LayerNormalization Scale length {scale_data.size} '
-                    f'does not match feature dim {x_shape[-1]}.'
-                )
 
             if bias_name is not None:
                 bias_tensor = _parameter_source_for(bias_name, node_name)
                 if not bias_tensor.is_parameter:
                     raise ValueError(f'{node_name}: LayerNormalization Bias must be a constant initializer.')
-                bias_data = np.asarray(bias_tensor.data, dtype=np.float64).reshape(-1)
-                if int(bias_data.size) != int(x_shape[-1]):
-                    raise ValueError(
-                        f'{node_name}: LayerNormalization Bias length {bias_data.size} '
-                        f'does not match feature dim {x_shape[-1]}.'
-                    )
             else:
-                zeros = np.zeros((int(x_shape[-1]),), dtype=np.float64)
+                zeros = np.zeros(norm_shape, dtype=np.float64)
                 bias_tensor = _param_tensor(f'{node_name}_beta_zero', zeros, scale_tensor.precision)
 
             op = OpNode(name=f'{node_name}_aie', op_type='layer_norm', dialect=ctx.device.dialect)
@@ -576,6 +591,7 @@ def lower_onnx_model(
                     'source_layer': node_name,
                     'input_roles': ['lhs', 'gamma', 'beta'],
                     'epsilon': epsilon,
+                    'axis': axis,
                 }
             )
 
@@ -590,6 +606,41 @@ def lower_onnx_model(
             graph.add_node(op)
             value_tensors[node.output[0]] = out_tensor
             shape_of[node.output[0]] = x_shape
+            continue
+
+        if op_type == 'Softmax':
+            if len(node.input) != 1:
+                raise ValueError(f'{node_name}: Softmax must have exactly 1 input.')
+            if 'hccs' not in directives:
+                raise ValueError(
+                    f'{node_name}: ONNX Softmax lowering requires explicit HCCS directives; '
+                    'this is a calibrated surrogate, not normal exponential softmax.'
+                )
+            src = _source_for(node.input[0], node_name)
+            out_name = node.output[0]
+            in_shape = tuple(int(x) for x in shape_of[node.input[0]])
+            axis = _normalize_axis(int(attr(node, 'axis', -1)), len(in_shape), node_name, 'Softmax')
+
+            op = OpNode(name=f'{node_name}_aie', op_type='softmax', dialect=ctx.device.dialect)
+            op.metadata.update(
+                {
+                    'axis': axis,
+                    'layer_class': 'Softmax',
+                    'source_class': 'Softmax',
+                    'source_layer': node_name,
+                    'input_roles': ['lhs'],
+                }
+            )
+
+            op.directives.update(directives)
+            src.consumers.append(op)
+            op.inputs.append(src)
+            out_tensor = TensorVar(name=out_name, shape=in_shape, precision=None, producer=op)
+            graph.add_tensor(out_tensor)
+            op.outputs.append(out_tensor)
+            graph.add_node(op)
+            value_tensors[out_name] = out_tensor
+            shape_of[out_name] = in_shape
             continue
 
         if op_type == 'Relu':
@@ -640,29 +691,6 @@ def lower_onnx_model(
         role_names = list(node.metadata.get('input_roles') or [])
         if role_names:
             set_input_roles(node, node.inputs, role_names)
-
-    def _lhs_consumed(tensor, seen=None) -> bool:
-        seen = set() if seen is None else seen
-        tid = id(tensor)
-        if tid in seen:
-            return False
-        seen.add(tid)
-        for consumer in tensor.consumers:
-            if consumer.op_type == 'transpose' and consumer.outputs:
-                if _lhs_consumed(consumer.outputs[0], seen):
-                    return True
-                continue
-            if consumer.roles.get(tensor.name) == 'lhs':
-                return True
-        return False
-
-    for tensor in graph.graph_inputs():
-        input_name = tensor.name
-        lhs_consumed = _lhs_consumed(tensor)
-        if lhs_consumed and int(tensor.shape[0]) != batch_size:
-            raise ValueError(
-                f'{input_name}: input batch dim. {tensor.shape[0]} does not match AIEConfig.BatchSize={batch_size}.'
-            )
 
     for tensor in graph.tensors.values():
         if tensor.is_parameter:

@@ -86,6 +86,15 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
             raise TypeError(f'{name}: io_route override must be a dict.')
         directives['io_route'] = dict(io_route)
 
+    if 'approximation' in raw:
+        directives['approximation'] = str(raw['approximation'])
+
+    if 'hccs' in raw:
+        hccs_cfg = raw['hccs']
+        if not isinstance(hccs_cfg, dict):
+            raise TypeError(f'{name}: hccs override must be a dict.')
+        directives['hccs'] = dict(hccs_cfg)
+
     return directives
 
 

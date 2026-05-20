@@ -206,9 +206,6 @@ def _resolve_parallelism(
     node, device, microtiling: MatmulMicrotileConfig, precision: Dict[str, AIEDataType]
 ) -> MatmulTiling:
     lhs_tensor = input_tensor_for_role(node, 'lhs')
-    if lhs_tensor is None:
-        raise ValueError(f'{node.name}: missing lhs tensor.')
-
     lhs_shape = view_shape(node, lhs_tensor, 'inputs')
     in_shape = lhs_shape[-1]
     out_shape = view_shape(node, node.outputs[0], 'outputs')[-1]
@@ -397,6 +394,10 @@ def _validate_matmul_family_rank_contract(node) -> None:
 
     lhs_shape = tuple(int(x) for x in view_shape(node, lhs_tensor, 'inputs'))
     rhs_shape = tuple(int(x) for x in view_shape(node, rhs_tensor, 'inputs'))
+    if len(lhs_shape) < 2:
+        raise ValueError(f'{node.name}: {node.op_type}.v1 requires rank>=2 LHS tensors, got {lhs_shape}.')
+    if len(rhs_shape) < 2:
+        raise ValueError(f'{node.name}: {node.op_type}.v1 requires rank>=2 RHS tensors, got {rhs_shape}.')
     rhs_batch = rhs_shape[:-2] if len(rhs_shape) > 2 else ()
     if rhs_batch and any(int(dim) != 1 for dim in rhs_batch):
         raise ValueError(
@@ -463,6 +464,12 @@ class MatmulResolver:
 
     def resolve(self, node, device, directives=None) -> MatmulConfig:
         _validate_matmul_family_rank_contract(node)
+        rhs_tensor = input_tensor_for_role(node, 'rhs')
+        if rhs_tensor.is_parameter:
+            raise ValueError(
+                f'{node.name}: matmul.v1 requires a runtime RHS tensor. Constant RHS MatMul must lower to dense, '
+                'parallel rank-2 MatMul ops, or a static/batched matmul variant.'
+            )
         io_route = dict((directives or {}).get('io_route', {}))
         precision = _resolve_numeric(node, device)
         microtiling = _resolve_tile_cfg(node, device, precision['lhs'], precision['rhs'])

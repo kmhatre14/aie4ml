@@ -118,8 +118,8 @@ class LayerNormResolver:
         input_contracts = (directives or {}).get('input_contracts', {})
 
         in_tensor = input_tensor_for_role(node, 'lhs')
-        input_tensor_for_role(node, 'gamma')
-        input_tensor_for_role(node, 'beta')
+        gamma_tensor = input_tensor_for_role(node, 'gamma')
+        beta_tensor = input_tensor_for_role(node, 'beta')
         out_tensor = node.outputs[0]
 
         if isinstance(in_tensor.precision, FloatIntent) or isinstance(out_tensor.precision, FloatIntent):
@@ -145,10 +145,24 @@ class LayerNormResolver:
         in_shape = tuple(int(x) for x in view_shape(node, in_tensor, 'inputs'))
         if len(in_shape) < 2:
             raise ValueError(f'{node.name}: LayerNorm requires rank>=2 input tensors, got {len(in_shape)}.')
+        axis = int(node.metadata.get('axis', -1))
+        if axis < 0:
+            axis += len(in_shape)
+        if axis != len(in_shape) - 1:
+            raise ValueError(f'{node.name}: integer LayerNorm only supports last-axis normalization; got axis={axis}.')
 
         full_inner = int(in_shape[-1])
         outer_prefix = int(math.prod(in_shape[:-2])) if len(in_shape) > 2 else 1
         last_outer = int(in_shape[-2])
+
+        for role, tensor in (('gamma', gamma_tensor), ('beta', beta_tensor)):
+            if not tensor.is_parameter:
+                raise ValueError(f'{node.name}: LayerNorm {role} must be a constant parameter tensor.')
+            param_elems = int(math.prod(tuple(int(x) for x in tensor.shape)))
+            if param_elems != full_inner:
+                raise ValueError(
+                    f'{node.name}: LayerNorm {role} length {param_elems} must match full_inner={full_inner}.'
+                )
 
         vec_size = layernorm_vec_size(precision['lhs'], device)
         if full_inner % vec_size != 0:
