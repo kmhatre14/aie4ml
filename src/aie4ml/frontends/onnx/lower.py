@@ -556,6 +556,56 @@ def lower_onnx_model(
             shape_of[node.output[0]] = tuple(int(x) for x in dense_tensor.shape)
             continue
 
+        if op_type == 'Concat':
+            if len(node.input) < 1:
+                raise ValueError(f'{node_name}: Concat must have at least one input.')
+            sources = [_source_for(name, node_name) for name in node.input]
+            if any(src.is_parameter for src in sources):
+                raise ValueError(f'{node_name}: Concat currently supports activation tensors only.')
+
+            shapes = [tuple(int(x) for x in shape_of[name]) for name in node.input]
+            rank = len(shapes[0])
+            if rank < 1:
+                raise ValueError(f'{node_name}: Concat does not accept scalar inputs.')
+            if any(len(shape) != rank for shape in shapes):
+                raise ValueError(f'{node_name}: Concat inputs must have the same rank.')
+            axis = _normalize_axis(int(attr(node, 'axis', -1)), rank, node_name, 'Concat')
+
+            prefix = tuple(shapes[0][:axis])
+            suffix = tuple(shapes[0][axis + 1 :])
+            for shape in shapes[1:]:
+                if tuple(shape[:axis]) != prefix or tuple(shape[axis + 1 :]) != suffix:
+                    raise ValueError(f'{node_name}: Concat input shapes disagree outside axis {axis}: {shapes}.')
+
+            precision = sources[0].precision
+            for src in sources[1:]:
+                if src.precision != precision:
+                    raise ValueError(f'{node_name}: Concat inputs must use identical precision contracts.')
+
+            axis_extent = sum(int(shape[axis]) for shape in shapes)
+
+            out_shape = tuple(prefix + (int(axis_extent),) + suffix)
+            op = OpNode(name=f'{node_name}_aie', op_type='concat', dialect=ctx.device.dialect)
+            op.metadata.update(
+                {
+                    'axis': axis,
+                    'layer_class': 'Concat',
+                    'source_class': 'Concat',
+                    'source_layer': node_name,
+                }
+            )
+
+            for src in sources:
+                src.consumers.append(op)
+            op.inputs.extend(sources)
+            out_tensor = TensorVar(name=node.output[0], shape=out_shape, precision=precision, producer=op)
+            graph.add_tensor(out_tensor)
+            op.outputs.append(out_tensor)
+            graph.add_node(op)
+            value_tensors[node.output[0]] = out_tensor
+            shape_of[node.output[0]] = out_shape
+            continue
+
         if op_type == 'LayerNormalization':
             if len(node.input) not in (2, 3):
                 raise ValueError(f'{node_name}: LayerNormalization must have 2 or 3 inputs.')

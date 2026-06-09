@@ -7,24 +7,33 @@ from typing import Any, Dict, List
 def graph_input_port_descs(entry, ctx, port_base: int) -> Dict[int, Dict[str, Any]]:
     consumer = entry.consumers[0].consumer
     inst = ctx.ir.execution.get(consumer.name)
-    count = int(inst.ports.inputs[entry.tensor].count)
+    consumer_ports = (
+        list(entry.consumer_port_subset)
+        if getattr(entry, 'consumer_port_subset', None) is not None
+        else list(range(int(inst.ports.inputs[entry.consumer_tensor].count)))
+    )
+    count = len(consumer_ports)
     if count != int(entry.producer_ports):
         raise ValueError(
-            f'{entry.tensor}: graph-input producer_ports must match consumer port count '
+            f'{entry.logical_tensor}: graph-input producer_ports must match consumer port count '
             f'({entry.producer_ports} != {count}).'
         )
     descs: Dict[int, Dict[str, Any]] = {}
-    for port in range(count):
-        descs[int(port_base) + int(port)] = inst.variant.describe_input_staging(
-            consumer, inst.config, entry.tensor, port, None, None
+    for local_port, port in enumerate(consumer_ports):
+        graph_port = int(port_base) + int(local_port)
+        descs[graph_port] = inst.variant.describe_input_staging(
+            consumer, inst.config, entry.consumer_tensor, int(port), None, None
         )
+        _rebase_descriptor_offset(descs[graph_port], entry.consumer_offset_base)
     return descs
 
 
 def graph_input_full_descriptor(entry, ctx) -> Dict[str, Any]:
     consumer = entry.consumers[0].consumer
     inst = ctx.ir.execution.get(consumer.name)
-    base = inst.variant.describe_input_staging(consumer, inst.config, entry.tensor, 0, None, None)
+    port = int(entry.consumer_port_subset[0]) if getattr(entry, 'consumer_port_subset', None) else 0
+    base = inst.variant.describe_input_staging(consumer, inst.config, entry.consumer_tensor, port, None, None)
+    _rebase_descriptor_offset(base, entry.consumer_offset_base)
     io_tile = list(base['io_tiling_dimension'])
     return {
         'access': 'write',
@@ -82,14 +91,14 @@ def graph_input_port_descriptor(entry, port: int) -> Dict[str, Any]:
     try:
         return copy.deepcopy(entry.graph_input_port_descs[int(port)])
     except KeyError as exc:
-        raise RuntimeError(f'{entry.tensor}: missing graph-input descriptor for port {port}.') from exc
+        raise RuntimeError(f'{entry.logical_tensor}: missing graph-input descriptor for port {port}.') from exc
 
 
 def graph_input_writer_port_descriptor(entry, port: int) -> Dict[str, Any]:
     try:
         return copy.deepcopy(entry.graph_input_writer_port_descs[int(port)])
     except KeyError as exc:
-        raise RuntimeError(f'{entry.tensor}: missing graph-input writer descriptor for port {port}.') from exc
+        raise RuntimeError(f'{entry.logical_tensor}: missing graph-input writer descriptor for port {port}.') from exc
 
 
 def localize_graph_io_descriptor(base: Dict[str, Any], unit_base: List[int], buf_dims: List[int]) -> Dict[str, Any]:
@@ -108,3 +117,12 @@ def localize_graph_io_descriptor(base: Dict[str, Any], unit_base: List[int], buf
     else:
         desc.pop('boundary_dimension', None)
     return desc
+
+
+def _rebase_descriptor_offset(desc: Dict[str, Any], base) -> None:
+    if not base:
+        return
+    offset = list(desc['offset'])
+    if len(offset) != len(base):
+        raise RuntimeError('graph-input descriptor rank mismatch during consumer offset rebasing.')
+    desc['offset'] = [int(offset[dim]) - int(base[dim]) for dim in range(len(offset))]

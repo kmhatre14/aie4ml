@@ -34,18 +34,18 @@ class ClassifyTransportEntries(AIEPass):
     def _classify_entry(self, entry, ctx, max_in: int, max_out: int) -> tuple[str, bool | None]:
         if len(entry.consumers) > 1:
             raise RuntimeError(
-                f'{entry.tensor}: unsupported join transport; '
+                f'{entry.logical_tensor}: unsupported join transport; '
                 'classification requires post-fanout single-consumer entries.'
             )
         if entry.consumers and entry.graph_output:
             raise RuntimeError(
-                f'{entry.tensor}: unsupported boundary transport mix; '
+                f'{entry.logical_tensor}: unsupported boundary transport mix; '
                 'classification requires graph-output legs to be separated from consumer legs.'
             )
         if entry.producer is None or entry.graph_output:
             return 'boundary', None
         if not entry.consumers:
-            raise RuntimeError(f'{entry.tensor}: transport classification requires a consumer or graph output.')
+            raise RuntimeError(f'{entry.logical_tensor}: transport classification requires a consumer or graph output.')
 
         producer_ports = max(1, int(entry.producer_ports))
         consumer_ports = self._consumer_ports(entry, producer_ports, ctx)
@@ -60,14 +60,17 @@ class ClassifyTransportEntries(AIEPass):
             # default direct check uses canonical tensor-local ports 0..N-1. If a
             # caller has already populated explicit port IDs, preserve them.
             producer_port_ids = entry.producer_port_ids or list(range(producer_ports))
-            consumer_port_ids = entry.consumer_port_ids or list(range(consumer_ports))
+            consumer_port_ids = entry.consumer_port_ids or self._consumer_port_ids(entry, consumer_ports)
             if direct_transport_supported(
                 ctx,
                 entry.producer,
                 consumer,
-                entry.tensor,
+                entry.logical_tensor,
+                entry.producer_tensor,
+                entry.consumer_tensor,
                 producer_port_ids,
                 consumer_port_ids,
+                entry.consumer_offset_base,
             ):
                 return 'direct', True
 
@@ -81,7 +84,7 @@ class ClassifyTransportEntries(AIEPass):
                 entry.topology_kind = 'relay'
                 entry.staging_compatible = None
                 raise NotImplementedError(
-                    f'{entry.tensor}: transport topology relay is not implemented; '
+                    f'{entry.logical_tensor}: transport topology relay is not implemented; '
                     f'one-stage shard cannot realize producer_ports={producer_ports} '
                     f'-> consumer_ports={consumer_ports}.'
                 )
@@ -93,11 +96,12 @@ class ClassifyTransportEntries(AIEPass):
         if route == 'direct':
             if topology != 'direct':
                 raise RuntimeError(
-                    f'{entry.tensor}: io_route=direct requested but transport topology is {topology}, not direct.'
+                    f'{entry.logical_tensor}: io_route=direct requested but transport topology '
+                    f'is {topology}, not direct.'
                 )
             if not staging_compatible:
                 raise RuntimeError(
-                    f'{entry.tensor}: io_route=direct requested but direct transport is not staging-compatible.'
+                    f'{entry.logical_tensor}: io_route=direct requested but direct transport is not staging-compatible.'
                 )
             return 'direct'
         if route == 'memtile':
@@ -113,19 +117,19 @@ class ClassifyTransportEntries(AIEPass):
 
         modes = set()
         producer_inst = ctx.ir.execution.get(entry.producer.name)
-        producer_mode = producer_inst.io_route.get('outputs', {}).get(entry.tensor)
+        producer_mode = producer_inst.io_route.get('outputs', {}).get(entry.producer_tensor)
         if producer_mode:
             modes.add(str(producer_mode))
 
         for consumer_conn in entry.consumers:
             consumer_inst = ctx.ir.execution.get(consumer_conn.consumer.name)
-            consumer_mode = consumer_inst.io_route.get('inputs', {}).get(entry.tensor)
+            consumer_mode = consumer_inst.io_route.get('inputs', {}).get(entry.consumer_tensor)
             if consumer_mode:
                 modes.add(str(consumer_mode))
 
         bad = [mode for mode in modes if mode not in ('direct', 'memtile', 'auto')]
         if bad:
-            raise ValueError(f'{entry.tensor}: unsupported io_route mode(s) {bad}.')
+            raise ValueError(f'{entry.logical_tensor}: unsupported io_route mode(s) {bad}.')
         if 'memtile' in modes:
             return 'memtile'
         if modes == {'direct'}:
@@ -135,12 +139,26 @@ class ClassifyTransportEntries(AIEPass):
     @staticmethod
     def _consumer_ports(entry, producer_ports: int, ctx) -> int:
         if entry.consumers:
+            if entry.consumer_port_subset is not None:
+                return len(tuple(entry.consumer_port_subset))
             consumer = entry.consumers[0].consumer
             inst = ctx.ir.execution.get(consumer.name)
-            return int(inst.ports.inputs[entry.tensor].count)
+            return int(inst.ports.inputs[entry.consumer_tensor].count)
         if entry.graph_output:
             return int(producer_ports)
-        raise ValueError(f'{entry.tensor}: entry has neither consumers nor graph_output.')
+        raise ValueError(f'{entry.logical_tensor}: entry has neither consumers nor graph_output.')
+
+    @staticmethod
+    def _consumer_port_ids(entry, consumer_ports: int):
+        if entry.consumer_port_subset is not None:
+            ports = [int(port) for port in entry.consumer_port_subset]
+            if len(ports) != int(consumer_ports):
+                raise RuntimeError(
+                    f'{entry.logical_tensor}: consumer port subset count mismatch '
+                    f'({len(ports)} != {consumer_ports}).'
+                )
+            return ports
+        return list(range(int(consumer_ports)))
 
     @staticmethod
     def _has_consumer_perm(entry) -> bool:
@@ -149,7 +167,7 @@ class ClassifyTransportEntries(AIEPass):
         if trait is None:
             return False
         inputs = trait.data.get('inputs', {})
-        return inputs.get(entry.tensor, {}).get('perm') is not None
+        return inputs.get(entry.consumer_tensor, {}).get('perm') is not None
 
     @staticmethod
     def _requires_relay(producer_ports: int, consumer_ports: int, units: int, max_out: int) -> bool:

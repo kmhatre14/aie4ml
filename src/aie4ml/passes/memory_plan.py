@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..aie_types import AIEDataType
 from ..ir import OpNode, get_backend_context, input_role
+from ..op_impls.utils.tensor_view import map_view_axis
 from .base import AIEPass
 from .boundary_sharding import (
     graph_input_port_descriptor,
@@ -25,16 +26,22 @@ class _Connection:
     consumer: Optional[OpNode]
     producer_group: str
     consumer_group: str
-    tensor: str
+    logical_tensor: str
+    producer_tensor: str
+    consumer_tensor: str
     external_kind: Optional[str] = None
+    consumer_port_subset: Optional[Tuple[int, ...]] = None
+    consumer_offset_base: Tuple[int, ...] = ()
 
 
 @dataclass
 class _EdgeEntry:
-    tensor: str
+    logical_tensor: str
     producer: Optional[OpNode]
     producer_group: str
     producer_ports: int
+    producer_tensor: str
+    consumer_tensor: str
     consumers: List[_Connection] = field(default_factory=list)
     graph_output: bool = False
     producer_port_ids: List[int] = field(default_factory=list)
@@ -48,6 +55,8 @@ class _EdgeEntry:
     shard_buffer_dimension: List[int] = field(default_factory=list)
     graph_input_port_descs: Dict[int, Dict[str, Any]] = field(default_factory=dict)
     graph_input_writer_port_descs: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+    consumer_port_subset: Optional[Tuple[int, ...]] = None
+    consumer_offset_base: Tuple[int, ...] = ()
     shard_index: int = 0
     shard_count: int = 1
     topology_kind: Optional[str] = None
@@ -168,12 +177,19 @@ class _CodegenPlanner:
                     continue
                 tname = t.name
                 cg = inst.ports.inputs[tname].group
+                concat_view = self._concat_view_for_tensor(t)
+                if concat_view is not None:
+                    connections.extend(self._concat_connections(n, t, cg, concat_view, producers))
+                    seen_outputs.add(tname)
+                    for item in concat_view.get('slices', []):
+                        seen_outputs.add(str(item['input']))
+                    continue
                 if tname in producers:
                     p, pg = producers[tname]
-                    connections.append(_Connection(p, n, pg, cg, tname))
+                    connections.append(_Connection(p, n, pg, cg, tname, tname, tname))
                     seen_outputs.add(tname)
                 else:
-                    connections.append(_Connection(None, n, 'graph_input', cg, tname, 'input'))
+                    connections.append(_Connection(None, n, 'graph_input', cg, tname, tname, tname, 'input'))
 
         # graph outputs
         for n in nodes:
@@ -185,9 +201,119 @@ class _CodegenPlanner:
                 if tname not in graph_output_names and tname in seen_outputs:
                     continue
                 pg = inst.ports.outputs[tname].group
-                connections.append(_Connection(n, None, pg, 'graph_output', tname, 'output'))
+                connections.append(_Connection(n, None, pg, 'graph_output', tname, tname, tname, 'output'))
 
         return connections
+
+    def _concat_view_for_tensor(self, tensor) -> Optional[Dict[str, Any]]:
+        producer = tensor.producer
+        if producer is None or producer.op_type != 'concat':
+            return None
+        trait = producer.traits.get('concat_view')
+        if trait is None:
+            raise ValueError(f'{producer.name}: concat node is missing concat_view trait.')
+        data = dict(trait.data)
+        if data.get('output') != tensor.name:
+            raise ValueError(f'{producer.name}: concat_view output does not match tensor {tensor.name!r}.')
+        return data
+
+    def _concat_connections(
+        self,
+        consumer: OpNode,
+        concat_tensor,
+        consumer_group: str,
+        concat_view: Dict[str, Any],
+        producers: Dict[str, Tuple[OpNode, str]],
+    ) -> List[_Connection]:
+        ports_by_source = self._concat_consumer_ports(consumer, concat_tensor.name, concat_view)
+        conns: List[_Connection] = []
+        for item in concat_view.get('slices', []):
+            source_name = str(item['input'])
+            ports = tuple(ports_by_source.get(source_name, ()))
+            if not ports:
+                continue
+            offset_base = self._concat_consumer_offset_base(
+                consumer, concat_tensor.name, concat_view, int(item['start'])
+            )
+            if source_name in producers:
+                producer, producer_group = producers[source_name]
+                conns.append(
+                    _Connection(
+                        producer,
+                        consumer,
+                        producer_group,
+                        consumer_group,
+                        concat_tensor.name,
+                        producer_tensor=source_name,
+                        consumer_tensor=concat_tensor.name,
+                        consumer_port_subset=ports,
+                        consumer_offset_base=offset_base,
+                    )
+                )
+            else:
+                raise NotImplementedError(
+                    f'{concat_tensor.name}: concat input {source_name!r} is a graph input; '
+                    'concat-backed graph-input legs are not implemented.'
+                )
+        return conns
+
+    def _concat_consumer_offset_base(
+        self, consumer: OpNode, concat_tensor: str, concat_view: Dict[str, Any], start: int
+    ) -> Tuple[int, ...]:
+        inst = self._kernel_inst(consumer)
+        view = inst.config.io_views[concat_tensor]
+        axis_dim = self._view_axis_to_buffer_dim(view, int(concat_view['axis']))
+        return tuple(int(start) if dim == axis_dim else 0 for dim in range(view.rank))
+
+    def _concat_consumer_ports(
+        self, consumer: OpNode, concat_tensor: str, concat_view: Dict[str, Any]
+    ) -> Dict[str, List[int]]:
+        inst = self._kernel_inst(consumer)
+        if inst is None:
+            raise RuntimeError(f'{concat_tensor}: concat consumer {consumer.name!r} is not resolved.')
+        total_ports = int(inst.ports.inputs[concat_tensor].count)
+        slices = [
+            (str(item['input']), int(item['start']), int(item['start']) + int(item['extent']))
+            for item in concat_view.get('slices', [])
+        ]
+        if not slices:
+            raise ValueError(f'{concat_tensor}: concat_view has no input slices.')
+
+        out: Dict[str, List[int]] = {name: [] for name, _, _ in slices}
+        axis = int(concat_view['axis'])
+        view = inst.config.io_views[concat_tensor]
+        axis_dim = self._view_axis_to_buffer_dim(view, axis)
+        for port in range(total_ports):
+            desc = inst.variant.describe_input_staging(consumer, inst.config, concat_tensor, port, None, None)
+            start, end = self._descriptor_axis_range(desc, axis_dim)
+
+            owners = [name for name, lo, hi in slices if start >= lo and end <= hi]
+            if len(owners) != 1:
+                raise NotImplementedError(
+                    f'{concat_tensor}: concat consumer port {port} axis {axis} range [{start}, {end}) does not '
+                    'fit exactly inside one concat input slice; packed concat/relay is not implemented.'
+                )
+            out[owners[0]].append(int(port))
+        return out
+
+    @staticmethod
+    def _descriptor_axis_range(desc: Dict[str, Any], dim: int) -> Tuple[int, int]:
+        start = int(desc['offset'][dim])
+        extent = int(desc['io_tiling_dimension'][dim])
+        if extent <= 0:
+            raise RuntimeError(f'invalid descriptor extent {extent} on dim{dim}.')
+        return start, start + extent
+
+    @staticmethod
+    def _view_axis_to_buffer_dim(view, axis: int) -> int:
+        rank = int(view.rank)
+        normalized = int(axis)
+        if normalized < 0:
+            normalized += rank
+        if normalized < 0 or normalized >= rank:
+            raise ValueError(f'view axis {axis} is out of range for rank {rank}.')
+        real_axis = map_view_axis(view, normalized)
+        return int(view.buffer_order.index(int(real_axis)))
 
     # -------------------------------------------------------------------------
     # Group edges
@@ -197,16 +323,24 @@ class _CodegenPlanner:
         grouped: Dict[Tuple[str, str], _EdgeEntry] = {}
 
         for c in connections:
-            key = (c.tensor, c.producer_group)
+            key = (c.producer_tensor, c.producer_group, c.consumer_tensor, c.consumer_group)
             if key not in grouped:
                 grouped[key] = _EdgeEntry(
-                    tensor=c.tensor,
+                    logical_tensor=c.logical_tensor,
+                    producer_tensor=c.producer_tensor,
+                    consumer_tensor=c.consumer_tensor,
                     producer=c.producer,
                     producer_group=c.producer_group,
-                    producer_ports=self._producer_port_count(c.producer, c.tensor),
+                    producer_ports=self._producer_port_count(c.producer, c.producer_tensor),
+                    consumer_port_subset=c.consumer_port_subset,
+                    consumer_offset_base=tuple(int(x) for x in c.consumer_offset_base),
                 )
 
             e = grouped[key]
+            if e.consumer_port_subset != c.consumer_port_subset:
+                raise RuntimeError(f'{c.logical_tensor}: inconsistent consumer port subsets for grouped edge.')
+            if tuple(e.consumer_offset_base) != tuple(c.consumer_offset_base):
+                raise RuntimeError(f'{c.logical_tensor}: inconsistent concat consumer offset for grouped edge.')
 
             if c.external_kind == 'output':
                 e.graph_output = True
@@ -215,7 +349,7 @@ class _CodegenPlanner:
                 if c.external_kind == 'input':
                     e.producer_ports = max(
                         e.producer_ports,
-                        self._consumer_port_count(c.consumer, c.tensor),
+                        self._consumer_port_count(c.consumer, c.consumer_tensor, c.consumer_port_subset),
                     )
 
         return list(grouped.values())
@@ -226,11 +360,13 @@ class _CodegenPlanner:
 
     def _materialize_entry(self, entry: _EdgeEntry):
         if len(entry.consumers) > 1:
-            raise RuntimeError(f'{entry.tensor}: materializer requires at most one consumer per entry.')
+            raise RuntimeError(f'{entry.logical_tensor}: materializer requires at most one consumer per entry.')
         if entry.consumers and entry.graph_output:
-            raise RuntimeError(f'{entry.tensor}: materializer does not accept mixed consumer + graph_output entry.')
+            raise RuntimeError(
+                f'{entry.logical_tensor}: materializer does not accept mixed consumer + graph_output entry.'
+            )
         if not entry.producer_port_ids:
-            raise RuntimeError(f'{entry.tensor}: missing producer_port_ids; run port-limit legalization first.')
+            raise RuntimeError(f'{entry.logical_tensor}: missing producer_port_ids; run port-limit legalization first.')
         p_ports = [int(x) for x in entry.producer_port_ids]
         c_ports = [int(x) for x in entry.consumer_port_ids]
         realization = self._route(entry)
@@ -242,39 +378,46 @@ class _CodegenPlanner:
                 or len(entry.consumers) != 1
                 or len(p_ports) != len(c_ports)
             ):
-                raise RuntimeError(f'{entry.tensor}: direct realization invariant violated.')
+                raise RuntimeError(f'{entry.logical_tensor}: direct realization invariant violated.')
             self._emit_direct(entry, p_ports, c_ports)
             return
         if realization != 'memtile':
-            raise RuntimeError(f'{entry.tensor}: unsupported transport realization {realization!r}.')
+            raise RuntimeError(f'{entry.logical_tensor}: unsupported transport realization {realization!r}.')
         graph_input_generic = entry.producer is None and bool(entry.graph_input_port_descs)
         if not graph_input_generic and (
             entry.shard_dim is None or entry.shard_port_stride is None or entry.shard_dim_size is None
         ):
-            raise RuntimeError(f'{entry.tensor}: missing shard metadata; run port-limit legalization first.')
+            raise RuntimeError(f'{entry.logical_tensor}: missing shard metadata; run port-limit legalization first.')
         self._emit_memtile(entry, p_ports, c_ports)
 
     def _route(self, entry: _EdgeEntry) -> str:
         if entry.realization_kind is None:
-            raise RuntimeError(f'{entry.tensor}: missing transport realization; run transport classification first.')
+            raise RuntimeError(
+                f'{entry.logical_tensor}: missing transport realization; run transport classification first.'
+            )
         if entry.topology_kind is None:
-            raise RuntimeError(f'{entry.tensor}: missing transport topology; run transport classification first.')
+            raise RuntimeError(
+                f'{entry.logical_tensor}: missing transport topology; run transport classification first.'
+            )
         if entry.topology_kind not in TRANSPORT_TOPOLOGY_KINDS:
-            raise RuntimeError(f'{entry.tensor}: unsupported transport topology {entry.topology_kind!r}.')
+            raise RuntimeError(f'{entry.logical_tensor}: unsupported transport topology {entry.topology_kind!r}.')
         if entry.topology_kind == 'relay':
-            raise NotImplementedError(f'{entry.tensor}: transport topology relay is not implemented.')
+            raise NotImplementedError(f'{entry.logical_tensor}: transport topology relay is not implemented.')
         if entry.topology_kind == 'split':
-            raise NotImplementedError(f'{entry.tensor}: transport topology split is not implemented.')
+            raise NotImplementedError(f'{entry.logical_tensor}: transport topology split is not implemented.')
         if entry.topology_kind == 'join':
-            raise NotImplementedError(f'{entry.tensor}: transport topology join is not implemented.')
+            raise NotImplementedError(f'{entry.logical_tensor}: transport topology join is not implemented.')
         if entry.topology_kind != 'direct' and entry.staging_compatible is not None:
             raise RuntimeError(
-                f'{entry.tensor}: non-direct transport topology {entry.topology_kind} cannot carry staging_compatible.'
+                f'{entry.logical_tensor}: non-direct transport topology {entry.topology_kind} '
+                'cannot carry staging_compatible.'
             )
         if entry.topology_kind == 'direct' and entry.staging_compatible is None:
-            raise RuntimeError(f'{entry.tensor}: direct transport topology requires staging_compatible to be set.')
+            raise RuntimeError(
+                f'{entry.logical_tensor}: direct transport topology requires staging_compatible to be set.'
+            )
         if entry.realization_kind not in ('direct', 'memtile'):
-            raise RuntimeError(f'{entry.tensor}: unsupported transport realization {entry.realization_kind!r}.')
+            raise RuntimeError(f'{entry.logical_tensor}: unsupported transport realization {entry.realization_kind!r}.')
         return entry.realization_kind
 
     # ------------------------------------------------------------------
@@ -290,7 +433,7 @@ class _CodegenPlanner:
                 {
                     'source': f'{sanitize_identifier(p.name)}.{entry.producer_group}[{int(p_port)}]',
                     'target': f'{sanitize_identifier(c.consumer.name)}.{c.consumer_group}[{int(c_port)}]',
-                    'tensor': entry.tensor,
+                    'tensor': entry.logical_tensor,
                 }
             )
 
@@ -301,7 +444,7 @@ class _CodegenPlanner:
     def _emit_memtile(self, entry, p_ports, c_ports):
         if entry.producer:
             inst = self._kernel_inst(entry.producer)
-            base = inst.variant.describe_output_staging(entry.producer, inst.config, entry.tensor, 0, None)
+            base = inst.variant.describe_output_staging(entry.producer, inst.config, entry.producer_tensor, 0, None)
             shard_dim = int(entry.shard_dim)
             port_stride = int(entry.shard_port_stride)
             unit_base_dim0 = int(entry.shard_dim_base)
@@ -329,7 +472,7 @@ class _CodegenPlanner:
             'ctype': self._buffer_ctype(entry),
             'writers': [],
             'readers': [],
-            'tensor': entry.tensor,
+            'tensor': entry.logical_tensor,
         }
 
         base_p = p_ports[0]
@@ -348,7 +491,9 @@ class _CodegenPlanner:
                 self._max_graph_input_port = max(self._max_graph_input_port, int(p))
             else:
                 inst = self._kernel_inst(entry.producer)
-                desc = inst.variant.describe_output_staging(entry.producer, inst.config, entry.tensor, p, buf_dims)
+                desc = inst.variant.describe_output_staging(
+                    entry.producer, inst.config, entry.producer_tensor, p, buf_dims
+                )
                 desc['buffer_dimension'] = list(buf_dims)
                 desc['offset'][shard_dim] -= int(unit_base_dim0)
 
@@ -376,8 +521,9 @@ class _CodegenPlanner:
                 else:
                     inst = self._kernel_inst(consumer_conn.consumer)
                     desc = inst.variant.describe_input_staging(
-                        consumer_conn.consumer, inst.config, entry.tensor, i, buf_dims, entry.producer
+                        consumer_conn.consumer, inst.config, entry.consumer_tensor, i, buf_dims, entry.producer
                     )
+                    self._localize_consumer_descriptor(desc, entry.consumer_offset_base, buf_dims)
                     desc['buffer_dimension'] = list(buf_dims)
                     desc['offset'][shard_dim] -= int(unit_base_dim0)
                     if int(entry.shard_count) > 1:
@@ -428,7 +574,7 @@ class _CodegenPlanner:
     def _graph_input_writer_descriptor(self, entry: _EdgeEntry) -> Dict[str, Any]:
         c = entry.consumers[0].consumer
         inst = self._kernel_inst(c)
-        base = inst.variant.describe_input_staging(c, inst.config, entry.tensor, 0, None, None)
+        base = inst.variant.describe_input_staging(c, inst.config, entry.consumer_tensor, 0, None, None)
 
         io_tile = list(base['io_tiling_dimension'])
 
@@ -453,7 +599,7 @@ class _CodegenPlanner:
     ) -> Dict[str, Any]:
         p = entry.producer
         inst = self._kernel_inst(p)
-        base = inst.variant.describe_output_staging(p, inst.config, entry.tensor, port, buf_dims)
+        base = inst.variant.describe_output_staging(p, inst.config, entry.producer_tensor, port, buf_dims)
         shard_dim = int(base['slice_dimension'])
         io_tile = list(base['io_tiling_dimension'])
         io_boundary = list(base['io_boundary_dimension'])
@@ -482,12 +628,38 @@ class _CodegenPlanner:
     def _kernel_inst(self, node):
         return self.ctx.ir.execution.get(node.name) if node else None
 
+    @staticmethod
+    def _rebase_descriptor_offset(desc: Dict[str, Any], base: Tuple[int, ...]) -> None:
+        if not base:
+            return
+        offset = list(desc['offset'])
+        if len(offset) != len(base):
+            raise RuntimeError(
+                f'descriptor rank mismatch during consumer offset rebasing ({len(offset)} != {len(base)}).'
+            )
+        desc['offset'] = [int(offset[dim]) - int(base[dim]) for dim in range(len(offset))]
+
+    @staticmethod
+    def _localize_consumer_descriptor(desc: Dict[str, Any], base: Tuple[int, ...], buf_dims: List[int]) -> None:
+        if not base:
+            return
+        offset = list(desc['offset'])
+        boundary = list(desc.get('boundary_dimension', buf_dims))
+        if len(offset) != len(base) or len(offset) != len(buf_dims) or len(boundary) != len(buf_dims):
+            raise RuntimeError('descriptor rank mismatch during consumer localization.')
+        desc['offset'] = [int(offset[dim]) - int(base[dim]) for dim in range(len(offset))]
+        desc['boundary_dimension'] = [
+            min(int(buf_dims[dim]), max(0, int(boundary[dim]) - int(base[dim]))) for dim in range(len(buf_dims))
+        ]
+
     def _producer_port_count(self, node, tensor):
         if node is None:
             return 1
         return self._kernel_inst(node).ports.outputs[tensor].count
 
-    def _consumer_port_count(self, node, tensor):
+    def _consumer_port_count(self, node, tensor, forced_ports: Optional[Tuple[int, ...]] = None):
+        if forced_ports is not None:
+            return len(tuple(forced_ports))
         return self._kernel_inst(node).ports.inputs[tensor].count
 
     def _producer_endpoint(self, node, group, port):
@@ -515,10 +687,10 @@ class _CodegenPlanner:
 
     def _graph_input_role(self, entry: _EdgeEntry) -> str:
         consumer = entry.consumers[0].consumer
-        role = input_role(consumer, entry.tensor)
+        role = input_role(consumer, entry.consumer_tensor)
         if not role:
             raise RuntimeError(
-                f'{entry.tensor}: no role assigned on consumer {consumer.name!r}; '
+                f'{entry.logical_tensor}: no role assigned on consumer {consumer.name!r}; '
                 'frontend must call set_input_roles before building memory plan.'
             )
         return role
@@ -554,11 +726,11 @@ class _CodegenPlanner:
     def _graph_output_staging(self, entry: _EdgeEntry, port: int) -> Dict[str, Any]:
         producer = entry.producer
         inst = self._kernel_inst(producer)
-        base = inst.variant.describe_output_staging(producer, inst.config, entry.tensor, port, None)
+        base = inst.variant.describe_output_staging(producer, inst.config, entry.producer_tensor, port, None)
         return _host_visible_output_staging(base)
 
     def _next_buffer_name(self, entry: _EdgeEntry):
-        base = sanitize_identifier(entry.tensor)
+        base = sanitize_identifier(entry.producer_tensor)
         suffix = ''
         if int(entry.shard_count) > 1:
             suffix += f'_u{int(entry.shard_index)}'
