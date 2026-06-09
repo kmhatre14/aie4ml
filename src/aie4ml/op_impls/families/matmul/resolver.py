@@ -156,6 +156,24 @@ def _resolve_numeric(node, device) -> Dict[str, AIEDataType]:
     return resolved
 
 
+def _resolve_output_scale_shift(node, *, is_float: bool) -> int:
+    trait = node.traits.get('output_scale')
+    if trait is None:
+        return 0
+    scale = float(trait.data['scale'])
+    if is_float:
+        raise NotImplementedError(f'{node.name}: fused output scaling is not implemented for float MatMul-family ops.')
+    if scale <= 0.0 or scale > 1.0:
+        raise ValueError(f'{node.name}: fused output scale must be in the range (0, 1], got {scale}.')
+    shift = int(round(-math.log2(scale)))
+    if not math.isclose(scale, math.ldexp(1.0, -shift), rel_tol=0.0, abs_tol=1e-12):
+        raise NotImplementedError(
+            f'{node.name}: fused output scale {scale} is not a power of two; '
+            'fixed-point multiplier scaling is not implemented.'
+        )
+    return shift
+
+
 def _parallelism_candidate(
     *,
     op_type: str,
@@ -429,6 +447,7 @@ class DenseResolver:
             if is_float
             else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
         )
+        shift += _resolve_output_scale_shift(node, is_float=is_float)
 
         fused_act = node.traits.get('fused_activation')
         use_relu = ((fused_act.data.get('activation') if fused_act else '') or '').lower() == 'relu'
@@ -487,6 +506,7 @@ class MatmulResolver:
             if is_float
             else resolve_accumulator_output_shift(lhs_tensor.precision, node.outputs[0].precision, rhs_tensor.precision)
         )
+        shift += _resolve_output_scale_shift(node, is_float=is_float)
 
         return MatmulConfig(
             precision=precision,

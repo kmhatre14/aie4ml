@@ -215,6 +215,7 @@ def lower_onnx_model(
                     and producer.op_type == 'activation'
                     and producer.metadata.get('activation') == 'relu'
                 )
+                scale_producer = producer is not None and producer.op_type == 'scale'
                 if tensor.precision is None:
                     if relu_producer:
                         relu_input = producer.inputs[0] if producer.inputs else None
@@ -226,6 +227,10 @@ def lower_onnx_model(
                                 rounding=intent.rounding,
                                 saturation=intent.saturation,
                             )
+                    elif scale_producer:
+                        scale_input = producer.inputs[0] if producer.inputs else None
+                        if scale_input is not None and scale_input.precision is None:
+                            scale_input.precision = intent
                     tensor.precision = intent
                 elif tensor.precision != intent:
                     if relu_producer:
@@ -495,6 +500,57 @@ def lower_onnx_model(
             graph.add_node(op)
             value_tensors[node.output[0]] = out_tensor
             shape_of[node.output[0]] = out_shape
+            continue
+
+        if op_type in ('Mul', 'Div'):
+            if len(node.input) != 2:
+                raise ValueError(f'{node_name}: {op_type} must have exactly 2 inputs.')
+
+            if op_type == 'Mul':
+                constant_names = [name for name in node.input if name in initializers]
+                if len(constant_names) != 1:
+                    raise NotImplementedError(f'{node_name}: Mul currently requires exactly one constant input.')
+                constant_name = constant_names[0]
+                source_name = node.input[1] if node.input[0] == constant_name else node.input[0]
+                scale = float(np.asarray(initializers[constant_name]).reshape(-1)[0])
+            else:
+                source_name, constant_name = node.input
+                if constant_name not in initializers:
+                    raise NotImplementedError(f'{node_name}: Div currently requires a constant divisor.')
+                divisor = float(np.asarray(initializers[constant_name]).reshape(-1)[0])
+                if divisor == 0.0:
+                    raise ValueError(f'{node_name}: Div constant divisor must be nonzero.')
+                scale = 1.0 / divisor
+
+            constant = np.asarray(initializers[constant_name])
+            if constant.size != 1:
+                raise NotImplementedError(f'{node_name}: {op_type} currently requires a scalar constant.')
+
+            source = _source_for(source_name, node_name)
+            op = OpNode(name=f'{node_name}_aie', op_type='scale', dialect=ctx.device.dialect)
+            op.metadata.update(
+                {
+                    'scale': scale,
+                    'layer_class': op_type,
+                    'source_class': op_type,
+                    'source_layer': node_name,
+                    'input_roles': ['lhs'],
+                }
+            )
+            op.directives.update(directives)
+            source.consumers.append(op)
+            op.inputs.append(source)
+            out_tensor = TensorVar(
+                name=node.output[0],
+                shape=tuple(int(x) for x in source.shape),
+                precision=source.precision,
+                producer=op,
+            )
+            graph.add_tensor(out_tensor)
+            op.outputs.append(out_tensor)
+            graph.add_node(op)
+            value_tensors[node.output[0]] = out_tensor
+            shape_of[node.output[0]] = tuple(int(x) for x in source.shape)
             continue
 
         if op_type == 'Add':
