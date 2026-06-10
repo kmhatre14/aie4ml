@@ -20,6 +20,8 @@ class FoldViewOps(AIEPass):
                 changed = self._fold_transpose(graph, node) or changed
             elif node.op_type == 'concat':
                 changed = self._fold_concat(node) or changed
+            elif node.op_type in ('slice', 'split'):
+                changed = self._fold_slice(node) or changed
 
         return changed
 
@@ -100,6 +102,47 @@ class FoldViewOps(AIEPass):
                     'axis': axis,
                     'output': output.name,
                     'slices': slices,
+                },
+            )
+        )
+        node.is_placeholder = True
+        return True
+
+    def _fold_slice(self, node) -> bool:
+        if len(node.inputs) != 1:
+            raise ValueError(f'{node.name}: {node.op_type} view must have exactly one input.')
+        if not node.outputs:
+            raise ValueError(f'{node.name}: {node.op_type} view must have at least one output.')
+
+        source = node.inputs[0]
+        axis = int(node.metadata['axis'])
+        rank = len(source.shape)
+        if axis < 0:
+            axis += rank
+        if axis < 0 or axis >= rank:
+            raise ValueError(f'{node.name}: {node.op_type} axis {axis} is out of range for rank {rank}.')
+
+        slices = list(node.metadata.get('slices', ()))
+        if len(slices) != len(node.outputs):
+            raise ValueError(f'{node.name}: {node.op_type} slice metadata does not match output count.')
+        normalized = []
+        for output, item in zip(node.outputs, slices):
+            start = int(item['start'])
+            extent = int(item['extent'])
+            if start < 0 or extent <= 0 or start + extent > int(source.shape[axis]):
+                raise ValueError(f'{node.name}: invalid {node.op_type} range [{start}, {start + extent}).')
+            if int(output.shape[axis]) != extent:
+                raise ValueError(f'{node.name}: {node.op_type} output {output.name!r} extent mismatch.')
+            normalized.append({'output': output.name, 'start': start, 'extent': extent})
+
+        node.add_trait(
+            TraitInstance(
+                'slice_view',
+                {
+                    'kind': node.op_type,
+                    'axis': axis,
+                    'source': source.name,
+                    'slices': normalized,
                 },
             )
         )

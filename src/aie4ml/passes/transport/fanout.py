@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import copy
 
-from ..ir import get_backend_context
-from .base import AIEPass
+from ...ir import get_backend_context
+from ..base import AIEPass
 
 
 class LegalizeFanoutEntries(AIEPass):

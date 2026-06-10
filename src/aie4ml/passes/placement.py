@@ -144,22 +144,6 @@ def _interval_distance(a0: float, a1: float, b0: float, b1: float) -> float:
     return 0.0
 
 
-def _edge_end_name(endpoint: Any) -> Optional[str]:
-    if endpoint is None:
-        return None
-    if hasattr(endpoint, 'name'):
-        return str(endpoint.name)
-    return str(endpoint)
-
-
-def _tensor_name(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    if hasattr(value, 'name'):
-        return str(value.name)
-    return str(value)
-
-
 # ---------------------------------------------------------------------------
 # Footprint parsing
 # ---------------------------------------------------------------------------
@@ -396,43 +380,28 @@ def _possible_face_domain(
 # ---------------------------------------------------------------------------
 
 
-def _derive_edges_from_tensors(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
-    """
-    Reconstruct kernel edges from tensor producers/consumers if logical_edges is
-    unavailable on the IR object.
-    """
+def _transport_edges(ctx, kernel_names: Sequence[str]) -> List[EdgeSpec]:
+    """Build placement connectivity from collected semantic transport legs."""
+    state = ctx.ir.physical.plan.get('_memory_plan_state')
+    if state is None:
+        raise RuntimeError('Placement requires collected transport entries.')
+
     kernel_set = set(kernel_names)
-    producer_of: Dict[str, str] = {}
-
-    for node in ctx.ir.logical:
-        if node.name not in kernel_set:
-            continue
-        for tensor in getattr(node, 'outputs', []) or []:
-            producer_of[str(tensor)] = node.name
-
-    edges: List[EdgeSpec] = []
+    edges = []
     seen = set()
-
-    for node in ctx.ir.logical:
-        if node.name not in kernel_set:
+    for entry in state['entries']:
+        src = entry.producer.node
+        if src is None:
             continue
-        for tensor in getattr(node, 'inputs', []) or []:
-            src = producer_of.get(str(tensor))
-            if src is None or src == node.name:
+        for connection in entry.consumers:
+            consumer = connection.consumer
+            if consumer is None or src.name not in kernel_set or consumer.node.name not in kernel_set:
                 continue
-            key = (src, node.name, str(tensor))
+            key = (src.name, consumer.node.name, entry.logical_tensor)
             if key in seen:
                 continue
             seen.add(key)
-            tensor_name = _tensor_name(tensor)
-            edges.append(
-                EdgeSpec(
-                    src=src,
-                    dst=node.name,
-                    tensor=tensor_name,
-                )
-            )
-
+            edges.append(EdgeSpec(src=src.name, dst=consumer.node.name, tensor=entry.logical_tensor))
     return edges
 
 
@@ -501,31 +470,7 @@ def _build_graph(ctx, col_offset: int, row_offset: int) -> GraphSpec:
         )
         stable_index[node.name] = idx
 
-    if hasattr(ctx.ir, 'logical_edges'):
-        raw_edges = getattr(ctx.ir, 'logical_edges') or []
-        edges: List[EdgeSpec] = []
-        seen = set()
-
-        for edge in raw_edges:
-            src = _edge_end_name(getattr(edge, 'src', None))
-            dst = _edge_end_name(getattr(edge, 'dst', None))
-            if src not in specs or dst not in specs or src == dst:
-                continue
-
-            tensor_name = _tensor_name(getattr(edge, 'tensor', None))
-            key = (src, dst, tensor_name)
-            if key in seen:
-                continue
-            seen.add(key)
-            edges.append(
-                EdgeSpec(
-                    src=src,
-                    dst=dst,
-                    tensor=tensor_name,
-                )
-            )
-    else:
-        edges = _derive_edges_from_tensors(ctx, list(specs))
+    edges = _transport_edges(ctx, list(specs))
 
     preds = {name: [] for name in specs}
     succs = {name: [] for name in specs}

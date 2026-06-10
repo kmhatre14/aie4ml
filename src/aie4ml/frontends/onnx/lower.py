@@ -360,6 +360,92 @@ def lower_onnx_model(
             shape_of[out_name] = out_shape
             continue
 
+        if op_type in ('Slice', 'Split'):
+            if op_type == 'Slice':
+                if len(node.input) not in (3, 4, 5):
+                    raise ValueError(f'{node_name}: Slice must have 3 to 5 inputs.')
+                src_name = node.input[0]
+                for name in node.input[1:]:
+                    if name and name not in initializers:
+                        raise NotImplementedError(f'{node_name}: Slice parameters must be constant initializers.')
+                starts = np.asarray(initializers[node.input[1]], dtype=np.int64).reshape(-1)
+                ends = np.asarray(initializers[node.input[2]], dtype=np.int64).reshape(-1)
+                axes = (
+                    np.asarray(initializers[node.input[3]], dtype=np.int64).reshape(-1)
+                    if len(node.input) >= 4 and node.input[3]
+                    else np.arange(starts.size, dtype=np.int64)
+                )
+                steps = (
+                    np.asarray(initializers[node.input[4]], dtype=np.int64).reshape(-1)
+                    if len(node.input) >= 5 and node.input[4]
+                    else np.ones(starts.size, dtype=np.int64)
+                )
+                if starts.size != 1 or ends.size != 1 or axes.size != 1 or steps.size != 1:
+                    raise NotImplementedError(f'{node_name}: Slice currently supports exactly one sliced axis.')
+                if int(steps[0]) != 1:
+                    raise NotImplementedError(f'{node_name}: Slice currently supports only unit steps.')
+                src_shape = tuple(int(x) for x in shape_of[src_name])
+                axis = _normalize_axis(int(axes[0]), len(src_shape), node_name, 'Slice')
+                start = max(0, min(int(src_shape[axis]), int(starts[0])))
+                end = max(start, min(int(src_shape[axis]), int(ends[0])))
+                ranges = [(start, end - start)]
+            else:
+                if len(node.input) not in (1, 2):
+                    raise ValueError(f'{node_name}: Split must have 1 or 2 inputs.')
+                src_name = node.input[0]
+                src_shape = tuple(int(x) for x in shape_of[src_name])
+                axis = _normalize_axis(int(attr(node, 'axis', 0)), len(src_shape), node_name, 'Split')
+                if len(node.input) == 2:
+                    split_name = node.input[1]
+                    if split_name not in initializers:
+                        raise NotImplementedError(f'{node_name}: Split sizes must be a constant initializer.')
+                    sizes = [int(x) for x in np.asarray(initializers[split_name], dtype=np.int64).reshape(-1)]
+                else:
+                    sizes = [int(x) for x in list(attr(node, 'split', []))]
+                    if not sizes:
+                        if int(src_shape[axis]) % len(node.output) != 0:
+                            raise ValueError(f'{node_name}: equal Split does not divide axis {axis} exactly.')
+                        sizes = [int(src_shape[axis]) // len(node.output) for _ in node.output]
+                if len(sizes) != len(node.output) or any(size <= 0 for size in sizes):
+                    raise ValueError(f'{node_name}: Split sizes must be positive and match output count.')
+                if sum(sizes) != int(src_shape[axis]):
+                    raise ValueError(f'{node_name}: Split sizes must cover axis {axis} exactly.')
+                offset = 0
+                ranges = []
+                for size in sizes:
+                    ranges.append((offset, size))
+                    offset += size
+
+            source = _source_for(src_name, node_name)
+            op = OpNode(name=f'{node_name}_aie', op_type=op_type.lower(), dialect=ctx.device.dialect)
+            op.metadata.update(
+                {
+                    'axis': axis,
+                    'slices': [{'start': start, 'extent': extent} for start, extent in ranges],
+                    'layer_class': op_type,
+                    'source_class': op_type,
+                    'source_layer': node_name,
+                    'input_roles': ['lhs'],
+                }
+            )
+            source.consumers.append(op)
+            op.inputs.append(source)
+            for out_name, (start, extent) in zip(node.output, ranges):
+                out_shape = list(src_shape)
+                out_shape[axis] = extent
+                out_tensor = TensorVar(
+                    name=out_name,
+                    shape=tuple(out_shape),
+                    precision=source.precision,
+                    producer=op,
+                )
+                graph.add_tensor(out_tensor)
+                op.outputs.append(out_tensor)
+                value_tensors[out_name] = out_tensor
+                shape_of[out_name] = tuple(out_shape)
+            graph.add_node(op)
+            continue
+
         if op_type in ('MatMul', 'Gemm'):
             if op_type == 'MatMul':
                 if len(node.input) != 2:
