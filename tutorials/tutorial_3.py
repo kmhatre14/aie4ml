@@ -53,7 +53,8 @@ aie_model = hls4ml.converters.convert_from_keras_model(
     batch_size=BATCH,
     iterations=ITERS,
     part=PLATFORM,
-    target='hardware'
+    target='hardware',
+    pl_memory='uram'
 )
 
 aie_model.compile()

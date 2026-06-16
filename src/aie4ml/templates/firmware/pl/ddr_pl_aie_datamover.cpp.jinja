@@ -120,7 +120,7 @@ static void preload_and_send_proc(ap_uint<512>* mem_in,
     ap_uint<512> big_in_{{ s }}[MAX_BIG_IN];
 {% endfor %}
 {% for s in range(n_ifm) %}
-    #pragma HLS bind_storage variable=big_in_{{ s }} type=RAM_2P impl=URAM
+    #pragma HLS bind_storage variable=big_in_{{ s }} type=RAM_2P impl={{ pl_mem_impl }}
 {% endfor %}
 
     const int n_in_total_512      = size_in / 16;
@@ -212,7 +212,7 @@ static void recv_and_postwrite_proc(
     ap_uint<512> big_out_{{ s }}[MAX_BIG_OUT];
 {% endfor %}
 {% for s in range(n_ofm) %}
-    #pragma HLS bind_storage variable=big_out_{{ s }} type=RAM_2P impl=URAM
+    #pragma HLS bind_storage variable=big_out_{{ s }} type=RAM_2P impl={{ pl_mem_impl }}
 {% endfor %}
 
     const int n_out_total_512      = size_out / 16;
