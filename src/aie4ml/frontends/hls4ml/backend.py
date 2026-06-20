@@ -138,17 +138,19 @@ class AIEBackend(Backend):
     def predict(
         self,
         model,
-        X,
+        X=None,
         simulator='x86',
         *,
         quantize_in=True,
         dequantize_out=True,
+        **kwargs,
     ):
         return self._aie_model(model).predict(
             X,
             simulator=simulator,
             quantize_in=quantize_in,
             dequantize_out=dequantize_out,
+            **kwargs,
         )
 
     def write(self, model):

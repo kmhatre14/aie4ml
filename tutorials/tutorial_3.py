@@ -16,7 +16,7 @@ BATCH = 256
 ITERS = 4
 PLATFORM = 'xilinx_vek280_base_202520_1'
 
-PROJECT_NAME = 'hardware_new'
+PROJECT_NAME = 'dense_hw_emu'
 
 
 def build_model():
@@ -57,33 +57,18 @@ aie_model = hls4ml.converters.convert_from_keras_model(
     pl_memory='uram'
 )
 
-aie_model.compile()
+# aie_model.compile()
 # By default the simulation works for hardware target, To build for hardware_emulation use aie_model.build(make_target='hw_emu')
-aie_model.build()
+aie_model.build(make_target='hw_emu')
 
-# Simulation
+# Simulation input
 x = np.random.random((BATCH, N_IN)).astype(np.float32)
-y_aie = aie_model.predict(x, simulator='aie')[:BATCH]
 
-from aie4ml.simulation import read_aie_report
-report = read_aie_report(aie_model)
+# Run the built design on the QEMU hardware-emulation target. This boots QEMU,
+# runs the host program, parses the performance it prints, and powers off --
+# returning the report as a dict (no OFM read-back, so X is ignored here).
+import json
+perf = aie_model.predict(x, simulator='hw_emu')
+print('\nHW-EMU PERFORMANCE REPORT')
+print(json.dumps(perf, indent=2))
 
-print('\n' + '=' * 60)
-print('AIE SIMULATION REPORT')
-print('=' * 60)
-
-if 'throughput' in report:
-    t = report['throughput']
-    print('\n[Throughput]')
-    print(f"  Avg : {t['Avg_GOPs']} GOPs")
-    print(f"  Min : {t['Min_GOPs']} GOPs")
-    print(f"  Max : {t['Max_GOPs']} GOPs")
-
-if 'output_interval' in report:
-    ii = report['output_interval']
-    print('\n[Output Interval (ns)]')
-    for name, vals in ii.items():
-        if isinstance(vals, dict):
-            print(f"  {name}:")
-            for k, v in vals.items():
-                print(f"    {k}: {v} ns")

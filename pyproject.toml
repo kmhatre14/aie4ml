@@ -32,7 +32,8 @@ classifiers = [
   "Programming Language :: Python :: 3 :: Only"
 ]
 dependencies = [
-   "jinja2>=3.0"
+   "jinja2>=3.0",
+   "pexpect>=4.8"
 ]
 
 [project.optional-dependencies]

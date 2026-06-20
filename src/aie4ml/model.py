@@ -104,13 +104,36 @@ class AIEModel:
 
     def predict(
         self,
-        X,
+        X=None,
         simulator: str = 'x86',
         *,
         quantize_in: bool = True,
         dequantize_out: bool = True,
+        **kwargs,
     ):
+        """Run the design and return its output.
+
+        ``simulator='x86'|'aie'`` run the x86/AIE simulators and return the
+        dequantized output tensor(s). ``simulator='hw_emu'`` instead boots the
+        QEMU hardware-emulation image, runs the host program, and returns the
+        parsed **performance dict** (no OFM read-back -- the host replays the
+        input baked into ``data.h``, so ``X`` is ignored). hw_emu requires a
+        project converted with ``target='hardware'`` and built with
+        ``build(make_target='hw_emu')``; extra kwargs (e.g. ``n_iter``,
+        ``echo``) are forwarded to :func:`aie4ml.hw_emu.run_hw_emu`.
+        """
         ctx = self.context
+        sim_key = simulator.lower()
+
+        if sim_key == 'hw_emu':
+            return self._predict_hw_emu(**kwargs)
+
+        if kwargs:
+            raise TypeError(
+                f"predict() got unexpected keyword arguments {list(kwargs)} "
+                f"for simulator={simulator!r}."
+            )
+
         output_dir = ctx.project_config.output_dir
         if not output_dir.exists():
             raise FileNotFoundError(
@@ -124,7 +147,6 @@ class AIEModel:
         prepared_inputs = prepare_inputs(layout, X, iterations=iterations, quantize=quantize_in)
         write_input_files(output_dir, layout, prepared_inputs, plio_width_bits=plio_width)
 
-        sim_key = simulator.lower()
         if sim_key == 'x86':
             make_target = 'x86sim'
         elif sim_key == 'aie':
@@ -146,6 +168,30 @@ class AIEModel:
         if len(final_out) == 1:
             return _flatten_iters(next(iter(final_out.values())))
         return {k: _flatten_iters(v) for k, v in final_out.items()}
+
+    def _predict_hw_emu(self, *, n_iter: Optional[int] = None, **kwargs) -> dict:
+        """Boot the hw_emu QEMU image, run the host, and return the perf dict.
+
+        Folded into :meth:`predict` (``simulator='hw_emu'``); see
+        :func:`aie4ml.hw_emu.run_hw_emu`.
+        """
+        ctx = self.context
+        if str(ctx.aie_config.get('Target', 'aie')).lower() != 'hardware':
+            raise RuntimeError(
+                "simulator='hw_emu' requires a hardware project. "
+                "Re-convert with target='hardware'."
+            )
+
+        from .hw_emu import run_hw_emu
+
+        if n_iter is None:
+            n_iter = int(ctx.aie_config['Iterations'])
+        log.info(
+            'Running hw_emu for "%s" (n_iter=%d)',
+            ctx.project_config.project_name,
+            n_iter,
+        )
+        return run_hw_emu(ctx.project_config.output_dir, n_iter=n_iter, **kwargs)
 
     def report(self):
         return read_aie_report(self)
