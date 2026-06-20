@@ -34,7 +34,6 @@
 #include <fstream>
 #include <iostream>
 #include <cstring>
-#include <string>
 #include <chrono>
 
 #include "experimental/xrt_kernel.h"
@@ -147,16 +146,15 @@ int main(int argc, char* argv[])
 {% for L in layers %}
 {% for spec in L.artifacts %}
 {% if spec.kind == '2d' %}
-    for (int chain = 0; chain < {{ L.cas_num }}; ++chain) {
-        for (int col = 0; col < {{ L.cas_length }}; ++col) {
-            cghdl.update("dut.{{ spec.port }}[" + std::to_string(chain * {{ L.cas_length }} + col) + "]",
-                         {{ spec.prefix }}[chain][col]);
-        }
-    }
+{% for chain in range(L.cas_num) %}
+{%- for col in range(L.cas_length) %}
+    cghdl.update("dut.{{ spec.port }}[{{ chain * L.cas_length + col }}]", {{ spec.prefix }}_{{ chain }}_{{ col }});
+{% endfor %}
+{%- endfor %}
 {% else %}
-    for (int chain = 0; chain < {{ L.cas_num }}; ++chain) {
-        cghdl.update("dut.{{ spec.port }}[" + std::to_string(chain) + "]", {{ spec.prefix }}[chain]);
-    }
+{%- for chain in range(L.cas_num) %}
+    cghdl.update("dut.{{ spec.port }}[{{ chain }}]", {{ spec.prefix }}_{{ chain }});
+{% endfor %}
 {% endif %}
 {% endfor %}
 {% endfor %}
