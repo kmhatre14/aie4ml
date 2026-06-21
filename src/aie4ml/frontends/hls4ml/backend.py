@@ -183,6 +183,7 @@ class AIEBackend(Backend):
         compute_dtype=None,
         target='aie',
         pl_memory='uram',
+        enable_pl_timing=False,
         **_,
     ):
         if str(target).lower() not in ('aie', 'hardware'):
@@ -222,6 +223,7 @@ class AIEBackend(Backend):
                 'Iterations': iterations,
                 'Target': target,
                 'PLMemory': pl_memory,
+                'EnablePLTiming': bool(enable_pl_timing),
                 'Memory': device_info.get('Memory'),
                 'MaxMemTileInPorts': int(device_info['MaxMemTileInPorts']),
                 'MaxMemTileOutPorts': int(device_info['MaxMemTileOutPorts']),
