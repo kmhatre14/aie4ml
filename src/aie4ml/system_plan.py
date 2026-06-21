@@ -146,6 +146,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     iterations = int(ctx.aie_config['Iterations'])
     # HLS storage impl for the data mover preload buffers: URAM (default) or BRAM.
     pl_mem_impl = 'BRAM' if str(ctx.aie_config.get('PLMemory', 'uram')).lower() == 'bram' else 'URAM'
+    # Optional PL cycle-counter instrumentation (tick_gen + cycles_* s_axilite regs).
+    enable_pl_timing = bool(ctx.aie_config.get('EnablePLTiming', True))
     return {
         'project_name': ctx.project_config.project_name,
         'platform': ctx.device.platform,
@@ -153,6 +155,7 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'pl_freq_hz': float(ctx.aie_config['PLClockFreqMHz']) * 1e6,
         'plio_width_bits': int(ctx.device.plio_width_bits),
         'pl_mem_impl': pl_mem_impl,
+        'enable_pl_timing': enable_pl_timing,
         'n_ifm': n_ifm,
         'n_ofm': n_ofm,
         'batch': batch,

@@ -45,6 +45,7 @@ static const int MAX_N_ITER         = {{ max_n_iter }};
 static const int MAX_BIG_IN         = MAX_512_PER_STREAM * MAX_N_ITER;
 static const int MAX_BIG_OUT        = MAX_512_PER_STREAM * MAX_N_ITER;
 
+{% if enable_pl_timing %}
 // ---------------------------------------------------------------------------
 // Free-running PL-clock counter -- parallel dataflow process.
 //
@@ -100,6 +101,7 @@ static void tick_gen(
     *cycles_compute_done = cd_t;
     *cycles_total        = t;
 }
+{% endif %}
 
 // ---------------------------------------------------------------------------
 // preload_and_send_proc: merged process owning {{ n_ifm }} local URAM IFM buffer(s).
@@ -111,10 +113,10 @@ static void preload_and_send_proc(ap_uint<512>* mem_in,
 {% for s in range(n_ifm) %}
                                   hls::stream<ap_axis<128, 0, 0, 0>>& s_out_{{ s }},
 {% endfor %}
-                                  int size_in, int n_iter,
+                                  int size_in, int n_iter{% if enable_pl_timing %},
                                   hls::stream<bool>& trig_preload_done,
                                   hls::stream<bool>& trig_first_send,
-                                  hls::stream<bool>& trig_last_send) {
+                                  hls::stream<bool>& trig_last_send{% endif %}) {
     // Local URAM buffers -- never leave this function.
 {% for s in range(n_ifm) %}
     ap_uint<512> big_in_{{ s }}[MAX_BIG_IN];
@@ -126,8 +128,10 @@ static void preload_and_send_proc(ap_uint<512>* mem_in,
     const int n_in_total_512      = size_in / 16;
     const int n_in_512_per_stream = n_in_total_512 / N_IFM_STREAMS;
 
+{% if enable_pl_timing %}
     // Scheduling anchor for the preload-done marker (see the write below).
     ap_uint<512> preload_anchor = 0;
+{% endif %}
 
     // ---- Phase 1: preload from DDR into the URAM buffer(s) ----
     // Contiguous 512-bit words are striped round-robin: word i -> stream
@@ -146,24 +150,30 @@ static void preload_and_send_proc(ap_uint<512>* mem_in,
                 big_in_{{ s }}[row_slot] = w;
 {% endfor %}
             }
+{% if enable_pl_timing %}
             // Fold every loaded word into a running token. This is purely a
             // scheduling anchor: it gives the trig_preload_done.write() below a
             // real data dependence on the last mem_in read, so HLS cannot hoist
             // the marker to ~cycle 1. tick_gen ignores the value -- it only
             // timestamps the trigger's arrival.
             preload_anchor ^= w;
+{% endif %}
         }
     }
+{% if enable_pl_timing %}
     // Fires only after the preload loop has truly drained (depends on
     // preload_anchor). The boolean value itself is irrelevant to tick_gen.
     trig_preload_done.write(preload_anchor != 0);
+{% endif %}
 
     // ---- Phase 2a: send from URAM to PLIO_ifm ----
     for (int iter = 0; iter < n_iter; iter++) {
         bool is_iter0 = (iter == 0);
+{% if enable_pl_timing %}
         if (is_iter0) {
             trig_first_send.write(true);
         }
+{% endif %}
 
         int base = iter * n_in_512_per_stream;
         for (int row_slot = 0; row_slot < n_in_512_per_stream; row_slot++) {
@@ -186,9 +196,11 @@ static void preload_and_send_proc(ap_uint<512>* mem_in,
             }
         }
 
+{% if enable_pl_timing %}
         if (is_iter0) {
             trig_last_send.write(true);
         }
+{% endif %}
     }
 }
 
@@ -203,11 +215,11 @@ static void recv_and_postwrite_proc(
                                     hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
 {% endfor %}
                                     ap_uint<512>* mem_out,
-                                    int size_out, int n_iter,
+                                    int size_out, int n_iter{% if enable_pl_timing %},
                                     hls::stream<bool>& trig_first_recv,
                                     hls::stream<bool>& trig_last_recv,
                                     hls::stream<bool>& trig_compute_done,
-                                    hls::stream<bool>& stop_sig) {
+                                    hls::stream<bool>& stop_sig{% endif %}) {
 {% for s in range(n_ofm) %}
     ap_uint<512> big_out_{{ s }}[MAX_BIG_OUT];
 {% endfor %}
@@ -237,9 +249,11 @@ static void recv_and_postwrite_proc(
                 ap_axis<128, 0, 0, 0> x{{ s }} = s_in_{{ s }}.read();
                 slc_{{ s }}[j] = x{{ s }}.data;
 {% endfor %}
+{% if enable_pl_timing %}
                 if (is_iter0 && row_slot == 0 && j == 0) {
                     trig_first_recv.write(true);
                 }
+{% endif %}
             }
 
 {% for s in range(n_ofm) %}
@@ -252,12 +266,16 @@ static void recv_and_postwrite_proc(
 {% endfor %}
         }
 
+{% if enable_pl_timing %}
         if (is_iter0) {
             trig_last_recv.write(true);
         }
+{% endif %}
     }
+{% if enable_pl_timing %}
     // All iters' outputs have been packed into the URAM buffer(s).
     trig_compute_done.write(true);
+{% endif %}
 
     // ---- Phase 3: postwrite from URAM to DDR ----
     // Outputs are de-striped back to contiguous DDR: word i <- stream
@@ -278,7 +296,9 @@ static void recv_and_postwrite_proc(
             mem_out[dram_base + i] = w;
         }
     }
+{% if enable_pl_timing %}
     stop_sig.write(true);
+{% endif %}
 }
 
 extern "C" {
@@ -291,14 +311,14 @@ void ddr_pl_aie_datamover(ap_uint<512>* mem_in,
 {% for s in range(n_ofm) %}
            hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
 {% endfor %}
-           int size_in, int size_out, int n_iter,
+           int size_in, int size_out, int n_iter{% if enable_pl_timing %},
            ap_uint<64>* cycles_preload_done,
            ap_uint<64>* cycles_first_send,
            ap_uint<64>* cycles_last_send,
            ap_uint<64>* cycles_first_recv,
            ap_uint<64>* cycles_last_recv,
            ap_uint<64>* cycles_compute_done,
-           ap_uint<64>* cycles_total) {
+           ap_uint<64>* cycles_total{% endif %}) {
 #pragma HLS INTERFACE m_axi port=mem_in  offset=slave bundle=gmem_in \
     max_read_burst_length=16 num_read_outstanding=16
 #pragma HLS INTERFACE m_axi port=mem_out offset=slave bundle=gmem_out \
@@ -314,6 +334,7 @@ void ddr_pl_aie_datamover(ap_uint<512>* mem_in,
 #pragma HLS INTERFACE s_axilite port=size_in             bundle=control
 #pragma HLS INTERFACE s_axilite port=size_out            bundle=control
 #pragma HLS INTERFACE s_axilite port=n_iter              bundle=control
+{% if enable_pl_timing %}
 #pragma HLS INTERFACE s_axilite port=cycles_preload_done bundle=control
 #pragma HLS INTERFACE s_axilite port=cycles_first_send   bundle=control
 #pragma HLS INTERFACE s_axilite port=cycles_last_send    bundle=control
@@ -321,10 +342,12 @@ void ddr_pl_aie_datamover(ap_uint<512>* mem_in,
 #pragma HLS INTERFACE s_axilite port=cycles_last_recv    bundle=control
 #pragma HLS INTERFACE s_axilite port=cycles_compute_done bundle=control
 #pragma HLS INTERFACE s_axilite port=cycles_total        bundle=control
+{% endif %}
 #pragma HLS INTERFACE s_axilite port=return              bundle=control
 
 #pragma HLS DATAFLOW
 
+{% if enable_pl_timing %}
     // Trigger / stop streams.
     hls::stream<bool, 2> trig_preload_done;
     hls::stream<bool, 2> trig_first_send;
@@ -341,22 +364,23 @@ void ddr_pl_aie_datamover(ap_uint<512>* mem_in,
              cycles_first_recv, cycles_last_recv,
              cycles_compute_done,
              cycles_total);
+{% endif %}
 
     preload_and_send_proc(mem_in,
 {% for s in range(n_ifm) %}
                           s_out_{{ s }},
 {% endfor %}
-                          size_in, n_iter,
-                          trig_preload_done, trig_first_send, trig_last_send);
+                          size_in, n_iter{% if enable_pl_timing %},
+                          trig_preload_done, trig_first_send, trig_last_send{% endif %});
 
     recv_and_postwrite_proc(
 {% for s in range(n_ofm) %}
                             s_in_{{ s }},
 {% endfor %}
                             mem_out,
-                            size_out, n_iter,
+                            size_out, n_iter{% if enable_pl_timing %},
                             trig_first_recv, trig_last_recv, trig_compute_done,
-                            stop_sig);
+                            stop_sig{% endif %});
 }
 
 }
