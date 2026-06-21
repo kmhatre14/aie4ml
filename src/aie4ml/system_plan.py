@@ -18,6 +18,7 @@ import numpy as np
 
 from .ir import get_backend_context
 from .passes.utils import sanitize_identifier
+from .ir.graph import input_tensor_for_role
 
 # Bytes in one 512-bit DDR/AXI word -- the unit the PL data mover transfers.
 # This is a transport constant (matches the kernel's ap_uint<512> m_axi word); it is
@@ -92,11 +93,17 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
 
     in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
-
     # Per-layer RTP (weight/bias) loading, in writer layer order (every node with an
     # execution entry increments the index, matching AIEProjectEmitter._collect_layers).
+    # in_feat_slice / out_feat_slice are the per-port (padded) slice sizes the firmware
+    # uses (== parameters.h IN_FEAT_SLICE/OUT_FEAT_SLICE, == lhs/output view.tile_inner).
+    # They are read from the physical-plan view, NOT inferred by division, so host and
+    # kernel agree including align_up padding. in_feat_slice tracks the graph-input-
+    # consuming (first) weight layer; out_feat_slice the graph-output-producing (last) one.
     layers = []
     layer_index = 0
+    in_feat_slice = None
+    out_feat_slice = None
     for node in ctx.ir.logical:
         inst = ctx.ir.execution.get(node.name)
         if inst is None:
@@ -108,6 +115,14 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         parallelism = getattr(inst.config, 'parallelism', None)
         if parallelism is None:
             raise RuntimeError(f'{node.name}: RTP-bearing layer has no parallelism config.')
+        io_views = getattr(inst.config, 'io_views', None)
+        if io_views is None:
+            raise RuntimeError(f'{node.name}: RTP-bearing layer has no io_views (cannot source feat slices).')
+        lhs_name = input_tensor_for_role(node, 'lhs').name
+        out_name = node.outputs[0].name
+        if in_feat_slice is None:
+            in_feat_slice = int(io_views[lhs_name].tile_inner)
+        out_feat_slice = int(io_views[out_name].tile_inner)
         inst_name = sanitize_identifier(node.name)
         layers.append({
             'inst_name': inst_name,
@@ -126,6 +141,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         })
 
 
+    if in_feat_slice is None or out_feat_slice is None:
+        raise RuntimeError('build_system_io found no RTP-bearing (weight) layer to source feat slices from.')
     # Top-level cas_* describe the graph-output-producing (last weight) layer.
     cas_num = layers[-1]['cas_num'] if layers else 1
     cas_length = layers[-1]['cas_length'] if layers else 1
@@ -164,8 +181,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'max_n_iter': _DEFAULT_MAX_N_ITER,
         'in_feat': in_feat,
         'out_feat': out_feat,
-        'in_feat_slice': in_feat // n_ifm,
-        'out_feat_slice': out_feat // cas_num,
+        'in_feat_slice': in_feat_slice,
+        'out_feat_slice': out_feat_slice,
         'cas_num': cas_num,
         'cas_length': cas_length,
         'max_512_per_stream': max_512_per_stream,
