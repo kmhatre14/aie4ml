@@ -116,8 +116,7 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         # output port layout
         out_ports = layout.outputs[out_name]
         out_port = out_ports[0]
-        if in_feat_slice is None:
-            in_feat_slice = in_port.tiling_dimension[in_port.slice_dimension]
+        in_feat_slice = in_port.tiling_dimension[in_port.slice_dimension]
         out_feat_slice = out_port.tiling_dimension[out_port.slice_dimension]
         inst_name = sanitize_identifier(node.name)
         layers.append({
