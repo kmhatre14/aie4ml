@@ -93,13 +93,6 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
 
     in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
-    # Per-layer RTP (weight/bias) loading, in writer layer order (every node with an
-    # execution entry increments the index, matching AIEProjectEmitter._collect_layers).
-    # in_feat_slice / out_feat_slice are the per-port (padded) slice sizes the firmware
-    # uses (== parameters.h IN_FEAT_SLICE/OUT_FEAT_SLICE, == lhs/output view.tile_inner).
-    # They are read from the physical-plan view, NOT inferred by division, so host and
-    # kernel agree including align_up padding. in_feat_slice tracks the graph-input-
-    # consuming (first) weight layer; out_feat_slice the graph-output-producing (last) one.
     layers = []
     layer_index = 0
     in_feat_slice = None
@@ -115,14 +108,17 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         parallelism = getattr(inst.config, 'parallelism', None)
         if parallelism is None:
             raise RuntimeError(f'{node.name}: RTP-bearing layer has no parallelism config.')
-        io_views = getattr(inst.config, 'io_views', None)
-        if io_views is None:
-            raise RuntimeError(f'{node.name}: RTP-bearing layer has no io_views (cannot source feat slices).')
         lhs_name = input_tensor_for_role(node, 'lhs').name
+        # input port layout
         out_name = node.outputs[0].name
+        in_ports = layout.inputs[lhs_name]
+        in_port = in_ports[0] # PLIO port 0 representative (all shards same shape)
+        # output port layout
+        out_ports = layout.outputs[out_name]
+        out_port = out_ports[0]
         if in_feat_slice is None:
-            in_feat_slice = int(io_views[lhs_name].tile_inner)
-        out_feat_slice = int(io_views[out_name].tile_inner)
+            in_feat_slice = in_port.tiling_dimension[in_port.slice_dimension]
+        out_feat_slice = out_port.tiling_dimension[out_port.slice_dimension]
         inst_name = sanitize_identifier(node.name)
         layers.append({
             'inst_name': inst_name,
@@ -139,8 +135,6 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
                 for a in artifacts
             ],
         })
-
-
     if in_feat_slice is None or out_feat_slice is None:
         raise RuntimeError('build_system_io found no RTP-bearing (weight) layer to source feat slices from.')
     # Top-level cas_* describe the graph-output-producing (last weight) layer.
@@ -154,12 +148,10 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         raise NotImplementedError(
             f'out_feat {out_feat} not divisible by cas_num {cas_num}; uneven output shard is not yet supported.'
         )
-
     max_512_per_stream = max(
         _stream_words_512(batch, in_feat, in_bytes, n_ifm, 'input'),
         _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output'),
     )
-
     iterations = int(ctx.aie_config['Iterations'])
     # HLS storage impl for the data mover preload buffers: URAM (default) or BRAM.
     pl_mem_impl = 'BRAM' if str(ctx.aie_config.get('PLMemory', 'uram')).lower() == 'bram' else 'URAM'
@@ -188,7 +180,6 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'max_512_per_stream': max_512_per_stream,
         'layers': layers,
     }
-
 
 # ---------------------------------------------------------------------------
 # Host data.h generation (DDR-packed input) — target='hardware'
