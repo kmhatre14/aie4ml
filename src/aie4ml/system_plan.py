@@ -18,6 +18,7 @@ import numpy as np
 
 from .ir import get_backend_context
 from .passes.utils import sanitize_identifier
+from .ir.graph import input_tensor_for_role
 
 # Bytes in one 512-bit DDR/AXI word -- the unit the PL data mover transfers.
 # This is a transport constant (matches the kernel's ap_uint<512> m_axi word); it is
@@ -47,11 +48,6 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int):
     not yet supported).
     """
     tensors = list(ports_map)
-    if len(tensors) != 1:
-        raise NotImplementedError(
-            f'system I/O plan supports a single graph {direction} tensor; '
-            f'got {len(tensors)} ({tensors}). Multiple graph {direction}s are not yet supported.'
-        )
     port0 = ports_map[tensors[0]][0]
     total = int(math.prod(port0.numpy_boundary_shape))
     if total % int(batch) != 0:
@@ -89,14 +85,18 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     n_ifm = int(plan['graph_input_count'])
     n_ofm = int(plan['graph_output_count'])
     batch = int(ctx.aie_config['BatchSize'])
+    if len(layout.inputs) != 1 or len(layout.outputs) != 1:
+        raise RuntimeError(
+            f'system I/O plan supports a single graph tensor; '
+            f'got {len(layout.inputs)} and ({layout.outputs}). Multiple graph are not yet supported.'
+        )
 
     in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
-
-    # Per-layer RTP (weight/bias) loading, in writer layer order (every node with an
-    # execution entry increments the index, matching AIEProjectEmitter._collect_layers).
     layers = []
     layer_index = 0
+    in_feat_slice = None
+    out_feat_slice = None
     for node in ctx.ir.logical:
         inst = ctx.ir.execution.get(node.name)
         if inst is None:
@@ -108,6 +108,16 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         parallelism = getattr(inst.config, 'parallelism', None)
         if parallelism is None:
             raise RuntimeError(f'{node.name}: RTP-bearing layer has no parallelism config.')
+        lhs_name = input_tensor_for_role(node, 'lhs').name
+        # input port layout
+        out_name = node.outputs[0].name
+        in_ports = layout.inputs[lhs_name]
+        in_port = in_ports[0] # PLIO port 0 representative (all shards same shape)
+        # output port layout
+        out_ports = layout.outputs[out_name]
+        out_port = out_ports[0]
+        in_feat_slice = in_port.tiling_dimension[in_port.slice_dimension]
+        out_feat_slice = out_port.tiling_dimension[out_port.slice_dimension]
         inst_name = sanitize_identifier(node.name)
         layers.append({
             'inst_name': inst_name,
@@ -124,8 +134,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
                 for a in artifacts
             ],
         })
-
-
+    if in_feat_slice is None or out_feat_slice is None:
+        raise RuntimeError('build_system_io found no RTP-bearing (weight) layer to source feat slices from.')
     # Top-level cas_* describe the graph-output-producing (last weight) layer.
     cas_num = layers[-1]['cas_num'] if layers else 1
     cas_length = layers[-1]['cas_length'] if layers else 1
@@ -137,12 +147,10 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         raise NotImplementedError(
             f'out_feat {out_feat} not divisible by cas_num {cas_num}; uneven output shard is not yet supported.'
         )
-
     max_512_per_stream = max(
         _stream_words_512(batch, in_feat, in_bytes, n_ifm, 'input'),
         _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output'),
     )
-
     iterations = int(ctx.aie_config['Iterations'])
     # HLS storage impl for the data mover preload buffers: URAM (default) or BRAM.
     pl_mem_impl = 'BRAM' if str(ctx.aie_config.get('PLMemory', 'uram')).lower() == 'bram' else 'URAM'
@@ -167,14 +175,13 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'max_n_iter': _DEFAULT_MAX_N_ITER,
         'in_feat': in_feat,
         'out_feat': out_feat,
-        'in_feat_slice': in_feat // n_ifm,
-        'out_feat_slice': out_feat // cas_num,
+        'in_feat_slice': in_feat_slice,
+        'out_feat_slice': out_feat_slice,
         'cas_num': cas_num,
         'cas_length': cas_length,
         'max_512_per_stream': max_512_per_stream,
         'layers': layers,
     }
-
 
 # ---------------------------------------------------------------------------
 # Host data.h generation (DDR-packed input) — target='hardware'
@@ -254,9 +261,6 @@ def pack_host_data(model_or_ctx, X=None):
 
     ctx = get_backend_context(model_or_ctx)
     layout = build_io_layout(ctx)
-    if len(layout.inputs) != 1 or len(layout.outputs) != 1:
-        raise NotImplementedError('host data.h supports a single graph input and output.')
-
     in_tensor = next(iter(layout.inputs))
     in_ports = layout.inputs[in_tensor]
     out_port0 = layout.outputs[next(iter(layout.outputs))][0]
