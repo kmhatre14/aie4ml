@@ -48,11 +48,6 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int):
     not yet supported).
     """
     tensors = list(ports_map)
-    if len(tensors) != 1:
-        raise NotImplementedError(
-            f'system I/O plan supports a single graph {direction} tensor; '
-            f'got {len(tensors)} ({tensors}). Multiple graph {direction}s are not yet supported.'
-        )
     port0 = ports_map[tensors[0]][0]
     total = int(math.prod(port0.numpy_boundary_shape))
     if total % int(batch) != 0:
@@ -90,6 +85,11 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     n_ifm = int(plan['graph_input_count'])
     n_ofm = int(plan['graph_output_count'])
     batch = int(ctx.aie_config['BatchSize'])
+    if len(layout.inputs) != 1 or len(layout.outputs) != 1:
+        raise RuntimeError(
+            f'system I/O plan supports a single graph tensor; '
+            f'got {len(layout.inputs)} and ({layout.outputs}). Multiple graph are not yet supported.'
+        )
 
     in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
@@ -258,9 +258,6 @@ def pack_host_data(model_or_ctx, X=None):
 
     ctx = get_backend_context(model_or_ctx)
     layout = build_io_layout(ctx)
-    if len(layout.inputs) != 1 or len(layout.outputs) != 1:
-        raise NotImplementedError('host data.h supports a single graph input and output.')
-
     in_tensor = next(iter(layout.inputs))
     in_ports = layout.inputs[in_tensor]
     out_port0 = layout.outputs[next(iter(layout.outputs))][0]
