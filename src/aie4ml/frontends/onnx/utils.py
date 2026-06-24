@@ -138,6 +138,21 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
     )
     resolved_aie_config = dict(merged)
     resolved_aie_config['Part'] = str(part_name)
+
+    # Validate + default the hardware-emission knobs the same way the hls4ml backend does
+    # (frontends/hls4ml/backend.py), so a raw AIEConfig dict can set target='hardware' and
+    # pl_memory cleanly. Target gates PL+host emission (emits_system); PLMemory selects the
+    # data mover's preload storage. Reject typos here instead of silently falling back to AIE-only.
+    target = str(resolved_aie_config.get('Target', 'aie')).lower()
+    if target not in ('aie', 'hardware'):
+        raise ValueError(f"AIEConfig.Target must be 'aie' or 'hardware', got {resolved_aie_config.get('Target')!r}.")
+    resolved_aie_config['Target'] = target
+
+    pl_memory = str(resolved_aie_config.get('PLMemory', 'uram')).lower()
+    if pl_memory not in ('uram', 'bram'):
+        raise ValueError(f"AIEConfig.PLMemory must be 'uram' or 'bram', got {resolved_aie_config.get('PLMemory')!r}.")
+    resolved_aie_config['PLMemory'] = pl_memory
+
     ctx = AIEBackendContext(
         device=device,
         policies=policies,
