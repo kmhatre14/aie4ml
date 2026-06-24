@@ -33,14 +33,17 @@ class AIEProjectEmitter:
 
         self._emit_kernel_artifacts(output_dir, layers, env)
         self._copy_kernel_sources(output_dir, ctx.project_config.custom_sources)
-        self._render_templates(output_dir, ctx, layers, graph_plan, env)
 
         # PL data mover + XRT host are emitted only for target='hardware' (default 'aie' is
-        # AIE-only). Gated so the existing AIE/sim flow is completely unaffected.
-        from .system_plan import emits_system
+        # AIE-only). Resolve the data-mover plan ONCE here; both the base render (Makefile)
+        # and the PL/host system render reuse it, so build_data_mover_plan runs once.
+        from .system_plan import data_mover_plan_for, emits_system
 
-        if emits_system(ctx):
-            self._render_system_templates(output_dir, ctx, env)
+        data_mover_plan = data_mover_plan_for(ctx) if emits_system(ctx) else None
+
+        self._render_templates(output_dir, ctx, layers, graph_plan, env, data_mover_plan)
+        if data_mover_plan is not None:
+            self._render_system_templates(output_dir, ctx, env, data_mover_plan)
 
     def _prepare_directories(self, output_dir: Path):
         (output_dir / 'src').mkdir(parents=True, exist_ok=True)
@@ -140,9 +143,10 @@ class AIEProjectEmitter:
         else:
             path.unlink()
 
-    def _render_templates(self, output_dir: Path, ctx, layers, graph_plan, env: Environment):
-        from .system_plan import emits_system
-
+    def _render_templates(self, output_dir: Path, ctx, layers, graph_plan, env: Environment,
+                          data_mover_plan=None):
+        # data_mover_plan is set only for target='hardware'; the Makefile uses it (kernel
+        # .xo list, per-kernel build/clean) and all its uses are gated behind is_hardware.
         context = {
             'layers': layers,
             'graph_plan': graph_plan,
@@ -153,8 +157,9 @@ class AIEProjectEmitter:
             'platform': ctx.device.platform,
             # The unified Makefile adds PL/host/package targets when this project was
             # emitted for hardware; aie-only projects render just the AIE/sim flow.
-            'is_hardware': emits_system(ctx),
+            'is_hardware': data_mover_plan is not None,
             'project_name': ctx.project_config.project_name,
+            'data_mover_plan': data_mover_plan,
         }
 
         self._render_template(env, 'Makefile.jinja', output_dir / 'Makefile', context)
@@ -164,25 +169,28 @@ class AIEProjectEmitter:
         self._render_template(env, 'top_graph.h.jinja', output_dir / 'src' / 'top_graph.h', context)
         self._render_template(env, 'app.cpp.jinja', output_dir / 'app.cpp', context)
 
-    def _render_system_templates(self, output_dir: Path, ctx, env: Environment):
+    def _render_system_templates(self, output_dir: Path, ctx, env: Environment, data_mover_plan):
         """Render the PL data mover + v++ connectivity + XRT host (target='hardware').
 
         Templates live under templates/firmware/ (pl/, host/, system.cfg.jinja) and are
-        rendered with the shared firmware Jinja environment.
+        rendered with the shared firmware Jinja environment. ``data_mover_plan`` is the
+        plan already resolved in write_aie (reused so it isn't built twice).
         """
         from .system_plan import build_system_io
 
-        system_io = build_system_io(ctx)
+        system_io = build_system_io(ctx, data_mover_plan=data_mover_plan)
 
         (output_dir / 'pl').mkdir(parents=True, exist_ok=True)
         (output_dir / 'host').mkdir(parents=True, exist_ok=True)
 
-        self._render_template(
-            env, 'pl/ddr_pl_aie_datamover.cpp.jinja', output_dir / 'pl' / 'ddr_pl_aie_datamover.cpp', system_io
-        )
-        self._render_template(
-            env, 'pl/ddr_pl_aie_datamover.cfg.jinja', output_dir / 'pl' / 'ddr_pl_aie_datamover.cfg', system_io
-        )
+        # Render each PL kernel the data-mover plan selects (benchmark = one combined
+        # CU; memory_stream = mm2s + s2mm [+ tick_gen when timing]). Templates may live
+        # under pl/ or pl/deployment/, but always render to pl/<name>.{cpp,cfg}.
+        for kernel in system_io['data_mover_plan']['kernels']:
+            name = kernel['name']
+            self._render_template(env, kernel['cpp_template'], output_dir / 'pl' / f'{name}.cpp', system_io)
+            self._render_template(env, kernel['cfg_template'], output_dir / 'pl' / f'{name}.cfg', system_io)
+
         self._render_template(env, 'system.cfg.jinja', output_dir / 'system.cfg', system_io)
         self._render_template(env, 'host/host.cpp.jinja', output_dir / 'host' / 'host.cpp', system_io)
 

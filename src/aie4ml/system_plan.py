@@ -31,6 +31,12 @@ _DDR_WORD_BYTES = 64
 # iteration count. Hardcoded until URAM-aware sizing lands.
 _DEFAULT_MAX_N_ITER = 64
 
+# PL data-mover template locations. The benchmark mover lives under pl/benchmark/; the
+# deployment movers (memory_stream / external_stream) live under pl/deployment/.
+_BENCHMARK_KERNEL = 'ddr_pl_aie_datamover'
+_BENCHMARK_TEMPLATE_DIR = 'pl/benchmark'
+_DEPLOYMENT_TEMPLATE_DIR = 'pl/deployment'
+
 
 def emits_system(model_or_ctx) -> bool:
     """Return True when PL + host code should be emitted (``target='hardware'``).
@@ -66,7 +72,110 @@ def _stream_words_512(batch: int, feat: int, elem_bytes: int, n_streams: int, di
     return total_bytes // (_DDR_WORD_BYTES * int(n_streams))
 
 
-def build_system_io(model_or_ctx) -> Dict[str, Any]:
+def _kernel_entry(name: str, template_dir: str) -> Dict[str, str]:
+    """One PL kernel for the writer (which templates to render) and the Makefile (.xo)."""
+    return {
+        'name': name,
+        'cpp_template': f'{template_dir}/{name}.cpp.jinja',
+        'cfg_template': f'{template_dir}/{name}.cfg.jinja',
+    }
+
+
+def build_data_mover_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> Dict[str, Any]:
+    """Describe the PL data path for a given ``PLDataMoverMode``: which kernels to emit,
+    the v++ linker connectivity (``nk=`` / ``sc=``), and the host's timing wiring.
+
+    This is the single source of truth consumed by:
+      * the writer            -> ``plan['kernels']`` (which .cpp/.cfg templates to render),
+      * ``Makefile.jinja``    -> kernel ``.xo`` list + per-kernel build,
+      * ``system.cfg.jinja``  -> ``plan['nk']`` / ``plan['sc']`` connectivity,
+      * ``host.cpp.jinja``    -> ``plan['host']`` (timing CU + ``cycles_*`` register names).
+
+    Modes:
+      ``benchmark``     single combined ``ddr_pl_aie_datamover`` CU (today's design);
+      ``memory_stream`` split ``mm2s`` + ``s2mm`` double-buffered CUs, plus a shared
+                        ``tick_gen`` timer CU when PL timing is on (separate CUs have
+                        independent ``ap_start``, so one timer gives a common time base);
+      ``external_stream`` not yet emitted (direct PLIO<->external PL wiring + traffic-gen).
+    """
+    mode = str(mode).lower()
+
+    if mode == 'benchmark':
+        # Benchmark is a cycle-accurate measurement harness -- the PL timers are its
+        # whole point, so force them ON regardless of EnablePLTiming.
+        if not enable_pl_timing:
+            print("[aie4ml] PLDataMoverMode='benchmark' forces PL timers ON "
+                  "(overriding EnablePLTiming=False).")
+            enable_pl_timing = True
+        name = _BENCHMARK_KERNEL
+        sc = [f'{name}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
+        sc += [f'ai_engine_0.PLIO_ofm_{s}:{name}.s_in_{s}' for s in range(n_ofm)]
+        # The combined CU owns tick_gen internally; the host reads its 7 cycles_* regs.
+        return {
+            'mode': mode,
+            'enable_pl_timing': enable_pl_timing,
+            'kernels': [_kernel_entry(name, _BENCHMARK_TEMPLATE_DIR)],
+            'nk': [f'{name}:1:{name}'],
+            'sc': sc,
+            'host': {
+                'timing_kernel': name,
+                'cycles': ['preload_done', 'first_send', 'last_send', 'first_recv',
+                           'last_recv', 'compute_done', 'total'],
+            },
+        }
+
+    if mode == 'memory_stream':
+        ifm_k, ofm_k = 'mm2s', 's2mm'
+        kernels = [_kernel_entry(ifm_k, _DEPLOYMENT_TEMPLATE_DIR),
+                   _kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR)]
+        nk = [f'{ifm_k}:1:{ifm_k}', f'{ofm_k}:1:{ofm_k}']
+        sc = [f'{ifm_k}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
+        sc += [f'ai_engine_0.PLIO_ofm_{s}:{ofm_k}.s_in_{s}' for s in range(n_ofm)]
+        host = {'timing_kernel': None, 'cycles': []}
+        if enable_pl_timing:
+            timer = 'tick_gen'
+            kernels.append(_kernel_entry(timer, _DEPLOYMENT_TEMPLATE_DIR))
+            nk.append(f'{timer}:1:{timer}')
+            # PL-to-PL event pulses give tick_gen a single time base across the two CUs.
+            sc += [
+                f'{ifm_k}.ev_first_send:{timer}.ev_first_send',
+                f'{ifm_k}.ev_last_send:{timer}.ev_last_send',
+                f'{ofm_k}.ev_first_recv:{timer}.ev_first_recv',
+                f'{ofm_k}.ev_last_recv:{timer}.ev_last_recv',
+                f'{ofm_k}.ev_done:{timer}.ev_done',
+            ]
+            host = {'timing_kernel': timer,
+                    'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total']}
+        return {'mode': mode, 'enable_pl_timing': enable_pl_timing,
+                'kernels': kernels, 'nk': nk, 'sc': sc, 'host': host}
+
+    if mode == 'external_stream':
+        raise NotImplementedError(
+            "PLDataMoverMode 'external_stream' is not yet emitted by the compiler "
+            '(direct PLIO<->external PL AXI-stream wiring + traffic-gen test pending).'
+        )
+    raise ValueError(f'unknown PLDataMoverMode {mode!r}.')
+
+
+def data_mover_plan_for(model_or_ctx) -> Dict[str, Any]:
+    """Resolve the data-mover plan from a backend context: ``PLDataMoverMode`` + PLIO
+    port counts (from the physical plan) + ``EnablePLTiming``.
+
+    Single entry point both the Makefile render and :func:`build_system_io` use, so
+    :func:`build_data_mover_plan` (and its benchmark-override message) runs exactly once
+    per emission instead of once per render pass.
+    """
+    ctx = get_backend_context(model_or_ctx)
+    phys = ctx.ir.physical.plan
+    return build_data_mover_plan(
+        str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower(),
+        int(phys['graph_input_count']),
+        int(phys['graph_output_count']),
+        bool(ctx.aie_config.get('EnablePLTiming', True)),
+    )
+
+
+def build_system_io(model_or_ctx, data_mover_plan=None) -> Dict[str, Any]:
     """Project the resolved IR + physical plan into the flat variable bag the PL/host
     templates in ``templates/system/`` consume.
 
@@ -154,8 +263,15 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     iterations = int(ctx.aie_config['Iterations'])
     # HLS storage impl for the data mover preload buffers: URAM (default) or BRAM.
     pl_mem_impl = 'BRAM' if str(ctx.aie_config.get('PLMemory', 'uram')).lower() == 'bram' else 'URAM'
-    # Optional PL cycle-counter instrumentation (tick_gen + cycles_* s_axilite regs).
-    enable_pl_timing = bool(ctx.aie_config.get('EnablePLTiming', True))
+    # PL data-path style (benchmark single CU vs split deployment movers). The plan tells
+    # the writer which kernels to render and the templates how to wire them, and resolves
+    # the effective PL timing (benchmark forces the timers on). Reuse a plan the writer
+    # passes -- so it (and its override message) is built once per emission; otherwise
+    # resolve it here for standalone callers.
+    if data_mover_plan is None:
+        data_mover_plan = data_mover_plan_for(ctx)
+    pl_data_mover_mode = data_mover_plan['mode']
+    enable_pl_timing = data_mover_plan['enable_pl_timing']
     return {
         'project_name': ctx.project_config.project_name,
         'platform': ctx.device.platform,
@@ -181,13 +297,15 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'cas_length': cas_length,
         'max_512_per_stream': max_512_per_stream,
         'layers': layers,
+        'pl_data_mover_mode': pl_data_mover_mode,
+        'data_mover_plan': data_mover_plan,
     }
 
 # ---------------------------------------------------------------------------
 # Host data.h generation (DDR-packed input) — target='hardware'
 #
-# The PL data mover (templates/firmware/pl/ddr_pl_aie_datamover.cpp.jinja) moves whole 512-bit
-# DDR words and round-robin stripes them across the N per-direction PLIO streams
+# The PL data movers (templates/firmware/pl/benchmark/ or pl/deployment/) move whole 512-bit
+# DDR words and round-robin stripe them across the N per-direction PLIO streams
 # (word i -> stream i % N). The host (host.cpp) replays this packed input each iteration.
 # This produces `host/data.h` with the packed input and the IO word sizes.
 # ---------------------------------------------------------------------------
