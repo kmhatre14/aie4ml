@@ -1,8 +1,7 @@
 # =============================================================
 # system.cfg — v++ linker connectivity for {{ project_name }}
-# GENERATED from templates/firmware/system.cfg.jinja -- do not edit by hand.
 #
-# PL data-mover mode: {{ data_mover_plan.mode }}
+# PL data-mover mode: {{ pl_plan.mode }}
 # This design has {{ n_ifm }} input PLIO(s) and {{ n_ofm }} output PLIO(s).
 #
 # PLIO port names must exactly match the strings in
@@ -11,10 +10,10 @@
 
 [connectivity]
 # PL kernel compute unit(s) (nk) + stream connection(s) (sc), per the data-mover plan.
-{% for entry in data_mover_plan.nk -%}
+{% for entry in pl_plan.nk -%}
 nk={{ entry }}
 {% endfor %}
-{% for entry in data_mover_plan.sc -%}
+{% for entry in pl_plan.sc -%}
 sc={{ entry }}
 {% endfor %}
 [clock]

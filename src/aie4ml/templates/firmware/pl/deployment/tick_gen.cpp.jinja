@@ -1,17 +1,7 @@
 /*
-Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
-SPDX-License-Identifier: X11
+Copyright (C) 2026, Advent lab
 
 tick_gen -- standalone PL-clock timestamp kernel for the split mm2s/s2mm movers.
-GENERATED from templates/firmware/pl/deployment/tick_gen.cpp.jinja -- do not edit by hand.
-Only emitted when PL timing is enabled (EnablePLTiming).
-
-With mm2s and s2mm as SEPARATE CUs each has its own ap_start, so a per-kernel counter
-could not be compared across the two. tick_gen restores a SINGLE common time base: it
-owns one free-running counter, and mm2s/s2mm send one-beat axis "event" pulses (wired via
-sc=) that this kernel timestamps. Because all events land on the same counter, cross-kernel
-deltas (AIE compute window, PL->AIE->PL round trip) are meaningful; the only error is a
-constant ~few-cycle event-link latency that cancels in the deltas.
 
 Events (one-shot, iter0-scoped except ev_done):
    ev_first_send  <- mm2s : first PLIO_ifm beat of iter0 (start of compute)

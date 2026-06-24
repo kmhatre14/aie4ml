@@ -1,9 +1,8 @@
 {%- set ctr_base = 2 + n_ifm + n_ofm + 3 -%}
-{%- set mode = data_mover_plan.mode -%}
+{%- set mode = pl_plan.mode -%}
 /*
  * Host application for {{ project_name }}.
  * Single Dense layer: {{ in_feat }}->{{ out_feat }}, int8, BATCH={{ batch }}.
- * GENERATED from templates/firmware/host/host.cpp.jinja -- do not edit by hand.
  *
  * PL data-mover mode: {{ mode }}
  *

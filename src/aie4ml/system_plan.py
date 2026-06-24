@@ -81,7 +81,7 @@ def _kernel_entry(name: str, template_dir: str) -> Dict[str, str]:
     }
 
 
-def build_data_mover_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> Dict[str, Any]:
+def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> Dict[str, Any]:
     """Describe the PL data path for a given ``PLDataMoverMode``: which kernels to emit,
     the v++ linker connectivity (``nk=`` / ``sc=``), and the host's timing wiring.
 
@@ -157,25 +157,7 @@ def build_data_mover_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: b
     raise ValueError(f'unknown PLDataMoverMode {mode!r}.')
 
 
-def data_mover_plan_for(model_or_ctx) -> Dict[str, Any]:
-    """Resolve the data-mover plan from a backend context: ``PLDataMoverMode`` + PLIO
-    port counts (from the physical plan) + ``EnablePLTiming``.
-
-    Single entry point both the Makefile render and :func:`build_system_io` use, so
-    :func:`build_data_mover_plan` (and its benchmark-override message) runs exactly once
-    per emission instead of once per render pass.
-    """
-    ctx = get_backend_context(model_or_ctx)
-    phys = ctx.ir.physical.plan
-    return build_data_mover_plan(
-        str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower(),
-        int(phys['graph_input_count']),
-        int(phys['graph_output_count']),
-        bool(ctx.aie_config.get('EnablePLTiming', True)),
-    )
-
-
-def build_system_io(model_or_ctx, data_mover_plan=None) -> Dict[str, Any]:
+def build_system_io(model_or_ctx) -> Dict[str, Any]:
     """Project the resolved IR + physical plan into the flat variable bag the PL/host
     templates in ``templates/system/`` consume.
 
@@ -265,13 +247,12 @@ def build_system_io(model_or_ctx, data_mover_plan=None) -> Dict[str, Any]:
     pl_mem_impl = 'BRAM' if str(ctx.aie_config.get('PLMemory', 'uram')).lower() == 'bram' else 'URAM'
     # PL data-path style (benchmark single CU vs split deployment movers). The plan tells
     # the writer which kernels to render and the templates how to wire them, and resolves
-    # the effective PL timing (benchmark forces the timers on). Reuse a plan the writer
-    # passes -- so it (and its override message) is built once per emission; otherwise
-    # resolve it here for standalone callers.
-    if data_mover_plan is None:
-        data_mover_plan = data_mover_plan_for(ctx)
-    pl_data_mover_mode = data_mover_plan['mode']
-    enable_pl_timing = data_mover_plan['enable_pl_timing']
+    # the effective PL timing (benchmark forces the timers on). Built once here and handed
+    # back via system_io['pl_plan'] so the Makefile render can reuse it.
+    pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
+    pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm,
+                            bool(ctx.aie_config.get('EnablePLTiming', True)))
+    enable_pl_timing = pl_plan['enable_pl_timing']
     return {
         'project_name': ctx.project_config.project_name,
         'platform': ctx.device.platform,
@@ -298,7 +279,7 @@ def build_system_io(model_or_ctx, data_mover_plan=None) -> Dict[str, Any]:
         'max_512_per_stream': max_512_per_stream,
         'layers': layers,
         'pl_data_mover_mode': pl_data_mover_mode,
-        'data_mover_plan': data_mover_plan,
+        'pl_plan': pl_plan,
     }
 
 # ---------------------------------------------------------------------------

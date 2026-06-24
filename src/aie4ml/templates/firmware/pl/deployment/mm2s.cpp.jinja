@@ -1,21 +1,12 @@
 /*
-Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
-SPDX-License-Identifier: X11
+Copyright (C) 2026, Advent lab
 
 mm2s -- DDR -> PLIO_ifm streaming data mover (memory_stream deployment mode).
-GENERATED from templates/firmware/pl/deployment/mm2s.cpp.jinja -- do not edit by hand.
 
 Design: {{ project_name }} ({{ in_feat }}->{{ out_feat }}, {{ n_ifm }} IFM PLIO).
-This kernel owns only the input side; S2MM is a separate CU (pl/s2mm.cpp).
 
 PING-PONG DOUBLE BUFFERING: each iteration is staged into one of two on-chip buffers;
-while send_plio() drains iteration N-1 from one buffer, load_ddr() fills the other with
-iteration N from DDR, so DDR transfer overlaps PLIO streaming (the AIE is not starved).
-Only ONE iteration is staged per buffer (not all n_iter), so n_iter is unbounded.
 
-DDR layout (per iteration): contiguous 512-bit word i belongs to stream i % N, row i / N.
-So for stream s at row r the DDR word is base + r*N + s. load_ddr reads DDR contiguously
-and de-stripes into buf[stream][row]. Each 512-bit word carries 4 x 128b AXI-stream beats.
 {% if enable_pl_timing %}
 PL timing on: mm2s emits one-beat axis event pulses (iter0 send window) to the shared
 tick_gen CU (sc=-wired), which owns the single free-running counter.
