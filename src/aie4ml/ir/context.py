@@ -73,6 +73,12 @@ class DeviceSpec:
     max_mem_out_ports: int
     dialect: str
     vector_bytes: int = 64
+    # PL on-chip URAM budget for the data mover preload buffers (bytes), and the URAM block
+    # geometry. Sourced from the device catalog's "UltraRAM" entry; 0 when the device does
+    # not declare it (only hardware-target system planning consumes it).
+    uram_total_bytes: int = 0
+    uram_block_bytes: int = 0
+    uram_blocks: int = 0
 
     @classmethod
     def from_config(cls, platform: str, cfg: Dict[str, Any]) -> 'DeviceSpec':
@@ -85,6 +91,8 @@ class DeviceSpec:
             if 'BankMemBytes' not in source:
                 raise KeyError('AIEConfig Memory missing "BankMemBytes".')
             return int(source['BankMemBytes'])
+
+        uram = cfg.get('UltraRAM', {}) or {}
 
         return cls(
             platform=platform,
@@ -99,6 +107,9 @@ class DeviceSpec:
             max_mem_out_ports=_require_int(cfg, 'MaxMemTileOutPorts'),
             dialect=detect_dialect(str(cfg['Generation'])),
             vector_bytes=int(cfg.get('VectorBytes', 64)),
+            uram_total_bytes=int(uram.get('TotalBytes', 0)),
+            uram_block_bytes=int(uram.get('BlockBytes', 0)),
+            uram_blocks=int(uram.get('Blocks', 0)),
         )
 
 
