@@ -18,7 +18,6 @@ import numpy as np
 
 from .ir import get_backend_context
 from .passes.utils import sanitize_identifier
-from .ir.graph import input_tensor_for_role
 
 # Bytes in one 512-bit DDR/AXI word -- the unit the PL data mover transfers.
 # This is a transport constant (matches the kernel's ap_uint<512> m_axi word); it is
@@ -30,6 +29,12 @@ _DDR_WORD_BYTES = 64
 # derived from available PL URAM (URAM budget / per-iteration footprint), not the AIE sim
 # iteration count. Hardcoded until URAM-aware sizing lands.
 _DEFAULT_MAX_N_ITER = 64
+
+# PL data-mover template locations. The benchmark mover lives under pl/benchmark/; the
+# deployment movers (memory_stream / external_stream) live under pl/deployment/.
+_BENCHMARK_KERNEL = 'ddr_pl_aie_datamover'
+_BENCHMARK_TEMPLATE_DIR = 'pl/benchmark'
+_DEPLOYMENT_TEMPLATE_DIR = 'pl/deployment'
 
 
 def emits_system(model_or_ctx) -> bool:
@@ -66,6 +71,91 @@ def _stream_words_512(batch: int, feat: int, elem_bytes: int, n_streams: int, di
     return total_bytes // (_DDR_WORD_BYTES * int(n_streams))
 
 
+def _kernel_entry(name: str, template_dir: str) -> Dict[str, str]:
+    """One PL kernel for the writer (which templates to render) and the Makefile (.xo)."""
+    return {
+        'name': name,
+        'cpp_template': f'{template_dir}/{name}.cpp.jinja',
+        'cfg_template': f'{template_dir}/{name}.cfg.jinja',
+    }
+
+
+def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> Dict[str, Any]:
+    """Describe the PL data path for a given ``PLDataMoverMode``: which kernels to emit,
+    the v++ linker connectivity (``nk=`` / ``sc=``), and the host's timing wiring.
+
+    This is the single source of truth consumed by:
+      * the writer            -> ``plan['kernels']`` (which .cpp/.cfg templates to render),
+      * ``Makefile.jinja``    -> kernel ``.xo`` list + per-kernel build,
+      * ``system.cfg.jinja``  -> ``plan['nk']`` / ``plan['sc']`` connectivity,
+      * ``host.cpp.jinja``    -> ``plan['host']`` (timing CU + ``cycles_*`` register names).
+
+    Modes:
+      ``benchmark``     single combined ``ddr_pl_aie_datamover`` CU (today's design);
+      ``memory_stream`` split ``mm2s`` + ``s2mm`` double-buffered CUs, plus a shared
+                        ``tick_gen`` timer CU when PL timing is on (separate CUs have
+                        independent ``ap_start``, so one timer gives a common time base);
+      ``external_stream`` not yet emitted (direct PLIO<->external PL wiring + traffic-gen).
+    """
+    mode = str(mode).lower()
+
+    if mode == 'benchmark':
+        # Benchmark is a cycle-accurate measurement harness -- the PL timers are its
+        # whole point, so force them ON regardless of EnablePLTiming.
+        if not enable_pl_timing:
+            print("[aie4ml] PLDataMoverMode='benchmark' forces PL timers ON "
+                  "(overriding EnablePLTiming=False).")
+            enable_pl_timing = True
+        name = _BENCHMARK_KERNEL
+        sc = [f'{name}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
+        sc += [f'ai_engine_0.PLIO_ofm_{s}:{name}.s_in_{s}' for s in range(n_ofm)]
+        # The combined CU owns tick_gen internally; the host reads its 7 cycles_* regs.
+        return {
+            'mode': mode,
+            'enable_pl_timing': enable_pl_timing,
+            'kernels': [_kernel_entry(name, _BENCHMARK_TEMPLATE_DIR)],
+            'nk': [f'{name}:1:{name}'],
+            'sc': sc,
+            'host': {
+                'timing_kernel': name,
+                'cycles': ['preload_done', 'first_send', 'last_send', 'first_recv',
+                           'last_recv', 'compute_done', 'total'],
+            },
+        }
+
+    if mode == 'memory_stream':
+        ifm_k, ofm_k = 'mm2s', 's2mm'
+        kernels = [_kernel_entry(ifm_k, _DEPLOYMENT_TEMPLATE_DIR),
+                   _kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR)]
+        nk = [f'{ifm_k}:1:{ifm_k}', f'{ofm_k}:1:{ofm_k}']
+        sc = [f'{ifm_k}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
+        sc += [f'ai_engine_0.PLIO_ofm_{s}:{ofm_k}.s_in_{s}' for s in range(n_ofm)]
+        host = {'timing_kernel': None, 'cycles': []}
+        if enable_pl_timing:
+            timer = 'tick_gen'
+            kernels.append(_kernel_entry(timer, _DEPLOYMENT_TEMPLATE_DIR))
+            nk.append(f'{timer}:1:{timer}')
+            # PL-to-PL event pulses give tick_gen a single time base across the two CUs.
+            sc += [
+                f'{ifm_k}.ev_first_send:{timer}.ev_first_send',
+                f'{ifm_k}.ev_last_send:{timer}.ev_last_send',
+                f'{ofm_k}.ev_first_recv:{timer}.ev_first_recv',
+                f'{ofm_k}.ev_last_recv:{timer}.ev_last_recv',
+                f'{ofm_k}.ev_done:{timer}.ev_done',
+            ]
+            host = {'timing_kernel': timer,
+                    'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total']}
+        return {'mode': mode, 'enable_pl_timing': enable_pl_timing,
+                'kernels': kernels, 'nk': nk, 'sc': sc, 'host': host}
+
+    if mode == 'external_stream':
+        raise NotImplementedError(
+            "PLDataMoverMode 'external_stream' is not yet emitted by the compiler "
+            '(direct PLIO<->external PL AXI-stream wiring + traffic-gen test pending).'
+        )
+    raise ValueError(f'unknown PLDataMoverMode {mode!r}.')
+
+
 def build_system_io(model_or_ctx) -> Dict[str, Any]:
     """Project the resolved IR + physical plan into the flat variable bag the PL/host
     templates in ``templates/system/`` consume.
@@ -93,10 +183,17 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
 
     in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
+    # Per-PLIO-tile feature slices come from the GRAPH BOUNDARY ports -- the single graph
+    # input and single graph output (already validated to be 1 each above). 
+    gin_port = next(iter(layout.inputs.values()))[0]  
+    gout_port = next(iter(layout.outputs.values()))[0]
+    in_feat_slice = gin_port.tiling_dimension[gin_port.slice_dimension]
+    out_feat_slice = gout_port.tiling_dimension[gout_port.slice_dimension]
+
+    # Per-layer RTP artifacts (weights/bias/...). layer_index counts every executed node
+    # (incl. param-less activations) so the RTP port suffix matches the app.cpp graph index.
     layers = []
     layer_index = 0
-    in_feat_slice = None
-    out_feat_slice = None
     for node in ctx.ir.logical:
         inst = ctx.ir.execution.get(node.name)
         if inst is None:
@@ -108,16 +205,6 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         parallelism = getattr(inst.config, 'parallelism', None)
         if parallelism is None:
             raise RuntimeError(f'{node.name}: RTP-bearing layer has no parallelism config.')
-        lhs_name = input_tensor_for_role(node, 'lhs').name
-        # input port layout
-        out_name = node.outputs[0].name
-        in_ports = layout.inputs[lhs_name]
-        in_port = in_ports[0] # PLIO port 0 representative (all shards same shape)
-        # output port layout
-        out_ports = layout.outputs[out_name]
-        out_port = out_ports[0]
-        in_feat_slice = in_port.tiling_dimension[in_port.slice_dimension]
-        out_feat_slice = out_port.tiling_dimension[out_port.slice_dimension]
         inst_name = sanitize_identifier(node.name)
         layers.append({
             'inst_name': inst_name,
@@ -134,8 +221,6 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
                 for a in artifacts
             ],
         })
-    if in_feat_slice is None or out_feat_slice is None:
-        raise RuntimeError('build_system_io found no RTP-bearing (weight) layer to source feat slices from.')
     # Top-level cas_* describe the graph-output-producing (last weight) layer.
     cas_num = layers[-1]['cas_num'] if layers else 1
     cas_length = layers[-1]['cas_length'] if layers else 1
@@ -154,8 +239,14 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     iterations = int(ctx.aie_config['Iterations'])
     # HLS storage impl for the data mover preload buffers: URAM (default) or BRAM.
     pl_mem_impl = 'BRAM' if str(ctx.aie_config.get('PLMemory', 'uram')).lower() == 'bram' else 'URAM'
-    # Optional PL cycle-counter instrumentation (tick_gen + cycles_* s_axilite regs).
-    enable_pl_timing = bool(ctx.aie_config.get('EnablePLTiming', True))
+    # PL data-path style (benchmark single CU vs split deployment movers). The plan tells
+    # the writer which kernels to render and the templates how to wire them, and resolves
+    # the effective PL timing (benchmark forces the timers on). Built once here and handed
+    # back via system_io['pl_plan'] so the Makefile render can reuse it.
+    pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
+    pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm,
+                            bool(ctx.aie_config.get('EnablePLTiming', True)))
+    enable_pl_timing = pl_plan['enable_pl_timing']
     return {
         'project_name': ctx.project_config.project_name,
         'platform': ctx.device.platform,
@@ -181,13 +272,15 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'cas_length': cas_length,
         'max_512_per_stream': max_512_per_stream,
         'layers': layers,
+        'pl_data_mover_mode': pl_data_mover_mode,
+        'pl_plan': pl_plan,
     }
 
 # ---------------------------------------------------------------------------
 # Host data.h generation (DDR-packed input) — target='hardware'
 #
-# The PL data mover (templates/firmware/pl/ddr_pl_aie_datamover.cpp.jinja) moves whole 512-bit
-# DDR words and round-robin stripes them across the N per-direction PLIO streams
+# The PL data movers (templates/firmware/pl/benchmark/ or pl/deployment/) move whole 512-bit
+# DDR words and round-robin stripe them across the N per-direction PLIO streams
 # (word i -> stream i % N). The host (host.cpp) replays this packed input each iteration.
 # This produces `host/data.h` with the packed input and the IO word sizes.
 # ---------------------------------------------------------------------------

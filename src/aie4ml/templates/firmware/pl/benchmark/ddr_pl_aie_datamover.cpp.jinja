@@ -1,9 +1,7 @@
 /*
-Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
-SPDX-License-Identifier: X11
+Copyright (C) 2026, Advent lab
 
 Three-phase ddr_pl_aie_datamover (v3) -- preload + AIE compute + postwrite.
-GENERATED from templates/ddr_pl_aie_datamover.cpp.j2 -- do not edit by hand.
 
 Design: {{ project_name }} ({{ in_feat }}->{{ out_feat }},
         {{ n_ifm }} IFM PLIO + {{ n_ofm }} OFM PLIO).
@@ -13,12 +11,7 @@ Top-level HLS DATAFLOW has only THREE processes:
    preload_and_send_proc    -- preload all IFM to URAM, then drain to PLIO
    recv_and_postwrite_proc  -- receive all OFM from PLIO to URAM, then store
 
-Each merged function owns its own LOCAL URAM buffers; nothing crosses the
-DATAFLOW boundary except the PLIO streams + trigger streams. Contiguous 512-bit
-DDR words are striped round-robin across the N per-direction buffers (word i ->
-stream i % N, row i / N); with N=1 this collapses to a plain contiguous copy.
-
-Within each merged function the phases are sequential by C++ semantics:
+Each merged function the phases are sequential by C++ semantics:
    preload_and_send_proc:
        preload_phase()    -- DRAM read into big_in_{0..N_IFM-1}
        trig_preload_done.write(true)
@@ -28,8 +21,6 @@ Within each merged function the phases are sequential by C++ semantics:
        trig_compute_done.write(true)
        postwrite_phase()  -- big_out -> DRAM write
 
-The AIE+PLIO compute pipeline overlaps naturally between the send phase of
-the first function and the recv phase of the second function.
 */
 
 #include <ap_int.h>
