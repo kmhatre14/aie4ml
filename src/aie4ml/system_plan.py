@@ -25,10 +25,31 @@ from .passes.utils import sanitize_identifier
 # per word, not the word size).
 _DDR_WORD_BYTES = 64
 
-# Compile-time cap on iterations the data mover preloads into PL URAM. Should ultimately be
-# derived from available PL URAM (URAM budget / per-iteration footprint), not the AIE sim
-# iteration count. Hardcoded until URAM-aware sizing lands.
-_DEFAULT_MAX_N_ITER = 64
+# The data mover runs iterations in fixed-size groups, so the usable iteration count must
+# be a whole multiple of this
+_ITERATIONS_PER_GROUP = 8
+
+def _max_preloadable_iterations(pl_budget: int, n_streams: int, ifm_per_stream: int, ofm_per_stream : int) -> int:
+    """Largest n_iter whose preload buffers fit the PL on-chip budget (URAM or BRAM, whichever
+    PLMemory selects), rounded down to a whole group of _ITERATIONS_PER_GROUP (leftover dropped).
+    """
+    # On-chip bytes one iteration's preload buffers occupy:
+    bytes_per_iter_ifm = int(n_streams) * int(ifm_per_stream) * _DDR_WORD_BYTES
+    bytes_per_iter_ofm = int(n_streams) * int(ofm_per_stream) * _DDR_WORD_BYTES
+    bytes_per_iter = bytes_per_iter_ifm + bytes_per_iter_ofm
+    if pl_budget <= 0:
+        raise RuntimeError('PL on-chip budget is unknown for this device (missing UltraRAM/BlockRAM geometry).')
+    iter_capacity = int(pl_budget) // bytes_per_iter
+    # Rounding to a whole number of groups (x - x % 8 = the largest multiple
+    # of 8 that is <= x), since partial groups can't run
+    possible_iters = iter_capacity - (iter_capacity % _ITERATIONS_PER_GROUP)
+    # Error if a full group does not exist, in that case per-iteration footprint is too large
+    if possible_iters < _ITERATIONS_PER_GROUP:
+        raise RuntimeError(
+            f'PL on-chip budget {pl_budget} B holds only {iter_capacity} preloaded iteration(s),'
+            f'the per-iteration IO footprint is too large for this device.'
+        )
+    return possible_iters
 
 # PL data-mover template locations. The benchmark mover lives under pl/benchmark/; the
 # deployment movers (memory_stream / external_stream) live under pl/deployment/.
@@ -232,13 +253,20 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         raise NotImplementedError(
             f'out_feat {out_feat} not divisible by cas_num {cas_num}; uneven output shard is not yet supported.'
         )
-    max_512_per_stream = max(
-        _stream_words_512(batch, in_feat, in_bytes, n_ifm, 'input'),
-        _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output'),
-    )
+    ifm_per_stream = _stream_words_512(batch, in_feat, in_bytes, n_ifm, 'input')
+    ofm_per_stream = _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output')
+    # The preload buffers are bound to URAM (default) or BRAM per PLMemory; size the iteration
+    # cap against whichever pool they actually land in. Budget is the block geometry
+    # (Blocks * BlockBytes); URAM falls back to a declared TotalBytes if blocks aren't given.
+    pl_memory = str(ctx.aie_config.get('PLMemory', 'uram')).lower()
+    if pl_memory == 'bram':
+        pl_budget_bytes = int(ctx.device.bram_blocks) * int(ctx.device.bram_block_bytes)
+    else:
+        pl_budget_bytes = int(ctx.device.uram_blocks) * int(ctx.device.uram_block_bytes) or int(ctx.device.uram_total_bytes)
+    max_n_iter = _max_preloadable_iterations(pl_budget_bytes, n_ifm + n_ofm, ifm_per_stream, ofm_per_stream)
     iterations = int(ctx.aie_config['Iterations'])
-    # HLS storage impl for the data mover preload buffers: URAM (default) or BRAM.
-    pl_mem_impl = 'BRAM' if str(ctx.aie_config.get('PLMemory', 'uram')).lower() == 'bram' else 'URAM'
+    # HLS storage impl for the data mover preload buffers, matching the pool sized above.
+    pl_mem_impl = 'BRAM' if pl_memory == 'bram' else 'URAM'
     # PL data-path style (benchmark single CU vs split deployment movers). The plan tells
     # the writer which kernels to render and the templates how to wire them, and resolves
     # the effective PL timing (benchmark forces the timers on). Built once here and handed
@@ -259,18 +287,15 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         'n_ofm': n_ofm,
         'batch': batch,
         'iterations': iterations,
-        # MAX_N_ITER sizes the data mover's on-chip URAM preload buffers
-        # (MAX_BIG_IN/OUT = MAX_512_PER_STREAM * MAX_N_ITER), so it must be driven by the PL
-        # URAM budget, NOT the AIE sim Iterations. TODO: derive from device URAM capacity vs
-        # max_512_per_stream; hardcoded for now.
-        'max_n_iter': _DEFAULT_MAX_N_ITER,
+        'max_n_iter': max_n_iter,
         'in_feat': in_feat,
         'out_feat': out_feat,
         'in_feat_slice': in_feat_slice,
         'out_feat_slice': out_feat_slice,
         'cas_num': cas_num,
         'cas_length': cas_length,
-        'max_512_per_stream': max_512_per_stream,
+        'ifm_per_stream': ifm_per_stream,
+        'ofm_per_stream': ofm_per_stream,
         'layers': layers,
         'pl_data_mover_mode': pl_data_mover_mode,
         'pl_plan': pl_plan,

@@ -29,7 +29,7 @@ static const int N_OFM_STREAMS = {{ n_ofm }};
 
 // One iteration's per-stream rows = (size_out/16)/N_OFM_STREAMS. Ping-pong buffers
 // are sized for a single iteration, independent of n_iter.
-static const int MAX_OFM_512_PER_STREAM = {{ max_512_per_stream }};
+static const int MAX_OFM_512_PER_STREAM = {{ ofm_per_stream }};
 {% if enable_pl_timing %}
 // One-beat timing event pulse to the shared tick_gen CU (sc=-wired). Data is
 // irrelevant -- the pulse's arrival is what tick_gen timestamps.
