@@ -32,12 +32,8 @@ _ITERATIONS_PER_GROUP = 8
 def _max_preloadable_iterations(pl_budget: int, n_streams: int, ifm_per_stream: int, ofm_per_stream : int) -> int:
     """Largest n_iter whose preload buffers fit the PL on-chip budget (URAM or BRAM, whichever
     PLMemory selects), rounded down to a whole group of _ITERATIONS_PER_GROUP (leftover dropped).
-
-    The data mover preloads ALL n_iter iterations on-chip, so the footprint is linear in n_iter:
-        footprint(n_iter) = n_streams * max_512_per_stream * _DDR_WORD_BYTES * n_iter
     """
     # On-chip bytes one iteration's preload buffers occupy:
-    #   (# input+output stream buffers) * (512-bit words each holds/iter) * (64 B/word)
     bytes_per_iter_ifm = int(n_streams) * int(ifm_per_stream) * _DDR_WORD_BYTES
     bytes_per_iter_ofm = int(n_streams) * int(ofm_per_stream) * _DDR_WORD_BYTES
     bytes_per_iter = bytes_per_iter_ifm + bytes_per_iter_ofm
@@ -267,7 +263,7 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         pl_budget_bytes = int(ctx.device.bram_blocks) * int(ctx.device.bram_block_bytes)
     else:
         pl_budget_bytes = int(ctx.device.uram_blocks) * int(ctx.device.uram_block_bytes) or int(ctx.device.uram_total_bytes)
-    max_n_iter = _max_preloadable_iterations(pl_budget_bytes, n_ifm + n_ofm, ifm_per_stream, ofm_per_stream) # MAX_512_PER_STREAM words/iteration
+    max_n_iter = _max_preloadable_iterations(pl_budget_bytes, n_ifm + n_ofm, ifm_per_stream, ofm_per_stream)
     iterations = int(ctx.aie_config['Iterations'])
     # HLS storage impl for the data mover preload buffers, matching the pool sized above.
     pl_mem_impl = 'BRAM' if pl_memory == 'bram' else 'URAM'
