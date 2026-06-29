@@ -73,12 +73,15 @@ class DeviceSpec:
     max_mem_out_ports: int
     dialect: str
     vector_bytes: int = 64
-    # PL on-chip URAM budget for the data mover preload buffers (bytes), and the URAM block
-    # geometry. Sourced from the device catalog's "UltraRAM" entry; 0 when the device does
-    # not declare it (only hardware-target system planning consumes it).
+    # PL on-chip budget for the data mover preload buffers, as block geometry. The buffers are
+    # bound to URAM or BRAM depending on PLMemory, so both pools are carried here; system
+    # planning picks the matching one. Sourced from the catalog's "UltraRAM"/"BlockRAM" entries;
+    # 0 when the device does not declare a pool (only hardware-target system planning uses these).
     uram_total_bytes: int = 0
     uram_block_bytes: int = 0
     uram_blocks: int = 0
+    bram_block_bytes: int = 0
+    bram_blocks: int = 0
 
     @classmethod
     def from_config(cls, platform: str, cfg: Dict[str, Any]) -> 'DeviceSpec':
@@ -93,6 +96,7 @@ class DeviceSpec:
             return int(source['BankMemBytes'])
 
         uram = cfg.get('UltraRAM', {}) or {}
+        bram = cfg.get('BlockRAM', {}) or {}
 
         return cls(
             platform=platform,
@@ -110,6 +114,8 @@ class DeviceSpec:
             uram_total_bytes=int(uram.get('TotalBytes', 0)),
             uram_block_bytes=int(uram.get('BlockBytes', 0)),
             uram_blocks=int(uram.get('Blocks', 0)),
+            bram_block_bytes=int(bram.get('BlockBytes', 0)),
+            bram_blocks=int(bram.get('Blocks', 0)),
         )
 
 
