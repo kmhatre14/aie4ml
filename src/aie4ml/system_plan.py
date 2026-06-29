@@ -25,28 +25,35 @@ from .passes.utils import sanitize_identifier
 # per word, not the word size).
 _DDR_WORD_BYTES = 64
 
-_MAX_N_ITER_GRANULARITY = 8 # Multiple of 512-bit DDR/AXI word
+# The data mover runs iterations in fixed-size groups, so the usable iteration count must
+# be a whole multiple of this
+_ITERATIONS_PER_GROUP = 8
 
-def _max_n_iter(uram_budget_bytes, n_streams, max_512_per_stream):
+def _max_preloadable_iterations(uram_budget: int, n_streams: int, max_512_per_stream: int) -> int:
+    """Largest n_iter whose preload buffers fit the PL URAM budget, rounded down to a whole
+    group of _ITERATIONS_PER_GROUP (leftover iterations are dropped).
+
+    The data mover preloads ALL n_iter iterations on-chip, so the footprint is linear in n_iter:
+        footprint(n_iter) = n_streams * max_512_per_stream * _DDR_WORD_BYTES * n_iter
     """
-    The data mover preloads ALL n_iter iterations on-chip footprint:
-        footprint(n_iter) = n_streams * MAX_512_PER_STREAM * _DDR_WORD_BYTES * n_iter
-    and the cap is rounded down to a multiple of 8
-    """
-    per_iteration_bytes = int(n_streams) * int(max_512_per_stream) * _DDR_WORD_BYTES
-    if per_iteration_bytes <= 0:
+    # On-chip URAM one iteration's preload buffers occupy:
+    #   (# input+output stream buffers) * (512-bit words each holds/iter) * (64 B/word)
+    bytes_per_iter = int(n_streams) * int(max_512_per_stream) * _DDR_WORD_BYTES
+    if bytes_per_iter <= 0:
         raise RuntimeError('cannot size MAX_N_ITER: per-iteration PL footprint is zero.')
-    if uram_budget_bytes <= 0:
+    if uram_budget <= 0:
         raise RuntimeError('PL URAM budget is unknown for this device')
-    fits = int(uram_budget_bytes) // per_iteration_bytes
-    aligned = fits - (fits % _MAX_N_ITER_GRANULARITY)
-    if aligned < _MAX_N_ITER_GRANULARITY:
+    iter_capacity = int(uram_budget) // bytes_per_iter
+    # Rounding to a whole number of groups (x - x % 8 = the largest multiple
+    # of 8 that is <= x), since partial groups can't run
+    possible_iters = iter_capacity - (iter_capacity % _ITERATIONS_PER_GROUP)
+    # Error if a full group does not exist, in that case per-iteration footprint is too large
+    if possible_iters < _ITERATIONS_PER_GROUP:
         raise RuntimeError(
-            f'PL URAM budget {uram_budget_bytes} B holds only {fits} preloaded iteration(s) '
-            f'at {per_iteration_bytes} B/iter -- under the {_MAX_N_ITER_GRANULARITY}-iteration '
-            f'minimum. The per-iteration IO footprint is too large for this device.'
+            f'PL URAM budget {uram_budget} B holds only {iter_capacity} preloaded iteration(s),'
+            f'the per-iteration IO footprint is too large for this device.'
         )
-    return aligned
+    return possible_iters
 
 # PL data-mover template locations. The benchmark mover lives under pl/benchmark/; the
 # deployment movers (memory_stream / external_stream) live under pl/deployment/.
@@ -254,7 +261,9 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         _stream_words_512(batch, in_feat, in_bytes, n_ifm, 'input'),
         _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output'),
     )
-    max_n_iter = _max_n_iter(int(ctx.device.uram_total_bytes), n_ifm + n_ofm, max_512_per_stream) # MAX_512_PER_STREAM words/iteration
+    # URAM budget is (Blocks * BlockBytes)
+    uram_budget_bytes = int(ctx.device.uram_blocks) * int(ctx.device.uram_block_bytes) or int(ctx.device.uram_total_bytes)
+    max_n_iter = _max_preloadable_iterations(uram_budget_bytes, n_ifm + n_ofm, max_512_per_stream) # MAX_512_PER_STREAM words/iteration
     iterations = int(ctx.aie_config['Iterations'])
     # HLS storage impl for the data mover preload buffers: URAM (default) or BRAM.
     pl_mem_impl = 'BRAM' if str(ctx.aie_config.get('PLMemory', 'uram')).lower() == 'bram' else 'URAM'
