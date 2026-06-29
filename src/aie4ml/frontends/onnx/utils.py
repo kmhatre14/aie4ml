@@ -139,10 +139,7 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
     resolved_aie_config = dict(merged)
     resolved_aie_config['Part'] = str(part_name)
 
-    # Validate + default the hardware-emission knobs the same way the hls4ml backend does
-    # (frontends/hls4ml/backend.py), so a raw AIEConfig dict can set target='hardware' and
-    # pl_memory cleanly. Target gates PL+host emission (emits_system); PLMemory selects the
-    # data mover's preload storage. Reject typos here instead of silently falling back to AIE-only.
+    # Validate + default the hardware-emission knobs
     target = str(resolved_aie_config.get('Target', 'aie')).lower()
     if target not in ('aie', 'hardware'):
         raise ValueError(f"AIEConfig.Target must be 'aie' or 'hardware', got {resolved_aie_config.get('Target')!r}.")
@@ -152,6 +149,18 @@ def create_context(config: Dict[str, Any], output_dir, project_name: str, stamp,
     if pl_memory not in ('uram', 'bram'):
         raise ValueError(f"AIEConfig.PLMemory must be 'uram' or 'bram', got {resolved_aie_config.get('PLMemory')!r}.")
     resolved_aie_config['PLMemory'] = pl_memory
+
+    # PL cycle-timer instrumentation (tick_gen + cycles_* regs). Default OFF
+    resolved_aie_config['EnablePLTiming'] = bool(resolved_aie_config.get('EnablePLTiming', False))
+
+    _pl_data_mover_modes = ('benchmark', 'memory_stream', 'external_stream')
+    pl_data_mover_mode = str(resolved_aie_config.get('PLDataMoverMode', 'benchmark')).lower()
+    if pl_data_mover_mode not in _pl_data_mover_modes:
+        raise ValueError(
+            f'AIEConfig.PLDataMoverMode must be one of {_pl_data_mover_modes}, got {pl_data_mover_mode!r}.'
+        )
+    resolved_aie_config['PLDataMoverMode'] = pl_data_mover_mode
+
 
     ctx = AIEBackendContext(
         device=device,
