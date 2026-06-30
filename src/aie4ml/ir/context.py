@@ -82,6 +82,13 @@ class DeviceSpec:
     uram_blocks: int = 0
     bram_block_bytes: int = 0
     bram_blocks: int = 0
+    # Per-block geometry (one RAM primitive): Depth x WidthBits. A 512-bit data-mover word is
+    # width-pinned to ceil(512/WidthBits) blocks and its depth rounds up to Depth. Defaults are
+    # the Versal AIE-ML values (URAM288 = 4096x72, RAMB36 SDP = 512x72) when a catalog omits them.
+    uram_depth: int = 4096
+    uram_width_bits: int = 72
+    bram_depth: int = 512
+    bram_width_bits: int = 72
 
     @classmethod
     def from_config(cls, platform: str, cfg: Dict[str, Any]) -> 'DeviceSpec':
@@ -116,6 +123,10 @@ class DeviceSpec:
             uram_blocks=int(uram.get('Blocks', 0)),
             bram_block_bytes=int(bram.get('BlockBytes', 0)),
             bram_blocks=int(bram.get('Blocks', 0)),
+            uram_depth=int(uram.get('Depth', 4096)),
+            uram_width_bits=int(uram.get('WidthBits', 72)),
+            bram_depth=int(bram.get('Depth', 512)),
+            bram_width_bits=int(bram.get('WidthBits', 72)),
         )
 
 

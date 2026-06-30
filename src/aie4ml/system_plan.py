@@ -29,27 +29,91 @@ _DDR_WORD_BYTES = 64
 # be a whole multiple of this
 _ITERATIONS_PER_GROUP = 8
 
-def _max_preloadable_iterations(pl_budget: int, n_streams: int, ifm_per_stream: int, ofm_per_stream : int) -> int:
-    """Largest n_iter whose preload buffers fit the PL on-chip budget (URAM or BRAM, whichever
-    PLMemory selects), rounded down to a whole group of _ITERATIONS_PER_GROUP (leftover dropped).
+def _max_preloadable_iterations(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
+                                ifm_per_stream: int, ofm_per_stream: int) -> int:
+    """Largest n_iter whose benchmark preload buffers fit the PL on-chip pool (URAM or BRAM,
+    whichever PLMemory selects), rounded down to a whole group of _ITERATIONS_PER_GROUP.
+
+    Counts BLOCKS, not bytes (see _onchip_blocks): the preload buffers store 512-bit words, so
+    each per-stream bank is width-pinned and its depth (per_stream * n_iter) rounds up to the
+    block depth. A byte budget would over-count and hand back an n_iter that then over-utilizes
+    at v++ link. Benchmark-only: that mover stages every iteration on-chip (one buffer per
+    stream, no ping-pong -> copies=1); the memory_stream movers stream instead.
     """
-    # On-chip bytes one iteration's preload buffers occupy:
-    bytes_per_iter_ifm = int(n_streams) * int(ifm_per_stream) * _DDR_WORD_BYTES
-    bytes_per_iter_ofm = int(n_streams) * int(ofm_per_stream) * _DDR_WORD_BYTES
-    bytes_per_iter = bytes_per_iter_ifm + bytes_per_iter_ofm
-    if pl_budget <= 0:
-        raise RuntimeError('PL on-chip budget is unknown for this device (missing UltraRAM/BlockRAM geometry).')
-    iter_capacity = int(pl_budget) // bytes_per_iter
-    # Rounding to a whole number of groups (x - x % 8 = the largest multiple
-    # of 8 that is <= x), since partial groups can't run
-    possible_iters = iter_capacity - (iter_capacity % _ITERATIONS_PER_GROUP)
-    # Error if a full group does not exist, in that case per-iteration footprint is too large
+    avail_blocks, depth, width, _ = _pl_pool(ctx, pl_memory)
+    if avail_blocks <= 0:
+        raise RuntimeError('PL on-chip budget is unknown for this device (missing UltraRAM/BlockRAM block geometry).')
+
+    def _blocks(n_iter: int) -> int:
+        return (_onchip_blocks(512, ifm_per_stream * n_iter, n_ifm, depth, width, copies=1)
+                + _onchip_blocks(512, ofm_per_stream * n_iter, n_ofm, depth, width, copies=1))
+
+    # Grow by whole groups while they still fit (block count is monotonic in n_iter).
+    possible_iters = 0
+    while _blocks(possible_iters + _ITERATIONS_PER_GROUP) <= avail_blocks:
+        possible_iters += _ITERATIONS_PER_GROUP
+    # Error if not even one group fits -- per-iteration footprint too large for this device.
     if possible_iters < _ITERATIONS_PER_GROUP:
         raise RuntimeError(
-            f'PL on-chip budget {pl_budget} B holds only {iter_capacity} preloaded iteration(s),'
-            f'the per-iteration IO footprint is too large for this device.'
+            f'PL on-chip pool ({avail_blocks} blocks) cannot hold one group of '
+            f'{_ITERATIONS_PER_GROUP} preloaded iterations (needs {_blocks(_ITERATIONS_PER_GROUP)} '
+            f'blocks); the per-iteration IO footprint is too large for this device.'
         )
     return possible_iters
+
+
+# A 512-bit data-mover word is WIDTH-PINNED to ceil(512/WidthBits)=8 blocks no matter how shallow it is 
+# which is why a shallow ping-pong buffer can exhaust the pool by block count even when its byte footprint
+# looks tiny. So the budgets below count blocks, not bytes.
+
+def _pl_pool(ctx, pl_memory: str):
+    """(blocks, depth, width_bits, label) for the on-chip RAM pool PLMemory selects, read from
+    the device catalog (aie_devices.json -> ctx.device)."""
+    d = ctx.device
+    if pl_memory == 'bram':
+        return int(d.bram_blocks), int(d.bram_depth), int(d.bram_width_bits), 'BRAM'
+    return int(d.uram_blocks), int(d.uram_depth), int(d.uram_width_bits), 'URAM'
+
+
+def _onchip_blocks(word_bits: int, rows: int, n_banks: int,
+                   block_depth: int, block_width_bits: int, copies: int = 2) -> int:
+    """RAM blocks for `copies` ping-pong buffers, each `n_banks` independent banks of `rows`
+    deep x `word_bits` wide. Width-pinned: ceil(word_bits/block_width_bits) blocks per bank,
+    depth rounded up to block_depth."""
+    width_blocks = math.ceil(int(word_bits) / int(block_width_bits))
+    depth_blocks = math.ceil(int(rows) / int(block_depth))
+    return int(copies) * int(n_banks) * width_blocks * depth_blocks
+
+
+def _stream_buffer_blocks(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
+                          ifm_per_stream: int, ofm_per_stream: int) -> int:
+    """Total URAM/BRAM blocks the memory_stream ping-pong buffers occupy (mm2s + s2mm) in the
+    pool PLMemory selects. mm2s = n_ifm banks x ifm_per_stream rows; s2mm = n_ofm x ofm_per_stream."""
+    _, depth, width, _ = _pl_pool(ctx, pl_memory)
+    return (_onchip_blocks(512, ifm_per_stream, n_ifm, depth, width)
+            + _onchip_blocks(512, ofm_per_stream, n_ofm, depth, width))
+
+
+def _check_memory_stream_fits(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
+                              ifm_per_stream: int, ofm_per_stream: int) -> int:
+    """If the memory_stream ping-pong buffers exceed
+    the on-chip pool, counted in BLOCKS. Suggests the other pool when it would fit. Returns blocks."""
+    avail, _, width, label = _pl_pool(ctx, pl_memory)
+    needed = _stream_buffer_blocks(ctx, pl_memory, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
+    if avail and needed > avail:
+        other = 'bram' if pl_memory == 'uram' else 'uram'
+        o_avail, _, _, o_label = _pl_pool(ctx, other)
+        o_needed = _stream_buffer_blocks(ctx, other, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
+        if o_avail and o_needed <= o_avail:
+            hint = f" PLMemory='{other}' would fit ({o_needed}/{o_avail} {o_label}); try that."
+        else:
+            hint = ' Reduce the PLIO count (coarser slice) or target a larger device.'
+        raise RuntimeError(
+            f'memory_stream buffers need {needed} {label} blocks but only {avail} are '
+            f'available (2 ping-pong x [{n_ifm} ifm + {n_ofm} ofm] banks; each 512-bit word '
+            f'pins {math.ceil(512 / width)} blocks/bank).' + hint
+        )
+    return needed
 
 # PL data-mover template locations. The benchmark mover lives under pl/benchmark/; the
 # deployment movers (memory_stream / external_stream) live under pl/deployment/.
@@ -255,26 +319,31 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         )
     ifm_per_stream = _stream_words_512(batch, in_feat, in_bytes, n_ifm, 'input')
     ofm_per_stream = _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output')
-    # The preload buffers are bound to URAM (default) or BRAM per PLMemory; size the iteration
-    # cap against whichever pool they actually land in. Budget is the block geometry
-    # (Blocks * BlockBytes); URAM falls back to a declared TotalBytes if blocks aren't given.
-    pl_memory = str(ctx.aie_config.get('PLMemory', 'uram')).lower()
-    if pl_memory == 'bram':
-        pl_budget_bytes = int(ctx.device.bram_blocks) * int(ctx.device.bram_block_bytes)
-    else:
-        pl_budget_bytes = int(ctx.device.uram_blocks) * int(ctx.device.uram_block_bytes) or int(ctx.device.uram_total_bytes)
-    max_n_iter = _max_preloadable_iterations(pl_budget_bytes, n_ifm + n_ofm, ifm_per_stream, ofm_per_stream)
     iterations = int(ctx.aie_config['Iterations'])
-    # HLS storage impl for the data mover preload buffers, matching the pool sized above.
+
+    # On-chip pool selection -- common to every mover (all bind_storage to URAM or BRAM).
+    pl_memory = str(ctx.aie_config.get('PLMemory', 'uram')).lower()
     pl_mem_impl = 'BRAM' if pl_memory == 'bram' else 'URAM'
-    # PL data-path style (benchmark single CU vs split deployment movers). The plan tells
-    # the writer which kernels to render and the templates how to wire them, and resolves
-    # the effective PL timing (benchmark forces the timers on). Built once here and handed
-    # back via system_io['pl_plan'] so the Makefile render can reuse it.
+
+    # PL data-path style (benchmark single CU vs split deployment movers). 
+    # Resolve the mode FIRST -- the on-chip budget below is mode-specific. 
     pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
     pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm,
                             bool(ctx.aie_config.get('EnablePLTiming', True)))
     enable_pl_timing = pl_plan['enable_pl_timing']
+
+    # On-chip budget is mode-specific, but BOTH count in BLOCKS -- the buffers are 512-bit
+    # words, so each per-stream bank is width-pinned to 8 URAM/BRAM blocks regardless of depth
+    # (a byte budget badly under-counts):
+    #   benchmark      preloads ALL n_iter on-chip -> cap n_iter to what the pool holds.
+    #   memory_stream  fixed 2-deep ping-pong buffers (n_iter unbounded) -> just verify they fit.
+    if pl_data_mover_mode == 'benchmark':
+        max_n_iter = _max_preloadable_iterations(ctx, pl_memory, n_ifm, n_ofm,
+                                                 ifm_per_stream, ofm_per_stream)
+    else:
+        # memory_stream: not preload-capped; fail early if the ping-pong won't fit the pool.
+        _check_memory_stream_fits(ctx, pl_memory, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
+        max_n_iter = iterations
     return {
         'project_name': ctx.project_config.project_name,
         'platform': ctx.device.platform,
