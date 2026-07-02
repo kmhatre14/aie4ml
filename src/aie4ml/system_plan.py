@@ -29,6 +29,11 @@ _DDR_WORD_BYTES = 64
 # be a whole multiple of this
 _ITERATIONS_PER_GROUP = 8
 
+# Fraction of the on-chip RAM pool the planner is allowed to spend on preload/stream buffers.
+# The model assumes perfect packing, but HLS's adds some overhead
+# Budgeting only 80% of the pool leaves headroom for the overhead 
+_PL_USABLE_FRACTION = 0.8
+
 def _max_preloadable_iterations(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
                                 ifm_per_stream: int, ofm_per_stream: int) -> int:
     """Largest n_iter whose benchmark preload buffers fit the PL on-chip pool (URAM or BRAM,
@@ -67,12 +72,14 @@ def _max_preloadable_iterations(ctx, pl_memory: str, n_ifm: int, n_ofm: int,
 # looks tiny. So the budgets below count blocks, not bytes.
 
 def _pl_pool(ctx, pl_memory: str):
-    """(blocks, depth, width_bits, label) for the on-chip RAM pool PLMemory selects, read from
-    the device catalog (aie_devices.json -> ctx.device)."""
+    """(usable_blocks, depth, width_bits, label) for the on-chip RAM pool PLMemory selects, read
+    from the device catalog (aie_devices.json -> ctx.device)."""
     d = ctx.device
     if pl_memory == 'bram':
-        return int(d.bram_blocks), int(d.bram_depth), int(d.bram_width_bits), 'BRAM'
-    return int(d.uram_blocks), int(d.uram_depth), int(d.uram_width_bits), 'URAM'
+        blocks, depth, width, label = int(d.bram_blocks), int(d.bram_depth), int(d.bram_width_bits), 'BRAM'
+    else:
+        blocks, depth, width, label = int(d.uram_blocks), int(d.uram_depth), int(d.uram_width_bits), 'URAM'
+    return int(blocks * _PL_USABLE_FRACTION), depth, width, label
 
 
 def _onchip_blocks(word_bits: int, rows: int, n_banks: int,
