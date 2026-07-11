@@ -179,7 +179,9 @@ class LowerToAieIr(ModelOptimizerPass):
             if epsilon is not None:
                 meta['epsilon'] = float(epsilon)
 
-        if layer.class_name == 'Activation':
+        # hls4ml's Softmax subclasses Activation but reports class_name='Softmax'
+        # (and lowers to op_type 'softmax'); it takes the same single 'lhs' input.
+        if layer.class_name in ('Activation', 'Softmax'):
             meta['input_roles'] = ['lhs']
             act = (layer.get_attr('activation', '') or '').lower()
             if act:

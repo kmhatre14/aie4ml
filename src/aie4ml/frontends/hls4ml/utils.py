@@ -117,6 +117,18 @@ def extract_layer_directives(layer, model) -> Dict[str, Any]:
     if io_route_cfg:
         directives['io_route'] = io_route_cfg
 
+    # Approximation family + its parameters (HCCS Softmax: B / S / Dmax calibration constants).
+    # Mirrors the ONNX frontend's normalize_directives so both frontends can lower Softmax.
+    approximation = cfg(layer, 'approximation')
+    if approximation is not None:
+        directives['approximation'] = str(approximation)
+
+    hccs_cfg = cfg(layer, 'hccs', {})
+    if hccs_cfg:
+        if not isinstance(hccs_cfg, dict):
+            raise TypeError(f'{layer.name}: hccs override must be a dict.')
+        directives['hccs'] = dict(hccs_cfg)
+
     return directives
 
 
