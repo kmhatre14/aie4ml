@@ -136,6 +136,17 @@ _BENCHMARK_TEMPLATE_DIR = 'pl/benchmark'
 _DEPLOYMENT_TEMPLATE_DIR = 'pl/deployment'
 
 
+def _ifm_mover_name(index: int) -> str:
+    """CU name for the memory_stream input mover serving the ``index``-th graph input PLIO port.
+
+    Port 0 keeps the historical bare name ``mm2s`` (so single-input designs are unchanged);
+    later ports get ``mm2s_2``, ``mm2s_3``, ... . All movers render from the one parameterized
+    ``mm2s.{cpp,cfg}.jinja`` (see :func:`_kernel_entry`'s ``template_base``), so any N is supported
+    with no extra template files.
+    """
+    return 'mm2s' if index == 0 else f'mm2s_{index + 1}'
+
+
 def emits_system(model_or_ctx) -> bool:
     """Return True when PL + host code should be emitted (``target='hardware'``).
 
@@ -172,12 +183,21 @@ def _stream_words_512(batch: int, feat: int, elem_bytes: int, n_streams: int, di
     return total_bytes // (_DDR_WORD_BYTES * int(n_streams))
 
 
-def _kernel_entry(name: str, template_dir: str) -> Dict[str, str]:
-    """One PL kernel for the writer (which templates to render) and the Makefile (.xo)."""
+def _kernel_entry(name: str, template_dir: str, context: Dict[str, Any] | None = None, template_base: str | None = None) -> Dict[str, Any]:
+    """One PL kernel for the writer (which templates to render) and the Makefile (.xo).
+
+    ``context`` holds per-kernel template overrides merged over the shared ``system_io`` bag
+    at render time (e.g. an mm2s mover's own ``n_streams`` / ``kernel_name``). ``template_base``
+    lets several CUs share ONE template file: the N input movers all render the single
+    parameterized ``mm2s.{cpp,cfg}.jinja`` to distinct ``mm2s`` / ``mm2s_2`` / ``mm2s_3`` ...
+    outputs. Defaults to ``name`` (one template file per kernel).
+    """
+    base = template_base or name
     return {
         'name': name,
-        'cpp_template': f'{template_dir}/{name}.cpp.jinja',
-        'cfg_template': f'{template_dir}/{name}.cfg.jinja',
+        'cpp_template': f'{template_dir}/{base}.cpp.jinja',
+        'cfg_template': f'{template_dir}/{base}.cfg.jinja',
+        'context': dict(context or {}),
     }
 
 
@@ -232,13 +252,29 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
         }
 
     if mode == 'memory_stream':
-        ifm_k, ofm_k = 'mm2s', 's2mm'
-        kernels = [_kernel_entry(ifm_k, _DEPLOYMENT_TEMPLATE_DIR), _kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR)]
-        nk = [f'{ifm_k}:1:{ifm_k}', f'{ofm_k}:1:{ofm_k}']
-        sc = [f'{ifm_k}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
+        ofm_k = 's2mm'
+        # One DDR->PLIO input mover (mm2s) CU PER graph input PLIO port. Each mover owns exactly one PLIO_ifm port and reads its own DDR buffer,
+        # so N input ports -> N byte-identical mm2s CUs. All N render from a single parameterized mm2s.{cpp,cfg}.jinja (template_base='mm2s'), differing only by kernel_name; mover i
+        # owns PLIO_ifm_i
+        ifm_movers = [_ifm_mover_name(i) for i in range(n_ifm)]
+        # pl_timing only wires a single nominated mover at a time so we need to disable it
+        if enable_pl_timing and len(ifm_movers) > 1:
+            print(
+                f"PLDataMoverMode='memory_stream' with {len(ifm_movers)} input movers "
+                'has no PL timers (byte-identical mm2s CUs cannot each own the shared tick_gen '
+                'event streams); using host-side timing (overriding EnablePLTiming=True).'
+            )
+            enable_pl_timing = False
+        kernels = []
+        for name in ifm_movers:
+            kernels.append(_kernel_entry(name, _DEPLOYMENT_TEMPLATE_DIR, {'n_streams': 1, 'kernel_name': name,}, template_base='mm2s'))
+        kernels.append(_kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR))
+        nk = [f'{name}:1:{name}' for name in ifm_movers] + [f'{ofm_k}:1:{ofm_k}']
+        sc = [f'{name}.s_out_0:ai_engine_0.PLIO_ifm_{i}' for i, name in enumerate(ifm_movers)]
         sc += [f'ai_engine_0.PLIO_ofm_{s}:{ofm_k}.s_in_{s}' for s in range(n_ofm)]
-        host = {'timing_kernel': None, 'cycles': []}
+        host = {'timing_kernel': None, 'cycles': [], 'ifm_movers': ifm_movers}
         if enable_pl_timing:
+            ifm_k = ifm_movers[0]
             timer = 'tick_gen'
             kernels.append(_kernel_entry(timer, _DEPLOYMENT_TEMPLATE_DIR))
             nk.append(f'{timer}:1:{timer}')
@@ -250,7 +286,7 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
                 f'{ofm_k}.ev_last_recv:{timer}.ev_last_recv',
                 f'{ofm_k}.ev_done:{timer}.ev_done',
             ]
-            host = {'timing_kernel': timer, 'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total']}
+            host = {'timing_kernel': timer, 'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total'], 'ifm_movers': ifm_movers,}
         return {
             'mode': mode,
             'enable_pl_timing': enable_pl_timing,
@@ -492,7 +528,10 @@ def _check_storage_width(port, tile) -> None:
 
 
 def pack_host_data(model_or_ctx, X=None):
-    """Return (ifm_packed, ofm_size_words) for one iteration, in the data mover DDR layout.
+    """Return (ifm_packed, ifm_packed_ports, ofm_size_words) for one iteration, in the data mover
+    DDR layout. ``ifm_packed`` is the combined round-robin buffer (benchmark's single mover);
+    ``ifm_packed_ports`` is one contiguous buffer per PLIO input port (memory_stream's per-port
+    movers each read one).
 
     Packs the quantized graph input into the DDR layout the host replays, and reports the
     output size (in 32-bit words) the host needs to size its output buffer. Both are
@@ -523,12 +562,14 @@ def pack_host_data(model_or_ctx, X=None):
         _check_storage_width(p, tile)
         in_tiles.append(tile)
     ifm_packed = _pack_ports_to_ddr(in_tiles, len(in_ports))
+    # Per-PLIO-port buffers: memory_stream instantiates one single-stream mm2s mover per input PLIO port, each reading its own DDR buffer
+    ifm_packed_ports = [_pack_ports_to_ddr([tile], 1) for tile in in_tiles]
 
     out_total_bytes = int(np.prod(out_port0.numpy_boundary_shape)) * (int(out_port0.dtype.width) // 8)
     if out_total_bytes % 4 != 0:
         raise NotImplementedError(f'graph output is {out_total_bytes} B, not a multiple of 4 B (uint32 host buffer).')
     ofm_size_words = out_total_bytes // 4
-    return ifm_packed, ofm_size_words
+    return ifm_packed, ifm_packed_ports, ofm_size_words
 
 
 def host_data_context(model_or_ctx, X=None) -> Dict[str, Any]:
@@ -538,9 +579,21 @@ def host_data_context(model_or_ctx, X=None) -> Dict[str, Any]:
     Python only prepares the values (masked to uint32); the writer renders
     ``templates/firmware/host/data.h.jinja``.
     """
-    ifm_packed, ofm_size_words = pack_host_data(model_or_ctx, X)
+    ifm_packed, ifm_packed_ports, ofm_size_words = pack_host_data(model_or_ctx, X)
+    ifm_ports = []
+    for i, arr in enumerate(ifm_packed_ports):
+        port = {
+            'index': i,
+            'data': [],
+            'size_words': int(len(arr))
+        }
+        for v in arr:
+            port['data'].append(int(v) & 0xFFFFFFFF)
+        ifm_ports.append(port)
     return {
         'ifm_packed': [int(v) & 0xFFFFFFFF for v in ifm_packed],
         'ifm_size_words': int(len(ifm_packed)),
+        # Per-PLIO-port buffers (memory_stream's per-port mm2s movers each read one)
+        'ifm_ports': ifm_ports,
         'ofm_size_words': int(ofm_size_words),
     }

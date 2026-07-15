@@ -4,4 +4,13 @@
 static const int IFM_SIZE_WORDS = {{ ifm_size_words }};
 static const int OFM_SIZE_WORDS = {{ ofm_size_words }};
 
+// Combined round-robin input (benchmark's single combined data mover reads this).
 static const uint32_t ifm_packed[IFM_SIZE_WORDS] = { {{ ifm_packed | join(', ') }} };
+{% if ifm_ports is defined %}
+
+// Per-PLIO-port input buffers: memory_stream's per-port mm2s movers each read one of these.
+{% for p in ifm_ports %}
+static const int IFM{{ p.index }}_SIZE_WORDS = {{ p.size_words }};
+static const uint32_t ifm{{ p.index }}_packed[IFM{{ p.index }}_SIZE_WORDS] = { {{ p.data | join(', ') }} };
+{% endfor %}
+{% endif %}
