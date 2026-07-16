@@ -97,34 +97,35 @@ def _onchip_blocks(
     return int(copies) * int(n_banks) * width_blocks * depth_blocks
 
 
-def _stream_buffer_blocks(ctx, pl_memory: str, n_ifm: int, n_ofm: int, ifm_per_stream: int, ofm_per_stream: int) -> int:
+def _stream_buffer_blocks(ctx, pl_memory: str, ifm_depths: List[int], n_ofm: int, ofm_per_stream: int) -> int:
     """Total URAM/BRAM blocks the memory_stream ping-pong buffers occupy (mm2s + s2mm) in the
-    pool PLMemory selects. mm2s = n_ifm banks x ifm_per_stream rows; s2mm = n_ofm x ofm_per_stream."""
+    pool PLMemory selects. mm2s = one single-stream bank per input PLIO port, each ``ifm_depths[i]``
+    rows deep (per-port -- different-sized inputs cost their own depth); s2mm = n_ofm x ofm_per_stream."""
     _, depth, width, _ = _pl_pool(ctx, pl_memory)
-    return _onchip_blocks(512, ifm_per_stream, n_ifm, depth, width) + _onchip_blocks(
-        512, ofm_per_stream, n_ofm, depth, width
-    )
+    ifm_blocks = sum(_onchip_blocks(512, d, 1, depth, width) for d in ifm_depths)
+    return ifm_blocks + _onchip_blocks(512, ofm_per_stream, n_ofm, depth, width)
 
 
 def _check_memory_stream_fits(
-    ctx, pl_memory: str, n_ifm: int, n_ofm: int, ifm_per_stream: int, ofm_per_stream: int
+ctx, pl_memory: str, ifm_depths: List[int], n_ofm: int, ofm_per_stream: int
 ) -> int:
-    """If the memory_stream ping-pong buffers exceed
-    the on-chip pool, counted in BLOCKS. Suggests the other pool when it would fit. Returns blocks."""
+    """If the memory_stream ping-pong buffers exceed the on-chip pool, counted in BLOCKS.
+    ``ifm_depths`` is the per-PLIO-input-port ping-pong depth list (one entry per single-stream
+    mm2s CU). Suggests the other pool when it would fit. Returns blocks."""
     avail, _, width, label = _pl_pool(ctx, pl_memory)
-    needed = _stream_buffer_blocks(ctx, pl_memory, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
+    needed = _stream_buffer_blocks(ctx, pl_memory, ifm_depths, n_ofm, ofm_per_stream)
     if avail and needed > avail:
         other = 'bram' if pl_memory == 'uram' else 'uram'
         o_avail, _, _, o_label = _pl_pool(ctx, other)
-        o_needed = _stream_buffer_blocks(ctx, other, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
+        o_needed = _stream_buffer_blocks(ctx, other, ifm_depths, n_ofm, ofm_per_stream)
         if o_avail and o_needed <= o_avail:
             hint = f" PLMemory='{other}' would fit ({o_needed}/{o_avail} {o_label}); try that."
         else:
             hint = ' Reduce the PLIO count (coarser slice) or target a larger device.'
         raise RuntimeError(
             f'memory_stream buffers need {needed} {label} blocks but only {avail} are '
-            f'available (2 ping-pong x [{n_ifm} ifm + {n_ofm} ofm] banks; each 512-bit word '
-            f'pins {math.ceil(512 / width)} blocks/bank).' + hint
+            f'available (2 ping-pong x [{len(ifm_depths)} ifm + {n_ofm} ofm] banks; each 512-bit '
+            f'word pins {math.ceil(512 / width)} blocks/bank).' + hint
         )
     return needed
 
@@ -170,6 +171,29 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int):
             f'graph {direction} {tensors[0]!r}: element count {total} is not divisible by batch {batch}.'
         )
     return total // int(batch), int(port0.dtype.width) // 8
+
+
+def _build_ifm_port_specs(inputs_map: Dict[str, Any], batch: int) -> List[Dict[str, int]]:
+    """One spec per graph-input PLIO port, ordered by GLOBAL port index (so spec i is the port
+    served by input mover i / wired to ``PLIO_ifm_i``).
+
+    Each input tensor is sharded across its own ports hence a port carries 512-bit words. 
+    Because that depth is derived per Tensor, differently-shaped inputs yield different depths -> non-byte-identical movers,
+    while a single tensor's shards stay uniform.
+    """
+    specs: List[Dict[str, int]] = []
+    for tname, ports in inputs_map.items():
+        p0 = ports[0]
+        elem_bytes = int(p0.dtype.width) // 8
+        total = int(math.prod(p0.numpy_boundary_shape))
+        if total % int(batch) != 0:
+            raise RuntimeError(f'graph input {tname!r}: element count {total} not divisible by batch {batch}.')
+        feat = total // int(batch)
+        per_port = _stream_words_512(batch, feat, elem_bytes, len(ports), 'input')
+        for p in ports:
+            specs.append({'port': int(p.port), 'ifm_per_stream': int(per_port), 'feat': int(feat), 'elem_bytes': elem_bytes})
+    specs.sort(key=lambda s: s['port'])
+    return specs
 
 
 def _stream_words_512(batch: int, feat: int, elem_bytes: int, n_streams: int, direction: str) -> int:
@@ -333,8 +357,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     templates in ``templates/system/`` consume.
 
     Reuses :func:`aie4ml.simulation.build_io_layout` for per-PLIO-port boundary/dtype data and
-    the dense/matmul execution entries for per-layer RTP (weight/bias) loading. Scope:
-    single graph input + single graph output, 512-bit-aligned sizes.
+    the dense/matmul execution entries for per-layer RTP (weight/bias) loading. Scope: N graph
+    input tensors (memory_stream -- one mm2s mover each), single graph output, 512-bit-aligned sizes.
     """
     from .simulation import build_io_layout
 
@@ -347,16 +371,26 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     n_ifm = int(plan['graph_input_count'])
     n_ofm = int(plan['graph_output_count'])
     batch = int(ctx.aie_config['BatchSize'])
-    if len(layout.inputs) != 1 or len(layout.outputs) != 1:
+    pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
+    if len(layout.outputs) != 1:
         raise RuntimeError(
-            f'system I/O plan supports a single graph tensor; '
-            f'got {len(layout.inputs)} and ({layout.outputs}). Multiple graph are not yet supported.'
+            f'system I/O plan supports a single graph OUTPUT tensor; got {len(layout.outputs)}. '
+            f'Multiple graph outputs are not yet supported.'
+        )
+    if len(layout.inputs) > 1 and pl_data_mover_mode != 'memory_stream':
+        raise RuntimeError(
+            f'multiple graph input tensors ({len(layout.inputs)}) require '
+            f"PLDataMoverMode='memory_stream' (each input needs its own mm2s mover); "
+            f'got {pl_data_mover_mode!r}.'
         )
 
-    in_feat, in_bytes = _single_io_feat(layout.inputs, 'input', batch)
+    # Per-PLIO-input-port ping-pong depths, ordered by global port index
+    ifm_port_specs = _build_ifm_port_specs(layout.inputs, batch)
+    ifm_port_depths = [s['ifm_per_stream'] for s in ifm_port_specs]
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
-    # Per-PLIO-tile feature slices come from the GRAPH BOUNDARY ports -- the single graph
-    # input and single graph output (already validated to be 1 each above).
+    # Aggregate input feature count / element bytes
+    in_feat, _ = _single_io_feat(layout.inputs, 'input', batch)
+    # Per-PLIO-tile feature slices come from the first graph boundary port of each direction
     gin_port = next(iter(layout.inputs.values()))[0]
     gout_port = next(iter(layout.outputs.values()))[0]
     in_feat_slice = gin_port.tiling_dimension[gin_port.slice_dimension]
@@ -398,15 +432,11 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     # Top-level cas_* describe the graph-output-producing (last weight) layer.
     cas_num = layers[-1]['cas_num'] if layers else 1
     cas_length = layers[-1]['cas_length'] if layers else 1
-    if in_feat % n_ifm != 0:
-        raise NotImplementedError(
-            f'in_feat {in_feat} not divisible by n_ifm {n_ifm}; uneven input shard is not yet supported.'
-        )
     if out_feat % cas_num != 0:
         raise NotImplementedError(
             f'out_feat {out_feat} not divisible by cas_num {cas_num}; uneven output shard is not yet supported.'
         )
-    ifm_per_stream = _stream_words_512(batch, in_feat, in_bytes, n_ifm, 'input')
+    ifm_per_stream = max(ifm_port_depths) if ifm_port_depths else 0
     ofm_per_stream = _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output')
     iterations = int(ctx.aie_config['Iterations'])
 
@@ -414,12 +444,18 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     pl_memory = str(ctx.aie_config.get('PLMemory', 'uram')).lower()
     pl_mem_impl = 'BRAM' if pl_memory == 'bram' else 'URAM'
 
-    # PL data-path style (benchmark single CU vs split deployment movers).
-    # Resolve the mode FIRST -- the on-chip budget below is mode-specific.
-    pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
     pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm, bool(ctx.aie_config.get('EnablePLTiming', True)))
     enable_pl_timing = pl_plan['enable_pl_timing']
 
+    # We need to provide each input with its own ping-pong depth: mover i (wired to PLIO_ifm_i) gets the depth
+    # of the i-th input PLIO port
+    if pl_data_mover_mode == 'memory_stream':
+        ifm_movers = pl_plan['host'].get('ifm_movers', [])
+        for kernel in pl_plan['kernels']:
+            for i in range(len(ifm_movers)):
+                if kernel['name'] == ifm_movers[i]:
+                    kernel['context']['ifm_per_stream'] = ifm_port_depths[i]
+                    break
     # On-chip budget is mode-specific, but BOTH count in BLOCKS -- the buffers are 512-bit
     # words, so each per-stream bank is width-pinned to 8 URAM/BRAM blocks regardless of depth
     # (a byte budget badly under-counts):
@@ -430,13 +466,13 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     if pl_data_mover_mode == 'benchmark':
         max_n_iter = _max_preloadable_iterations(ctx, pl_memory, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
     elif pl_data_mover_mode == 'external_stream':
-        # traffic_gen streams on the fly (no input buffer): zero input banks AND rows so only
-        # the s2mm (ofm) ping-pong is charged.
-        _check_memory_stream_fits(ctx, pl_memory, 0, n_ofm, 0, ofm_per_stream)
+        # traffic_gen streams on the fly (no input buffer): no ifm banks so only the s2mm (ofm)
+        # ping-pong is charged.
+        _check_memory_stream_fits(ctx, pl_memory, [], n_ofm, ofm_per_stream)
         max_n_iter = iterations
     else:
-        # memory_stream: not preload-capped; fail early if the ping-pong won't fit the pool.
-        _check_memory_stream_fits(ctx, pl_memory, n_ifm, n_ofm, ifm_per_stream, ofm_per_stream)
+        # memory_stream: not preload-capped; fail early if the per-port ping-pong won't fit the pool.
+        _check_memory_stream_fits(ctx, pl_memory, ifm_port_depths, n_ofm, ofm_per_stream)
         max_n_iter = iterations
     return {
         'project_name': ctx.project_config.project_name,
@@ -546,24 +582,38 @@ def pack_host_data(model_or_ctx, X=None):
 
     ctx = get_backend_context(model_or_ctx)
     layout = build_io_layout(ctx)
-    in_tensor = next(iter(layout.inputs))
-    in_ports = layout.inputs[in_tensor]
     out_port0 = layout.outputs[next(iter(layout.outputs))][0]
 
-    boundary = in_ports[0].numpy_boundary_shape  # full n-D shape; no (batch, feat) assumption
-
+    # One X per graph input tensor. Default: deterministic pseudo-random per tensor (its own seed
+    # so distinct inputs get distinct data). A user-supplied X may be a single array (one input)
+    # or a {tensor_name: array} dict (prepare_inputs handles both).
     if X is None:
-        X = np.random.default_rng(0).random(boundary, dtype=np.float64) * 2.0 - 1.0
+        X = {
+            tname: np.random.default_rng(seed).random(ports[0].numpy_boundary_shape, dtype=np.float64) * 2.0 - 1.0
+            for seed, (tname, ports) in enumerate(layout.inputs.items())
+        }
+    prepared = prepare_inputs(layout, X, iterations=1, quantize=True)  # {tensor: (1, *boundary)}
 
-    prepared = prepare_inputs(layout, X, iterations=1, quantize=True)[in_tensor]  # (1, *boundary)
-    in_tiles = []
-    for p in in_ports:
-        tile = _extract_port_tile(prepared, p)[0]  # this port's slice, storage dtype, n-D
-        _check_storage_width(p, tile)
-        in_tiles.append(tile)
-    ifm_packed = _pack_ports_to_ddr(in_tiles, len(in_ports))
-    # Per-PLIO-port buffers: memory_stream instantiates one single-stream mm2s mover per input PLIO port, each reading its own DDR buffer
-    ifm_packed_ports = [_pack_ports_to_ddr([tile], 1) for tile in in_tiles]
+    # Collect every input PLIO port's tile across ALL input tensors, ordered by global port index
+    # (so buffer i is what mm2s mover i / PLIO_ifm_i reads).
+    port_tiles = []  # (global_port_index, tile)
+    for tname, ports in layout.inputs.items():
+        for p in ports:
+            tile = _extract_port_tile(prepared[tname], p)[0]  # this port's slice, storage dtype, n-D
+            _check_storage_width(p, tile)
+            port_tiles.append((int(p.port), tile))
+    port_tiles.sort(key=lambda t: t[0])
+    tiles = [t for _, t in port_tiles]
+
+    # Per-PLIO-port buffers: memory_stream's per-port mm2s movers each read one (contiguous).
+    ifm_packed_ports = [_pack_ports_to_ddr([tile], 1) for tile in tiles]
+    # Combined round-robin buffer for benchmark's single mover. Requires equal per-port word
+    # counts; multi-tensor inputs (non-uniform) are memory_stream-only (guarded), so fall back to
+    # a concatenation there purely so data.h's ifm_packed[] exists (benchmark never reads it).
+    if len({len(a) for a in ifm_packed_ports}) <= 1 and tiles:
+        ifm_packed = _pack_ports_to_ddr(tiles, len(tiles))
+    else:
+        ifm_packed = np.concatenate(ifm_packed_ports) if ifm_packed_ports else np.zeros(0, dtype='<u4')
 
     out_total_bytes = int(np.prod(out_port0.numpy_boundary_shape)) * (int(out_port0.dtype.width) // 8)
     if out_total_bytes % 4 != 0:
