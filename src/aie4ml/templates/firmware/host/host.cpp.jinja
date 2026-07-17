@@ -212,6 +212,11 @@ int main(int argc, char* argv[])
     auto tick_gen_khdl = xrt::kernel(device, xclbin_uuid, "tick_gen",
                                      xrt::kernel::cu_access_mode::exclusive);
 {% endif %}
+{% for k in pl_plan.host.compute_kernels %}
+    // PL compute kernel for the offloaded '{{ k.source_layer }}' layer. The AIE graph is cut here:
+    // AIE -> PLIO_ofm -> {{ k.name }} ({{ k.n_in }} in / {{ k.n_out }} out) -> PLIO_ifm -> AIE.
+    auto {{ k.name }}_khdl = xrt::kernel(device, xclbin_uuid, "{{ k.name }}");
+{% endfor %}
     auto cghdl     = xrt::graph(device, xclbin_uuid, "dut");
 {% elif mode == 'external_stream' %}
     // traffic_gen (on-chip input source) and s2mm (output mover) are independent host-started
@@ -276,6 +281,14 @@ int main(int argc, char* argv[])
                                        (uint64_t)0, (uint64_t)0, (uint64_t)0,
                                        (uint64_t)0, (uint64_t)0);
 {% endif %}
+{% for k in pl_plan.host.compute_kernels %}
+    //   {{ k.name }}: (s_in_0..{{ k.n_in - 1 }}, s_out_0..{{ k.n_out - 1 }}, n_iter)  -- all streams sc-connected
+    // Start the PL compute CU BEFORE the movers. It is ap_ctrl_hs, so until the host starts it the
+    // AIE would stream into PLIO_ofm, fill the FIFOs, backpressure, and the far side of the cut
+    // would block forever on PLIO_ifm -- a hang, not an error. Blocking here on an empty s_in is
+    // harmless; the reverse order is not.
+    auto {{ k.name }}_rhdl = {{ k.name }}_khdl({{ (['nullptr'] * (k.n_in + k.n_out)) | join(', ') }}, n_iter);
+{% endfor %}
     cghdl.run(n_iter);
 {% for mover in pl_plan.host.ofm_movers %}
     auto {{ mover.name }}_rhdl = {{ mover.name }}_khdl(out_bohdl{{ loop.index0 }}, {{ (['nullptr'] * mover.n_streams) | join(', ') }}{% if enable_pl_timing %},
@@ -290,6 +303,9 @@ int main(int argc, char* argv[])
 {% endfor %}
 {% for mover in pl_plan.host.ofm_movers %}
     {{ mover.name }}_rhdl.wait();
+{% endfor %}
+{% for k in pl_plan.host.compute_kernels %}
+    {{ k.name }}_rhdl.wait();   // PL compute CU drained
 {% endfor %}
 {% if enable_pl_timing %}
     tick_gen_rhdl.wait();   // completes when s2mm emits ev_done (stops the counter)

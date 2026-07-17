@@ -117,6 +117,19 @@ class AIEModel:
             )
 
         self._ensure_runtime_plan()
+
+        # A PL layer offload cuts the AIE graph, adding PLIO ports that only a PL kernel drives. The
+        # AIE-only simulators cannot feed or drain those, so the array alone cannot produce a correct
+        # result -- fail loudly rather than return quietly wrong numbers.
+        pl_cuts = ctx.ir.physical.plan.get('pl_cuts') or []
+        if pl_cuts:
+            offloaded = ', '.join(str(cut.get('source_layer', '?')) for cut in pl_cuts)
+            raise NotImplementedError(
+                f'predict() is not supported for a model with a PL layer offload ({offloaded}). The '
+                'graph cut routes data out to a PL kernel and back, and the AIE simulators have no '
+                "PL. Verify on hardware instead: build(make_target='hw_emu') or build()."
+            )
+
         layout = build_io_layout(self)
         iterations = int(ctx.aie_config['Iterations'])
         plio_width = ctx.device.plio_width_bits

@@ -1,0 +1,77 @@
+/*
+Copyright (C) 2026, Advent lab
+
+{{ kernel_name }} -- DUMMY PL compute kernel standing in for the offloaded '{{ source_layer }}' layer.
+Design: {{ project_name }} ({{ n_in }} stream(s) in / {{ n_out }} out, {{ beats_per_iter }} beats per stream per iteration).
+
+The AIE graph is CUT at this layer, so the data path detours through the fabric:
+    AIE -> PLIO_ofm -> {{ kernel_name }} -> PLIO_ifm -> AIE
+
+This is NOT softmax yet. It applies a hardcoded elementwise add so the kernel's effect is
+OBSERVABLE end-to-end: an identity pass-through is indistinguishable from a plain wire, so a
+passing test would not prove the data actually transited the fabric. The board output must equal
+dense(x + ADD_CONST). Set ADD_CONST = 0 to recover the identity as a control run.
+*/
+
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <ap_axi_sdata.h>
+
+// Stream count is symmetric by construction (pl_offload rejects a cut that would re-shard), so
+// s_in_k feeds s_out_k and one loop covers both.
+static const int N_STREAMS      = {{ n_in }};
+static const int BEATS_PER_ITER = {{ beats_per_iter }};
+static const int LANES_PER_BEAT = 16;   // 128-bit beat / 8-bit element
+
+// The dummy op: y = x + ADD_CONST on every int8 lane. Wraps (no saturation), so the host can
+// reproduce it exactly in numpy with (x + ADD_CONST).astype(np.int8).
+static const ap_int<8> ADD_CONST = 3;
+
+extern "C" {
+
+// s_in_*  : 128-bit AXI-stream from AIE PLIO_ofm_* (the cut leaving the array).
+// s_out_* : 128-bit AXI-stream to   AIE PLIO_ifm_* (the cut re-entering the array).
+// n_iter  : number of iterations to process. Host-started (ap_ctrl_hs), like mm2s/s2mm.
+void {{ kernel_name }}(
+{% for s in range(n_in) %}
+    hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
+{% endfor %}
+{% for s in range(n_out) %}
+    hls::stream<ap_axis<128, 0, 0, 0>>& s_out_{{ s }},
+{% endfor %}
+    int n_iter) {
+{% for s in range(n_in) %}
+#pragma HLS INTERFACE axis port=s_in_{{ s }}
+{% endfor %}
+{% for s in range(n_out) %}
+#pragma HLS INTERFACE axis port=s_out_{{ s }}
+{% endfor %}
+#pragma HLS INTERFACE s_axilite port=n_iter bundle=control
+#pragma HLS INTERFACE s_axilite port=return bundle=control
+
+    for (int iter = 0; iter < n_iter; iter++) {
+        for (int b = 0; b < BEATS_PER_ITER; b++) {
+        #pragma HLS PIPELINE II=1
+            // Re-generate TLAST from the beat count -- do NOT forward the AIE's x.last. s2mm reads
+            // a fixed beat count and ignores .last, while mm2s ASSERTS it on the last beat into the
+            // array, so the AIE PLIO downstream of us expects a framed stream and we must frame it.
+            ap_uint<1> tlast = (b == BEATS_PER_ITER - 1) ? 1 : 0;
+
+{% for s in range(n_in) %}
+            ap_axis<128, 0, 0, 0> x{{ s }} = s_in_{{ s }}.read();
+            ap_uint<128> y{{ s }};
+            for (int e = 0; e < LANES_PER_BEAT; e++) {
+            #pragma HLS UNROLL
+                ap_int<8> v{{ s }} = x{{ s }}.data.range(e * 8 + 7, e * 8);
+                y{{ s }}.range(e * 8 + 7, e * 8) = (ap_int<8>)(v{{ s }} + ADD_CONST);
+            }
+            x{{ s }}.data = y{{ s }};
+            x{{ s }}.keep = -1;
+            x{{ s }}.last = tlast;
+            s_out_{{ s }}.write(x{{ s }});
+{% endfor %}
+        }
+    }
+}
+
+}

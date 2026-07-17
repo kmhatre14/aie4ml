@@ -105,6 +105,14 @@ def normalize_directives(name: str, raw: Any) -> Dict[str, Any]:
             raise TypeError(f'{name}: hccs override must be a dict.')
         directives['hccs'] = dict(hccs_cfg)
 
+    # Execution domain: 'aie' (default) or 'pl' (offload to the FPGA fabric; cuts the AIE graph).
+    if 'run_on' in raw:
+        run_on = str(raw['run_on']).lower()
+        if run_on not in ('aie', 'pl'):
+            raise ValueError(f"{name}: run_on must be 'aie' or 'pl', got {run_on!r}.")
+        if run_on == 'pl':
+            directives['run_on'] = 'pl'
+
     return directives
 
 

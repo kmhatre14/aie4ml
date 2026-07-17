@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Any, Dict, List
 
 from ...aie_types import AIEDataType
@@ -95,6 +96,7 @@ class _MemoryPlanMaterializer:
             'direct_edges': self.direct_edges,
             'graph_input_count': self._max_graph_input_port + 1,
             'graph_output_count': self._next_graph_output_port,
+            'pl_cuts': [asdict(cut) for cut in self.ctx.ir.logical.pl_cuts],
         }
 
     # ------------------------------------------------------------------

@@ -129,6 +129,14 @@ def extract_layer_directives(layer, model) -> Dict[str, Any]:
             raise TypeError(f'{layer.name}: hccs override must be a dict.')
         directives['hccs'] = dict(hccs_cfg)
 
+    # Execution domain for this layer: 'aie' (default, on the AIE array) or 'pl' (offloaded to
+    # the FPGA fabric
+    run_on = str(cfg(layer, 'run_on', 'aie')).lower()
+    if run_on not in ('aie', 'pl'):
+        raise ValueError(f"{layer.name}: run_on must be 'aie' or 'pl', got {run_on!r}.")
+    if run_on == 'pl':
+        directives['run_on'] = 'pl'
+
     return directives
 
 

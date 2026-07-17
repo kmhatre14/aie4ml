@@ -18,6 +18,7 @@ import numpy as np
 
 from .ir import get_backend_context
 from .passes.utils import sanitize_identifier
+from .pl_offload import resolve_pl_offload
 
 # Bytes in one 512-bit DDR/AXI word -- the unit the PL data mover transfers.
 # This is a transport constant (matches the kernel's ap_uint<512> m_axi word); it is
@@ -186,19 +187,15 @@ def emits_system(model_or_ctx) -> bool:
     return str(ctx.aie_config.get('Target', 'aie')).lower() == 'hardware'
 
 
-def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int):
-    """Return (per-sample feature count, element bytes) for a single graph IO tensor.
-
+def _io_feat(ports: List[Any], tensor: str, direction: str, batch: int):
+    """Return (per-sample feature count, element bytes) for one graph IO tensor.
     Supports exactly one graph input and one graph output (multiple graph I/O tensors are
     not yet supported).
     """
-    tensors = list(ports_map)
-    port0 = ports_map[tensors[0]][0]
+    port0 = ports[0]
     total = int(math.prod(port0.numpy_boundary_shape))
     if total % int(batch) != 0:
-        raise RuntimeError(
-            f'graph {direction} {tensors[0]!r}: element count {total} is not divisible by batch {batch}.'
-        )
+        raise RuntimeError(f'graph {direction} {tensor!r}: element count {total} is not divisible by batch {batch}.')
     return total // int(batch), int(port0.dtype.width) // 8
 
 
@@ -299,8 +296,30 @@ def _kernel_entry(name: str, template_dir: str, context: Dict[str, Any] | None =
     }
 
 
+def _compute_kernel_entry(spec) -> Dict[str, Any]:
+    """One PL COMPUTE kernel (an offloaded layer) for the writer + Makefile.
+    """
+    return {
+        'name': spec.name,
+        'cpp_template': spec.cpp_template,
+        'cfg_template': spec.cfg_template,
+        'context': {
+            'kernel_name': spec.name,
+            'source_layer': spec.source_layer,
+            'n_in': spec.n_in,
+            'n_out': spec.n_out,
+            'beats_per_iter': spec.beats_per_iter,
+        },
+    }
+
+
 def build_pl_plan(
-    mode: str, ifm_tensors: List[Dict[str, int]], ofm_tensors: List[Dict[str, int]], enable_pl_timing: bool
+    mode: str,
+    *, 
+    ifm_tensors: List[Dict[str, int]], 
+    ofm_tensors: List[Dict[str, int]], 
+    pl_kernels: List[Any] = (),
+    enable_pl_timing: bool,
 ) -> Dict[str, Any]:
     """Describe the PL data path for a given ``PLDataMoverMode``: which kernels to emit,
     the v++ linker connectivity (``nk=`` / ``sc=``), and the host's timing wiring.
@@ -315,7 +334,12 @@ def build_pl_plan(
       * the writer            -> ``plan['kernels']`` (which .cpp/.cfg templates to render),
       * ``Makefile.jinja``    -> kernel ``.xo`` list + per-kernel build,
       * ``system.cfg.jinja``  -> ``plan['nk']`` / ``plan['sc']`` connectivity,
-      * ``host.cpp.jinja``    -> ``plan['host']`` (timing CU + ``cycles_*`` register names).
+      * ``host.cpp.jinja``    -> ``plan['host']`` (timing CU, ``cycles_*`` regs, compute CUs).
+
+    Ports are passed as EXPLICIT lists, not counts. When a layer is offloaded to the PL, the movers
+    no longer own PLIO_ifm_0..n-1: the cut takes some of that numbering (in tutorial_4 mm2s gets
+    ifm 0-3 while the cut gets ifm 4-5, and the model output sits on ofm 2 *after* the cut's ofm
+    0-1). ``pl_offload.resolve_pl_offload`` computes the partition; this function only wires it.
 
     Modes:
       ``benchmark``     single combined ``ddr_pl_aie_datamover`` CU (today's design);
@@ -324,10 +348,18 @@ def build_pl_plan(
                         independent ``ap_start``, so one timer gives a common time base);
       ``external_stream`` on-chip HLS ``traffic_gen`` source -> AIE -> ``s2mm`` (a
                         synthesizable stand-in for an external AXI producer); PL timing off.
+
+    ``pl_kernels`` (PLKernelSpec) are the offloaded layers; only ``memory_stream`` supports them.
     """
     mode = str(mode).lower()
     n_ifm = sum(int(t['n_streams']) for t in ifm_tensors)  # total input PLIO ports
     n_ofm = sum(int(t['n_streams']) for t in ofm_tensors)  # total output PLIO ports
+    pl_kernels = list(pl_kernels or [])
+    if pl_kernels and mode != 'memory_stream':
+        # ExcisePLNodes already rejects this; re-checked here so a direct caller cannot mis-wire.
+        raise NotImplementedError(
+            f"PL layer offload requires PLDataMoverMode='memory_stream', got {mode!r}."
+        )
 
     if mode == 'benchmark':
         # Benchmark is a cycle-accurate measurement harness -- the PL timers are its
@@ -336,8 +368,8 @@ def build_pl_plan(
             print("[aie4ml] PLDataMoverMode='benchmark' forces PL timers ON " '(overriding EnablePLTiming=False).')
             enable_pl_timing = True
         name = _BENCHMARK_KERNEL
-        sc = [f'{name}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
-        sc += [f'ai_engine_0.PLIO_ofm_{s}:{name}.s_in_{s}' for s in range(n_ofm)]
+        sc = [f'{name}.s_out_{i}:ai_engine_0.PLIO_ifm_{p}' for i, p in enumerate(ifm_tensors[0]['ports'])]
+        sc += [f'ai_engine_0.PLIO_ofm_{p}:{name}.s_in_{i}' for i, p in enumerate(ofm_tensors[0]['ports'])]
         # The combined CU owns tick_gen internally; the host reads its 7 cycles_* regs.
         return {
             'mode': mode,
@@ -431,6 +463,19 @@ def build_pl_plan(
                 'ifm_movers': ifm_info,
                 'ofm_movers': ofm_info,
             }
+
+        for spec in pl_kernels:
+            kernels.append(_compute_kernel_entry(spec))
+            nk.append(f'{spec.name}:1:{spec.name}')
+            sc += [f'ai_engine_0.PLIO_ofm_{p}:{spec.name}.s_in_{i}'
+                   for i, p in enumerate(spec.cut_out_ports)]
+            sc += [f'{spec.name}.s_out_{i}:ai_engine_0.PLIO_ifm_{p}'
+                   for i, p in enumerate(spec.cut_in_ports)]
+        host['compute_kernels'] = [
+            {'name': s.name, 'n_in': s.n_in, 'n_out': s.n_out, 'source_layer': s.source_layer}
+            for s in pl_kernels
+        ]
+
         return {
             'mode': mode,
             'enable_pl_timing': enable_pl_timing,
@@ -494,8 +539,6 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         raise RuntimeError('build_system_io requires a materialized physical plan; run the pipeline first.')
 
     layout = build_io_layout(ctx)
-    n_ifm = int(plan['graph_input_count'])
-    n_ofm = int(plan['graph_output_count'])
     batch = int(ctx.aie_config['BatchSize'])
     pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
     # Multiple graph input OR output tensors are supported only by memory_stream (each gets its own
@@ -513,19 +556,32 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
             f'got {pl_data_mover_mode!r}.'
         )
 
+    # Partition the PLIO ports into the MODEL boundary (what the DDR movers own) and the PL cuts
+    boundary = resolve_pl_offload(ctx, layout)
+    model_inputs = {boundary.model_input_tensor: layout.inputs[boundary.model_input_tensor]}
+    model_outputs = {boundary.model_output_tensor: layout.outputs[boundary.model_output_tensor]}
+
     # Per-tensor movers, ordered by first PLIO port (one mm2s CU per input tensor, one s2mm CU per
     # output tensor -- a single sharded tensor stays one mover). (n_streams, per_stream) per tensor
     # drives the on-chip budget below and build_pl_plan's kernel contexts.
-    ifm_tensor_specs = _build_ifm_tensor_specs(layout.inputs, batch)
-    ofm_tensor_specs = _build_ofm_tensor_specs(layout.outputs, batch)
+    ifm_tensor_specs = _build_ifm_tensor_specs(model_inputs, batch)
+    ofm_tensor_specs = _build_ofm_tensor_specs(model_outputs, batch)
     ifm_banks = [(s['n_streams'], s['ifm_per_stream']) for s in ifm_tensor_specs]
     ofm_banks = [(s['n_streams'], s['ofm_per_stream']) for s in ofm_tensor_specs]
-    out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
-    # Aggregate input feature count / element bytes
-    in_feat, _ = _single_io_feat(layout.inputs, 'input', batch)
+    n_ifm = sum(s['n_streams'] for s in ifm_tensor_specs)  # model-boundary PLIO counts
+    n_ofm = sum(s['n_streams'] for s in ofm_tensor_specs)
+
+    out_feat, out_bytes = _io_feat(
+        layout.outputs[boundary.model_output_tensor], boundary.model_output_tensor, 'output', batch
+    )
+    in_feat, _ = _io_feat(
+        layout.inputs[boundary.model_input_tensor], boundary.model_input_tensor, 'input', batch
+    )
     # Per-PLIO-tile feature slices come from the first graph boundary port of each direction
-    gin_port = next(iter(layout.inputs.values()))[0]
-    gout_port = next(iter(layout.outputs.values()))[0]
+    # gin_port = next(iter(layout.inputs.values()))[0]
+    # gout_port = next(iter(layout.outputs.values()))[0]
+    gin_port = layout.inputs[boundary.model_input_tensor][0]
+    gout_port = layout.outputs[boundary.model_output_tensor][0]
     in_feat_slice = gin_port.tiling_dimension[gin_port.slice_dimension]
     out_feat_slice = gout_port.tiling_dimension[gout_port.slice_dimension]
 
@@ -581,10 +637,15 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     pl_memory = str(ctx.aie_config.get('PLMemory', 'uram')).lower()
     pl_mem_impl = 'BRAM' if pl_memory == 'bram' else 'URAM'
 
-    # One mm2s CU per input tensor + one s2mm CU per output tensor; build_pl_plan bakes each mover's
-    # n_streams / {ifm,ofm}_per_stream into its kernel context directly (no post-hoc injection here).
+    # PL data-path style (benchmark single CU vs split deployment movers). 
+    # Resolve the mode FIRST -- the on-chip budget below is mode-specific. 
+    # pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
     pl_plan = build_pl_plan(
-        pl_data_mover_mode, ifm_tensor_specs, ofm_tensor_specs, bool(ctx.aie_config.get('EnablePLTiming', True))
+        pl_data_mover_mode,
+        ifm_tensors=boundary.model_ifm_ports,
+        ofm_tensors=boundary.model_ofm_ports,
+        pl_kernels=boundary.kernels,
+        enable_pl_timing=bool(ctx.aie_config.get('EnablePLTiming', True)),
     )
     enable_pl_timing = pl_plan['enable_pl_timing']
 
@@ -710,11 +771,23 @@ def pack_host_data(model_or_ctx, X=None):
     of that are packed -- the same storage-dtype contract the weights path uses. n-D
     boundaries are handled via the full ``numpy_boundary_shape``.
     """
-    from .simulation import _extract_port_tile, build_io_layout, prepare_inputs
+    from .simulation import IOLayout, _extract_port_tile, build_io_layout, prepare_inputs
 
     ctx = get_backend_context(model_or_ctx)
     layout = build_io_layout(ctx)
-    out_port0 = layout.outputs[next(iter(layout.outputs))][0]
+    # Select the MODEL boundary explicitly: with a PL cut there are two input and two output
+    # tensors, and iteration order would otherwise pack the cut tensor instead of the model's.
+    bplan = resolve_pl_offload(ctx, layout)
+    in_tensor = bplan.model_input_tensor
+    in_ports = layout.inputs[in_tensor]
+    out_port0 = layout.outputs[bplan.model_output_tensor][0]
+
+    # prepare_inputs() prepares EVERY tensor in the layout it is handed. The cut tensors are graph
+    # inputs too, but the PL kernel drives them -- not the host -- so give it a model-only view.
+    model_layout = IOLayout(
+        inputs={in_tensor: in_ports},
+        outputs={bplan.model_output_tensor: layout.outputs[bplan.model_output_tensor]},
+    )
 
     # One X per graph input tensor. Default: deterministic pseudo-random per tensor (its own seed
     # so distinct inputs get distinct data). A user-supplied X may be a single array (one input)

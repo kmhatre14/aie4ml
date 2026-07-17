@@ -9,6 +9,7 @@ from .fold_views import FoldViewOps
 from .force_float_mode import ForceFloatMode
 from .fuse_activation import FuseActivationCasts
 from .pack import PackKernelArtifacts
+from .pl_excise import ExcisePLNodes
 from .placement import PlaceKernels
 from .resolve import Resolve
 from .transport import (
@@ -29,6 +30,7 @@ __all__ = [
     'FoldScale',
     'ForceFloatMode',
     'FoldViewOps',
+    'ExcisePLNodes',
     'CompactBufferRank',
     'LegalizeFanoutEntries',
     'LegalizeMemtilePortLimits',

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -97,6 +97,21 @@ def input_tensor_for_role(node: OpNode, role: str) -> TensorVar:
     raise ValueError(f'{node.name}: missing {role} tensor.')
 
 
+@dataclass(frozen=True)
+class PLCut:
+    """One layer excised from the AIE graph to run on the PL (see the ExcisePLNodes pass).
+
+    Cutting a node splits the AIE graph in two and turns its boundary tensors into PLIO
+    endpoints, so the data path becomes  AIE -> PLIO_ofm -> PL kernel -> PLIO_ifm -> AIE.
+    """
+
+    node_name: str  # IR node, e.g. 'softmax_0_aie'
+    source_layer: str  # frontend layer, e.g. 'softmax_0' -- names the PL kernel and its CU
+    cut_out_tensor: str  # the node's INPUT  -> now a graph output (AIE -> PL)
+    cut_in_tensor: str  # the node's OUTPUT -> now a graph input  (PL -> AIE)
+    width: int  # element width in bits; both sides must match (v1 is a bit-reinterpretation)
+
+
 @dataclass
 class LogicalIR:
     """
@@ -110,6 +125,8 @@ class LogicalIR:
     nodes: List[OpNode] = field(default_factory=list)
     input_tensor_names: List[str] = field(default_factory=list)
     output_tensor_names: List[str] = field(default_factory=list)
+    # Layers excised to run on the PL.
+    pl_cuts: List[PLCut] = field(default_factory=list)
 
     def add_tensor(self, tensor: TensorVar) -> None:
         if tensor.name in self.tensors:
@@ -132,7 +149,11 @@ class LogicalIR:
             self.output_tensor_names.append(tensor_name)
 
     def remove_node(self, node: OpNode, mode: str = 'bypass') -> None:
-        if len(node.inputs) == 1 and len(node.outputs) == 1:
+        # 'cut' is dispatched before the argument check: it has its own precondition (exactly one
+        # ACTIVATION input, parameters allowed) and validates it itself
+        if mode == 'cut':
+            self._cut_node(node)
+        elif len(node.inputs) == 1 and len(node.outputs) == 1:
             if mode == 'bypass':
                 self._bypass_node(node)
             elif mode == 'contract':
@@ -192,6 +213,39 @@ class LogicalIR:
         if not in_tv.consumers:
             self.tensors.pop(in_tv.name, None)
 
+    def _cut_node(self, node: OpNode):
+        """Excise a node so its boundary tensors become graph IO endpoints (PL offload).
+
+        Unlike the other removal modes, a cut KEEPS BOTH tensors alive, because each becomes a
+        distinct PLIO endpoint:
+          - the input tensor  keeps its producer, loses this consumer -> becomes a graph OUTPUT
+            (AIE -> PL, over PLIO_ofm)
+          - the output tensor keeps its consumers, loses its producer -> becomes a graph INPUT
+            (PL -> AIE, over PLIO_ifm)
+        """
+        # Parameters (weights/bias) ARE inputs in this IR -- see lower.py, which appends them to
+        # node.inputs alongside the activation.
+        params = [t for t in node.inputs if t.is_parameter]
+        if params:
+            raise ValueError(
+                f'Cannot cut node {node.name}: it has parameter input(s) {[t.name for t in params]}. '
+                'Offloading a layer with weights/bias to the PL is not supported -- there is no '
+                'path to ship RTP artifacts to a PL kernel.'
+            )
+
+        activations = [t for t in node.inputs if not t.is_parameter]
+        if len(activations) != 1 or len(node.outputs) != 1:
+            raise ValueError(
+                f'Cannot cut node {node.name}: requires exactly one activation input and one '
+                f'output, got {len(activations)} and {len(node.outputs)}.'
+            )
+
+        in_tv, out_tv = activations[0], node.outputs[0]
+        if node in in_tv.consumers:
+            in_tv.consumers.remove(node)
+        out_tv.producer = None
+        # Both tensors intentionally stay in self.tensors -- they are the two cut endpoints.
+
     def _detach_node(self, node: OpNode):
         """Fallback: Just cut the node out without merging tensors."""
         for t in node.inputs:
@@ -215,6 +269,14 @@ class LogicalIR:
         if not self.output_tensor_names:
             raise ValueError('LogicalIR.graph_outputs requires explicit output_tensor_names.')
         return [self.tensors[name] for name in self.output_tensor_names]
+
+    def cut_out_tensor_names(self) -> Set[str]:
+        """Graph-output tensors that feed a PL kernel (AIE -> PL), not real model outputs."""
+        return {cut.cut_out_tensor for cut in self.pl_cuts}
+
+    def cut_in_tensor_names(self) -> Set[str]:
+        """Graph-input tensors driven by a PL kernel (PL -> AIE), not real model inputs."""
+        return {cut.cut_in_tensor for cut in self.pl_cuts}
 
     def verify(self) -> None:
         """Assert structural invariants."""
