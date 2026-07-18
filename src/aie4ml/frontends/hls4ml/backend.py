@@ -17,6 +17,7 @@ from hls4ml.writer import get_writer
 from ...device_catalog import load_device_catalog
 from ...ir import get_backend_context
 from ...model import AIEModel
+from ...system_plan import normalize_pl_config
 
 log = logging.getLogger(__name__)
 
@@ -248,6 +249,7 @@ class AIEBackend(Backend):
             },
         }
 
+        normalize_pl_config(config['AIEConfig'])
         return config
 
     def build(self, model, make_target='all', env=None, log_to_stdout=True):
