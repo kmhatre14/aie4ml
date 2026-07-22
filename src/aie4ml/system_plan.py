@@ -97,34 +97,33 @@ def _onchip_blocks(
     return int(copies) * int(n_banks) * width_blocks * depth_blocks
 
 
-def _stream_buffer_blocks(ctx, pl_memory: str, ifm_depths: List[int], n_ofm: int, ofm_per_stream: int) -> int:
+def _stream_buffer_blocks(ctx, pl_memory: str, ifm_banks: List, n_ofm: int, ofm_per_stream: int) -> int:
     """Total URAM/BRAM blocks the memory_stream ping-pong buffers occupy (mm2s + s2mm) in the
-    pool PLMemory selects. mm2s = one single-stream bank per input PLIO port, each ``ifm_depths[i]``
-    rows deep (per-port -- different-sized inputs cost their own depth); s2mm = n_ofm x ofm_per_stream."""
+    pool PLMemory selects. mm2s = one CU per input tensor, each ``(n_streams, depth)`` in
+    ``ifm_banks`` (n_streams banks x depth rows -- differently-shaped inputs cost their own depth);
+    s2mm = n_ofm x ofm_per_stream."""
     _, depth, width, _ = _pl_pool(ctx, pl_memory)
-    ifm_blocks = sum(_onchip_blocks(512, d, 1, depth, width) for d in ifm_depths)
+    ifm_blocks = sum(_onchip_blocks(512, d, k, depth, width) for k, d in ifm_banks)
     return ifm_blocks + _onchip_blocks(512, ofm_per_stream, n_ofm, depth, width)
 
 
-def _check_memory_stream_fits(
-ctx, pl_memory: str, ifm_depths: List[int], n_ofm: int, ofm_per_stream: int
-) -> int:
+def _check_memory_stream_fits(ctx, pl_memory: str, ifm_banks: List, n_ofm: int, ofm_per_stream: int) -> int:
     """If the memory_stream ping-pong buffers exceed the on-chip pool, counted in BLOCKS.
-    ``ifm_depths`` is the per-PLIO-input-port ping-pong depth list (one entry per single-stream
-    mm2s CU). Suggests the other pool when it would fit. Returns blocks."""
+    ``ifm_banks`` is a ``(n_streams, ifm_per_stream)`` per input-tensor mover list. Suggests the
+    other pool when it would fit. Returns blocks."""
     avail, _, width, label = _pl_pool(ctx, pl_memory)
-    needed = _stream_buffer_blocks(ctx, pl_memory, ifm_depths, n_ofm, ofm_per_stream)
+    needed = _stream_buffer_blocks(ctx, pl_memory, ifm_banks, n_ofm, ofm_per_stream)
     if avail and needed > avail:
         other = 'bram' if pl_memory == 'uram' else 'uram'
         o_avail, _, _, o_label = _pl_pool(ctx, other)
-        o_needed = _stream_buffer_blocks(ctx, other, ifm_depths, n_ofm, ofm_per_stream)
+        o_needed = _stream_buffer_blocks(ctx, other, ifm_banks, n_ofm, ofm_per_stream)
         if o_avail and o_needed <= o_avail:
             hint = f" PLMemory='{other}' would fit ({o_needed}/{o_avail} {o_label}); try that."
         else:
             hint = ' Reduce the PLIO count (coarser slice) or target a larger device.'
         raise RuntimeError(
-            f'memory_stream buffers need {needed} {label} blocks but only {avail} are '
-            f'available (2 ping-pong x [{len(ifm_depths)} ifm + {n_ofm} ofm] banks; each 512-bit '
+            f'memory_stream buffers need {needed} {label} blocks but only {avail} are available '
+            f'(2 ping-pong x [{sum(k for k, _ in ifm_banks)} ifm + {n_ofm} ofm] banks; each 512-bit '
             f'word pins {math.ceil(512 / width)} blocks/bank).' + hint
         )
     return needed
@@ -173,13 +172,18 @@ def _single_io_feat(ports_map: Dict[str, Any], direction: str, batch: int):
     return total // int(batch), int(port0.dtype.width) // 8
 
 
-def _build_ifm_port_specs(inputs_map: Dict[str, Any], batch: int) -> List[Dict[str, int]]:
-    """One spec per graph-input PLIO port, ordered by GLOBAL port index (so spec i is the port
-    served by input mover i / wired to ``PLIO_ifm_i``).
+def _build_ifm_tensor_specs(inputs_map: Dict[str, Any], batch: int) -> List[Dict[str, int]]:
+    """One spec per graph INPUT TENSOR, ordered by its first (lowest) PLIO port index -- so spec j
+    is served by input mover j.
 
-    Each input tensor is sharded across its own ports hence a port carries 512-bit words. 
-    Because that depth is derived per Tensor, differently-shaped inputs yield different depths -> non-byte-identical movers,
-    while a single tensor's shards stay uniform.
+    Each tensor is delivered by ONE mm2s CU that feeds ALL of the tensor's PLIO streams: a single
+    sharded input therefore stays a single mover (matching the original single-input design), while
+    N distinct input tensors become N movers. Because the per-stream depth is derived per tensor,
+    differently-shaped inputs get differently-sized (non byte-identical) movers.
+
+    Fields: ``port_base`` (first PLIO_ifm port the tensor owns), ``n_streams`` (contiguous PLIO
+    ports it spans), ``ifm_per_stream`` (512-bit ping-pong depth per stream), ``size_words``
+    (32-bit words/iteration for the whole tensor -- the host mover's ``size_in``).
     """
     specs: List[Dict[str, int]] = []
     for tname, ports in inputs_map.items():
@@ -189,10 +193,17 @@ def _build_ifm_port_specs(inputs_map: Dict[str, Any], batch: int) -> List[Dict[s
         if total % int(batch) != 0:
             raise RuntimeError(f'graph input {tname!r}: element count {total} not divisible by batch {batch}.')
         feat = total // int(batch)
-        per_port = _stream_words_512(batch, feat, elem_bytes, len(ports), 'input')
-        for p in ports:
-            specs.append({'port': int(p.port), 'ifm_per_stream': int(per_port), 'feat': int(feat), 'elem_bytes': elem_bytes})
-    specs.sort(key=lambda s: s['port'])
+        n_streams = len(ports)
+        specs.append(
+            {
+                'tensor': tname,
+                'port_base': min(int(p.port) for p in ports),
+                'n_streams': n_streams,
+                'ifm_per_stream': _stream_words_512(batch, feat, elem_bytes, n_streams, 'input'),
+                'size_words': (int(batch) * feat * elem_bytes) // 4,
+            }
+        )
+    specs.sort(key=lambda s: s['port_base'])
     return specs
 
 
@@ -225,9 +236,13 @@ def _kernel_entry(name: str, template_dir: str, context: Dict[str, Any] | None =
     }
 
 
-def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> Dict[str, Any]:
+def build_pl_plan(mode: str, ifm_tensors: List[Dict[str, int]], n_ofm: int, enable_pl_timing: bool) -> Dict[str, Any]:
     """Describe the PL data path for a given ``PLDataMoverMode``: which kernels to emit,
     the v++ linker connectivity (``nk=`` / ``sc=``), and the host's timing wiring.
+
+    ``ifm_tensors`` is the per-graph-input-tensor spec list from :func:`_build_ifm_tensor_specs`
+    (``port_base`` / ``n_streams`` / ``ifm_per_stream``), one entry per input tensor. memory_stream
+    emits one mm2s CU per entry; the total input PLIO count is ``sum(n_streams)``.
 
     This is the single source of truth consumed by:
       * the writer            -> ``plan['kernels']`` (which .cpp/.cfg templates to render),
@@ -237,13 +252,14 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
 
     Modes:
       ``benchmark``     single combined ``ddr_pl_aie_datamover`` CU (today's design);
-      ``memory_stream`` split ``mm2s`` + ``s2mm`` double-buffered CUs, plus a shared
-                        ``tick_gen`` timer CU when PL timing is on (separate CUs have
+      ``memory_stream`` one ``mm2s`` CU per input tensor + one ``s2mm`` CU, double-buffered, plus a
+                        shared ``tick_gen`` timer CU when PL timing is on (separate CUs have
                         independent ``ap_start``, so one timer gives a common time base);
       ``external_stream`` on-chip HLS ``traffic_gen`` source -> AIE -> ``s2mm`` (a
                         synthesizable stand-in for an external AXI producer); PL timing off.
     """
     mode = str(mode).lower()
+    n_ifm = sum(int(t['n_streams']) for t in ifm_tensors)  # total input PLIO ports
 
     if mode == 'benchmark':
         # Benchmark is a cycle-accurate measurement harness -- the PL timers are its
@@ -277,32 +293,48 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
 
     if mode == 'memory_stream':
         ofm_k = 's2mm'
-        # One DDR->PLIO input mover (mm2s) CU PER graph input PLIO port. Each mover owns exactly one PLIO_ifm port and reads its own DDR buffer,
-        # so N input ports -> N byte-identical mm2s CUs. All N render from a single parameterized mm2s.{cpp,cfg}.jinja (template_base='mm2s'), differing only by kernel_name; mover i
-        # owns PLIO_ifm_i
-        ifm_movers = [_ifm_mover_name(i) for i in range(n_ifm)]
-        # pl_timing only wires a single nominated mover at a time so we need to disable it
+        # One DDR->PLIO input mover (mm2s) CU PER graph INPUT TENSOR. Each mover feeds ALL of its
+        # tensor's PLIO streams (N_IFM_STREAMS = the tensor's port count) and reads its own DDR
+        # buffer, so a single sharded input stays ONE mover (== the original single-input design)
+        # and N distinct input tensors -> N movers. All render from the one parameterized
+        # mm2s.{cpp,cfg}.jinja (template_base='mm2s'), differing only by kernel_name / n_streams /
+        # ifm_per_stream; mover j owns the contiguous PLIO_ifm range [port_base .. port_base+n_streams).
+        ifm_movers = [_ifm_mover_name(j) for j in range(len(ifm_tensors))]
+        # PL timing wires only ONE nominated mover to tick_gen's event streams; with >1 input mover
+        # that breaks, so disable it (host-side timing instead), mirroring external_stream.
         if enable_pl_timing and len(ifm_movers) > 1:
             print(
-                f"PLDataMoverMode='memory_stream' with {len(ifm_movers)} input movers "
-                'has no PL timers (byte-identical mm2s CUs cannot each own the shared tick_gen '
-                'event streams); using host-side timing (overriding EnablePLTiming=True).'
+                f"[aie4ml] PLDataMoverMode='memory_stream' with {len(ifm_movers)} input movers "
+                'has no PL timers (only one mover can own the shared tick_gen event streams); '
+                'using host-side timing (overriding EnablePLTiming=True).'
             )
             enable_pl_timing = False
         kernels = []
-        for name in ifm_movers:
-            kernels.append(_kernel_entry(name, _DEPLOYMENT_TEMPLATE_DIR, {'n_streams': 1, 'kernel_name': name,}, template_base='mm2s'))
+        nk = []
+        sc = []
+        for name, spec in zip(ifm_movers, ifm_tensors):
+            k = int(spec['n_streams'])
+            base = int(spec['port_base'])
+            kernels.append(
+                _kernel_entry(
+                    name,
+                    _DEPLOYMENT_TEMPLATE_DIR,
+                    {'n_streams': k, 'kernel_name': name, 'ifm_per_stream': int(spec['ifm_per_stream'])},
+                    template_base='mm2s',
+                )
+            )
+            nk.append(f'{name}:1:{name}')
+            sc += [f'{name}.s_out_{i}:ai_engine_0.PLIO_ifm_{base + i}' for i in range(k)]
         kernels.append(_kernel_entry(ofm_k, _DEPLOYMENT_TEMPLATE_DIR))
-        nk = [f'{name}:1:{name}' for name in ifm_movers] + [f'{ofm_k}:1:{ofm_k}']
-        sc = [f'{name}.s_out_0:ai_engine_0.PLIO_ifm_{i}' for i, name in enumerate(ifm_movers)]
+        nk.append(f'{ofm_k}:1:{ofm_k}')
         sc += [f'ai_engine_0.PLIO_ofm_{s}:{ofm_k}.s_in_{s}' for s in range(n_ofm)]
         host = {'timing_kernel': None, 'cycles': [], 'ifm_movers': ifm_movers}
         if enable_pl_timing:
-            ifm_k = ifm_movers[0]
+            ifm_k = ifm_movers[0]  # single input tensor here: its mover feeds tick_gen (as original)
             timer = 'tick_gen'
             kernels.append(_kernel_entry(timer, _DEPLOYMENT_TEMPLATE_DIR))
             nk.append(f'{timer}:1:{timer}')
-            # PL-to-PL event pulses give tick_gen a single time base across the two CUs.
+            # PL-to-PL event pulses give tick_gen a single time base across the CUs.
             sc += [
                 f'{ifm_k}.ev_first_send:{timer}.ev_first_send',
                 f'{ifm_k}.ev_last_send:{timer}.ev_last_send',
@@ -310,7 +342,7 @@ def build_pl_plan(mode: str, n_ifm: int, n_ofm: int, enable_pl_timing: bool) -> 
                 f'{ofm_k}.ev_last_recv:{timer}.ev_last_recv',
                 f'{ofm_k}.ev_done:{timer}.ev_done',
             ]
-            host = {'timing_kernel': timer, 'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total'], 'ifm_movers': ifm_movers,}
+            host = {'timing_kernel': timer, 'cycles': ['first_send', 'last_send', 'first_recv', 'last_recv', 'total'], 'ifm_movers': ifm_movers}
         return {
             'mode': mode,
             'enable_pl_timing': enable_pl_timing,
@@ -384,9 +416,11 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
             f'got {pl_data_mover_mode!r}.'
         )
 
-    # Per-PLIO-input-port ping-pong depths, ordered by global port index
-    ifm_port_specs = _build_ifm_port_specs(layout.inputs, batch)
-    ifm_port_depths = [s['ifm_per_stream'] for s in ifm_port_specs]
+    # Per-INPUT-TENSOR movers, ordered by first PLIO port (one mm2s CU per tensor -- a single
+    # sharded input stays one mover). (n_streams, ifm_per_stream) per tensor drives the on-chip
+    # budget below and build_pl_plan's kernel contexts.
+    ifm_tensor_specs = _build_ifm_tensor_specs(layout.inputs, batch)
+    ifm_banks = [(s['n_streams'], s['ifm_per_stream']) for s in ifm_tensor_specs]
     out_feat, out_bytes = _single_io_feat(layout.outputs, 'output', batch)
     # Aggregate input feature count / element bytes
     in_feat, _ = _single_io_feat(layout.inputs, 'input', batch)
@@ -436,7 +470,9 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         raise NotImplementedError(
             f'out_feat {out_feat} not divisible by cas_num {cas_num}; uneven output shard is not yet supported.'
         )
-    ifm_per_stream = max(ifm_port_depths) if ifm_port_depths else 0
+    # Scalar input depth for the single combined benchmark mover / comments (benchmark is
+    # single-input by the guard); memory_stream sizes each mover per-tensor via its kernel context.
+    ifm_per_stream = max((s['ifm_per_stream'] for s in ifm_tensor_specs), default=0)
     ofm_per_stream = _stream_words_512(batch, out_feat, out_bytes, n_ofm, 'output')
     iterations = int(ctx.aie_config['Iterations'])
 
@@ -444,18 +480,11 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     pl_memory = str(ctx.aie_config.get('PLMemory', 'uram')).lower()
     pl_mem_impl = 'BRAM' if pl_memory == 'bram' else 'URAM'
 
-    pl_plan = build_pl_plan(pl_data_mover_mode, n_ifm, n_ofm, bool(ctx.aie_config.get('EnablePLTiming', True)))
+    # One mm2s CU per input tensor; build_pl_plan bakes each mover's n_streams / ifm_per_stream
+    # into its kernel context directly (no post-hoc injection needed here).
+    pl_plan = build_pl_plan(pl_data_mover_mode, ifm_tensor_specs, n_ofm, bool(ctx.aie_config.get('EnablePLTiming', True)))
     enable_pl_timing = pl_plan['enable_pl_timing']
 
-    # We need to provide each input with its own ping-pong depth: mover i (wired to PLIO_ifm_i) gets the depth
-    # of the i-th input PLIO port
-    if pl_data_mover_mode == 'memory_stream':
-        ifm_movers = pl_plan['host'].get('ifm_movers', [])
-        for kernel in pl_plan['kernels']:
-            for i in range(len(ifm_movers)):
-                if kernel['name'] == ifm_movers[i]:
-                    kernel['context']['ifm_per_stream'] = ifm_port_depths[i]
-                    break
     # On-chip budget is mode-specific, but BOTH count in BLOCKS -- the buffers are 512-bit
     # words, so each per-stream bank is width-pinned to 8 URAM/BRAM blocks regardless of depth
     # (a byte budget badly under-counts):
@@ -471,8 +500,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
         _check_memory_stream_fits(ctx, pl_memory, [], n_ofm, ofm_per_stream)
         max_n_iter = iterations
     else:
-        # memory_stream: not preload-capped; fail early if the per-port ping-pong won't fit the pool.
-        _check_memory_stream_fits(ctx, pl_memory, ifm_port_depths, n_ofm, ofm_per_stream)
+        # memory_stream: not preload-capped; fail early if the per-tensor ping-pong won't fit the pool.
+        _check_memory_stream_fits(ctx, pl_memory, ifm_banks, n_ofm, ofm_per_stream)
         max_n_iter = iterations
     return {
         'project_name': ctx.project_config.project_name,
@@ -564,10 +593,10 @@ def _check_storage_width(port, tile) -> None:
 
 
 def pack_host_data(model_or_ctx, X=None):
-    """Return (ifm_packed, ifm_packed_ports, ofm_size_words) for one iteration, in the data mover
-    DDR layout. ``ifm_packed`` is the combined round-robin buffer (benchmark's single mover);
-    ``ifm_packed_ports`` is one contiguous buffer per PLIO input port (memory_stream's per-port
-    movers each read one).
+    """Return (ifm_packed, ifm_packed_tensors, ofm_size_words) for one iteration, in the data mover
+    DDR layout. ``ifm_packed`` is the combined buffer (benchmark's single mover); ``ifm_packed_tensors``
+    is one round-robin buffer per graph INPUT TENSOR (memory_stream's per-tensor mm2s movers each
+    read one), ordered by the tensor's first PLIO port.
 
     Packs the quantized graph input into the DDR layout the host replays, and reports the
     output size (in 32-bit words) the host needs to size its output buffer. Both are
@@ -594,32 +623,32 @@ def pack_host_data(model_or_ctx, X=None):
         }
     prepared = prepare_inputs(layout, X, iterations=1, quantize=True)  # {tensor: (1, *boundary)}
 
-    # Collect every input PLIO port's tile across ALL input tensors, ordered by global port index
-    # (so buffer i is what mm2s mover i / PLIO_ifm_i reads).
-    port_tiles = []  # (global_port_index, tile)
-    for tname, ports in layout.inputs.items():
+    # One DDR buffer per INPUT TENSOR (== one per mm2s mover), ordered by the tensor's first PLIO
+    # port. Each tensor's own PLIO-port tiles are round-robin interleaved into its buffer, exactly
+    # as the original single-input mover expects; a single sharded input yields exactly one buffer.
+    tensor_order = sorted(layout.inputs.items(), key=lambda kv: min(int(p.port) for p in kv[1]))
+    ifm_packed_tensors = []
+    for tname, ports in tensor_order:
+        tiles = []
         for p in ports:
             tile = _extract_port_tile(prepared[tname], p)[0]  # this port's slice, storage dtype, n-D
             _check_storage_width(p, tile)
-            port_tiles.append((int(p.port), tile))
-    port_tiles.sort(key=lambda t: t[0])
-    tiles = [t for _, t in port_tiles]
+            tiles.append(tile)
+        ifm_packed_tensors.append(_pack_ports_to_ddr(tiles, len(tiles)))
 
-    # Per-PLIO-port buffers: memory_stream's per-port mm2s movers each read one (contiguous).
-    ifm_packed_ports = [_pack_ports_to_ddr([tile], 1) for tile in tiles]
-    # Combined round-robin buffer for benchmark's single mover. Requires equal per-port word
-    # counts; multi-tensor inputs (non-uniform) are memory_stream-only (guarded), so fall back to
-    # a concatenation there purely so data.h's ifm_packed[] exists (benchmark never reads it).
-    if len({len(a) for a in ifm_packed_ports}) <= 1 and tiles:
-        ifm_packed = _pack_ports_to_ddr(tiles, len(tiles))
+    # Combined buffer for benchmark's single mover (single input by the guard): its one tensor's
+    # buffer. Multi-tensor is memory_stream-only, so concatenate purely so data.h's ifm_packed[]
+    # exists (benchmark never reads it there).
+    if len(ifm_packed_tensors) == 1:
+        ifm_packed = ifm_packed_tensors[0]
     else:
-        ifm_packed = np.concatenate(ifm_packed_ports) if ifm_packed_ports else np.zeros(0, dtype='<u4')
+        ifm_packed = np.concatenate(ifm_packed_tensors) if ifm_packed_tensors else np.zeros(0, dtype='<u4')
 
     out_total_bytes = int(np.prod(out_port0.numpy_boundary_shape)) * (int(out_port0.dtype.width) // 8)
     if out_total_bytes % 4 != 0:
         raise NotImplementedError(f'graph output is {out_total_bytes} B, not a multiple of 4 B (uint32 host buffer).')
     ofm_size_words = out_total_bytes // 4
-    return ifm_packed, ifm_packed_ports, ofm_size_words
+    return ifm_packed, ifm_packed_tensors, ofm_size_words
 
 
 def host_data_context(model_or_ctx, X=None) -> Dict[str, Any]:
@@ -629,21 +658,16 @@ def host_data_context(model_or_ctx, X=None) -> Dict[str, Any]:
     Python only prepares the values (masked to uint32); the writer renders
     ``templates/firmware/host/data.h.jinja``.
     """
-    ifm_packed, ifm_packed_ports, ofm_size_words = pack_host_data(model_or_ctx, X)
-    ifm_ports = []
-    for i, arr in enumerate(ifm_packed_ports):
-        port = {
-            'index': i,
-            'data': [],
-            'size_words': int(len(arr))
-        }
-        for v in arr:
-            port['data'].append(int(v) & 0xFFFFFFFF)
-        ifm_ports.append(port)
+    ifm_packed, ifm_packed_tensors, ofm_size_words = pack_host_data(model_or_ctx, X)
+    # One entry per input tensor (== per mm2s mover), index-aligned with pl_plan.host.ifm_movers.
+    ifm_ports = [
+        {'index': i, 'data': [int(v) & 0xFFFFFFFF for v in arr], 'size_words': int(len(arr))}
+        for i, arr in enumerate(ifm_packed_tensors)
+    ]
     return {
         'ifm_packed': [int(v) & 0xFFFFFFFF for v in ifm_packed],
         'ifm_size_words': int(len(ifm_packed)),
-        # Per-PLIO-port buffers (memory_stream's per-port mm2s movers each read one)
+        # Per-input-tensor buffers (memory_stream's per-tensor mm2s movers each read one).
         'ifm_ports': ifm_ports,
         'ofm_size_words': int(ofm_size_words),
     }
