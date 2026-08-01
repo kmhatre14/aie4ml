@@ -4,7 +4,7 @@ Copyright (C) 2026, Advent lab
 s2mm -- PLIO_ofm -> DDR streaming data mover (memory_stream deployment mode).
 GENERATED from templates/firmware/pl/deployment/s2mm.cpp.jinja -- do not edit by hand.
 
-Design: {{ project_name }} ({{ in_feat }}->{{ out_feat }}, {{ n_ofm }} OFM PLIO).
+Design: {{ project_name }} ({{ in_feat }}->{{ out_feat }}, {{ n_streams }} OFM PLIO).
 This kernel owns only the output side; MM2S is a separate CU (pl/mm2s.cpp).
 
 PING-PONG DOUBLE BUFFERING: each iteration is staged into one of two on-chip buffers;
@@ -25,7 +25,7 @@ shared tick_gen CU (sc=-wired), which owns the single free-running counter.
 #include <hls_stream.h>
 #include <ap_axi_sdata.h>
 
-static const int N_OFM_STREAMS = {{ n_ofm }};
+static const int N_OFM_STREAMS = {{ n_streams }};
 
 // One iteration's per-stream rows = (size_out/16)/N_OFM_STREAMS. Ping-pong buffers
 // are sized for a single iteration, independent of n_iter.
@@ -42,10 +42,10 @@ static void emit_event(hls::stream<ev_t>& ev) {
 }
 {% endif %}
 
-// Receive one iteration from the {{ n_ofm }} PLIO stream(s) into the per-stream buffer.
+// Receive one iteration from the {{ n_streams }} PLIO stream(s) into the per-stream buffer.
 // Per row, read 4 x 128b beats from each stream and assemble its 512-bit word.
 static void recv_plio(
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
                       hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
 {% endfor %}
                       ap_uint<512> buf[N_OFM_STREAMS][MAX_OFM_512_PER_STREAM],
@@ -55,16 +55,16 @@ static void recv_plio(
 #pragma HLS inline off
     if (enable) {
         for (int row = 0; row < rows_per_stream; row++) {
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
             ap_uint<128> slc_{{ s }}[4];
 {% endfor %}
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
             #pragma HLS ARRAY_PARTITION variable=slc_{{ s }} complete dim=1
 {% endfor %}
 
             for (int j = 0; j < 4; j++) {
             #pragma HLS PIPELINE II=1
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
                 ap_axis<128, 0, 0, 0> x{{ s }} = s_in_{{ s }}.read();
                 slc_{{ s }}[j] = x{{ s }}.data;
 {% endfor %}
@@ -73,7 +73,7 @@ static void recv_plio(
 {% endif %}
             }
 
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
             ap_uint<512> w{{ s }};
             w{{ s }}.range(127,   0) = slc_{{ s }}[0];
             w{{ s }}.range(255, 128) = slc_{{ s }}[1];
@@ -102,7 +102,7 @@ static void store_ddr(ap_uint<512> buf[N_OFM_STREAMS][MAX_OFM_512_PER_STREAM],
             int row_slot   = i / N_OFM_STREAMS;
             int stream_sel = i % N_OFM_STREAMS;
             ap_uint<512> w;
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
             {{ "if" if loop.first else "} else if" }} (stream_sel == {{ s }}) {
                 w = buf[{{ s }}][row_slot];
 {% endfor %}
@@ -116,10 +116,10 @@ extern "C" {
 
 // mem_out : 512-bit AXI-M (DDR), holds n_iter x size_out 32-bit words back-to-back.
 // s_in_*  : 128-bit AXI-stream from AIE PLIO_ofm_* (plio_128_bits).
-// size_out: 32-bit words per iteration, summed across all {{ n_ofm }} stream(s).
+// size_out: 32-bit words per iteration, summed across all {{ n_streams }} stream(s).
 // n_iter  : number of iterations to run.
-void s2mm(ap_uint<512>* mem_out,
-{% for s in range(n_ofm) %}
+void {{ kernel_name }}(ap_uint<512>* mem_out,
+{% for s in range(n_streams) %}
           hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
 {% endfor %}
 {% if enable_pl_timing %}
@@ -130,7 +130,7 @@ void s2mm(ap_uint<512>* mem_out,
           int size_out, int n_iter) {
 #pragma HLS INTERFACE m_axi port=mem_out offset=slave bundle=gmem_out \
     max_write_burst_length=16 num_write_outstanding=16
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
 #pragma HLS INTERFACE axis port=s_in_{{ s }}
 {% endfor %}
 {% if enable_pl_timing %}
@@ -144,7 +144,7 @@ void s2mm(ap_uint<512>* mem_out,
 #pragma HLS INTERFACE s_axilite port=return   bundle=control
 
     // Two ping-pong buffers, each one iteration deep. Partition on the stream
-    // dim so the {{ n_ofm }} stream(s) are independent banks.
+    // dim so the {{ n_streams }} stream(s) are independent banks.
     ap_uint<512> buff0[N_OFM_STREAMS][MAX_OFM_512_PER_STREAM];
     ap_uint<512> buff1[N_OFM_STREAMS][MAX_OFM_512_PER_STREAM];
     #pragma HLS ARRAY_PARTITION variable=buff0 complete dim=1
@@ -170,14 +170,14 @@ void s2mm(ap_uint<512>* mem_out,
 
         if (rd % 2 == 0) {
             recv_plio(
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
                       s_in_{{ s }},
 {% endfor %}
                       buff0, rows_per_stream, recv_en{% if enable_pl_timing %}, recv_iter0, ev_first_recv, ev_last_recv{% endif %});
             store_ddr(buff1, mem_out, rows_per_stream, rd - 1, store_en);
         } else {
             recv_plio(
-{% for s in range(n_ofm) %}
+{% for s in range(n_streams) %}
                       s_in_{{ s }},
 {% endfor %}
                       buff1, rows_per_stream, recv_en{% if enable_pl_timing %}, recv_iter0, ev_first_recv, ev_last_recv{% endif %});
