@@ -110,6 +110,9 @@ class PLCut:
     cut_out_tensor: str  # the node's INPUT  -> now a graph output (AIE -> PL)
     cut_in_tensor: str  # the node's OUTPUT -> now a graph input  (PL -> AIE)
     width: int  # element width in bits; both sides must match (v1 is a bit-reinterpretation)
+    reduces_features: bool = False  # op reduces over the feature axis (softmax/layer_norm), so the PL
+    # kernel needs COMPLETE feature rows per stream. When True, the transport delivers the cut
+    # batch-split (row-complete) instead of the default feature-split (see materialize row-join).
 
 
 @dataclass

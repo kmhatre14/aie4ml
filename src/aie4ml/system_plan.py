@@ -303,6 +303,9 @@ def _compute_kernel_entry(spec) -> Dict[str, Any]:
         'name': spec.name,
         'cpp_template': spec.cpp_template,
         'cfg_template': spec.cfg_template,
+        # The writer runs the hls4ml slicer (pl_hls4ml.generate_pl_kernel) for compute kernels to
+        # emit the op firmware and enrich these template_vars before rendering the AXIS wrapper.
+        'is_hls4ml_compute': True,
         'context': {
             'kernel_name': spec.name,
             'source_layer': spec.source_layer,

@@ -1,0 +1,115 @@
+/*
+Copyright (C) 2026, Advent lab
+
+{{ kernel_name }} -- AUTO-GENERATED PL compute kernel for the offloaded '{{ source_layer }}' layer.
+Design: {{ project_name }} ({{ n_in }} stream(s) in / {{ n_out }} out, {{ beats_per_iter }} beats/stream/iter).
+
+The AIE graph is CUT at this layer, so the data path detours through the fabric:
+    AIE -> PLIO_ofm -> {{ kernel_name }} -> PLIO_ifm -> AIE
+
+The op body is hls4ml-generated firmware (pl/{{ hls_proj }}/, produced by re-invoking hls4ml on the
+sliced sub-graph -- hls4ml UNMODIFIED). This file is only the AXIS glue: 128-bit beats <-> hls4ml's
+io_stream nnet::array, TLAST regeneration, ap_ctrl_hs. It is common across ops; only the parameters
+(types, feats, beats, the nnet:: call) differ.
+*/
+
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <ap_axi_sdata.h>
+
+#include "{{ hls_defines }}"  // input_t, result_t + the precision typedefs parameters.h references
+#include "{{ hls_params }}"    // {{ hls_cfg }}, {{ nnet_fn }}() + nnet_utils includes
+
+static const int FEATS           = {{ feats }};
+static const int ROWS_PER_STREAM = {{ rows_per_stream }};
+static const int BEATS_PER_ROW   = {{ beats_per_row }};
+static const int LANES_PER_BEAT  = {{ lanes_per_beat }};
+static const int LANE_BITS       = {{ lane_bits }};
+
+// Batch all rows ONE PLIO stream carries through a single op call at II=1 (matches the hand graft):
+// the generated config's per-row n_in is overridden to span the whole stream.
+struct {{ kernel_name }}_cfg : {{ hls_cfg }} {
+    static const unsigned n_in = ROWS_PER_STREAM * FEATS;
+};
+
+// --- DATAFLOW stage 1: gather AXIS beats -> one complete nnet::array row ---
+static void {{ kernel_name }}_read(hls::stream<ap_axis<128, 0, 0, 0>>& in, hls::stream<input_t>& sm_in) {
+    for (int r = 0; r < ROWS_PER_STREAM; r++) {
+        input_t x;
+        for (int b = 0; b < BEATS_PER_ROW; b++) {
+        #pragma HLS PIPELINE II=1
+            ap_axis<128, 0, 0, 0> beat = in.read();
+            for (int l = 0; l < LANES_PER_BEAT; l++) {
+            #pragma HLS UNROLL
+                x[b * LANES_PER_BEAT + l].range(LANE_BITS - 1, 0) =
+                    beat.data.range(l * LANE_BITS + LANE_BITS - 1, l * LANE_BITS);  // raw bit-reinterpret
+            }
+        }
+        sm_in.write(x);
+    }
+}
+
+// --- DATAFLOW stage 3: op-result rows -> truncated AXIS beats (+ regen TLAST) ---
+static void {{ kernel_name }}_write(hls::stream<result_t>& sm_out,
+                                    hls::stream<ap_axis<128, 0, 0, 0>>& out, bool last_iter) {
+    for (int r = 0; r < ROWS_PER_STREAM; r++) {
+        result_t y = sm_out.read();
+        for (int b = 0; b < BEATS_PER_ROW; b++) {
+        #pragma HLS PIPELINE II=1
+            ap_uint<128> packed = 0;
+            for (int l = 0; l < LANES_PER_BEAT; l++) {
+            #pragma HLS UNROLL
+                packed.range(l * LANE_BITS + LANE_BITS - 1, l * LANE_BITS) =
+                    y[b * LANES_PER_BEAT + l].range({{ trunc_hi }}, {{ trunc_lo }});
+            }
+            ap_axis<128, 0, 0, 0> beat;
+            beat.data = packed;
+            beat.keep = -1;
+            beat.last = (last_iter && r == ROWS_PER_STREAM - 1 && b == BEATS_PER_ROW - 1) ? 1 : 0;
+            out.write(beat);
+        }
+    }
+}
+
+// One PLIO stream: read complete rows -> hls4ml op (batched, II=1) -> write rows. DATAFLOW overlaps
+// read | compute | write.
+static void {{ kernel_name }}_stream(hls::stream<ap_axis<128, 0, 0, 0>>& in,
+                                     hls::stream<ap_axis<128, 0, 0, 0>>& out, bool last_iter) {
+#pragma HLS DATAFLOW
+    hls::stream<input_t>  sm_in;
+    hls::stream<result_t> sm_out;
+#pragma HLS STREAM variable=sm_in  depth=8
+#pragma HLS STREAM variable=sm_out depth=8
+    {{ kernel_name }}_read(in, sm_in);
+    {{ nnet_fn }}<input_t, result_t, {{ kernel_name }}_cfg>(sm_in, sm_out);
+    {{ kernel_name }}_write(sm_out, out, last_iter);
+}
+
+extern "C" {
+
+void {{ kernel_name }}(
+{% for s in range(n_in) %}
+    hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
+{% endfor %}
+{% for s in range(n_out) %}
+    hls::stream<ap_axis<128, 0, 0, 0>>& s_out_{{ s }},
+{% endfor %}
+    int n_iter) {
+{% for s in range(n_in) %}
+#pragma HLS INTERFACE axis port=s_in_{{ s }}
+{% endfor %}
+{% for s in range(n_out) %}
+#pragma HLS INTERFACE axis port=s_out_{{ s }}
+{% endfor %}
+#pragma HLS INTERFACE s_axilite port=n_iter bundle=control
+#pragma HLS INTERFACE s_axilite port=return bundle=control
+
+    for (int it = 0; it < n_iter; it++) {
+        bool last = (it == n_iter - 1);
+{% for s in range(n_in) %}
+        {{ kernel_name }}_stream(s_in_{{ s }}, s_out_{{ s }}, last);
+{% endfor %}
+    }
+}
+
+}

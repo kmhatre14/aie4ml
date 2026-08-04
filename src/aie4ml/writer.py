@@ -196,7 +196,21 @@ class AIEProjectEmitter:
         for kernel in system_io['pl_plan']['kernels']:
             name = kernel['name']
             # Per-kernel context (e.g. an mm2s mover's own n_streams) overrides the shared bag.
-            kernel_ctx = {**system_io, **kernel.get('context', {})}
+            extra_vars = {}
+            if kernel.get('is_hls4ml_compute'):
+                # Slice the layer out of the retained hls4ml ModelGraph, generate its HLS firmware
+                # under pl/<name>_hls/, and enrich the wrapper template vars (types, nnet call, etc.).
+                from .pl_hls4ml import generate_pl_kernel
+
+                tv = kernel.get('context', {})
+                extra_vars = generate_pl_kernel(
+                    ctx,
+                    name=name,
+                    source_layer=tv['source_layer'],
+                    beats_per_iter=tv['beats_per_iter'],
+                    out_dir=output_dir,
+                )
+            kernel_ctx = {**system_io, **kernel.get('context', {}), **extra_vars}
             self._render_template(env, kernel['cpp_template'], output_dir / 'pl' / f'{name}.cpp', kernel_ctx)
             self._render_template(env, kernel['cfg_template'], output_dir / 'pl' / f'{name}.cfg', kernel_ctx)
 

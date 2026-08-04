@@ -9,6 +9,11 @@ from typing import List
 from ..ir import PLCut, get_backend_context
 from .base import AIEPass
 
+# Ops that reduce over the feature axis and therefore need COMPLETE feature rows on the PL kernel
+# (each PLIO stream must carry whole rows, not feature-halves). Drives the mem-tile row-join in the
+# transport materialize pass. Elementwise ops (activations, add) are fine with the default split.
+_FEATURE_REDUCTION_OPS = frozenset({'softmax', 'layer_norm'})
+
 
 class ExcisePLNodes(AIEPass):
     """Cut layers marked ``run_on='pl'`` out of the AIE graph.
@@ -138,6 +143,7 @@ class ExcisePLNodes(AIEPass):
                 cut_out_tensor=in_tv.name,
                 cut_in_tensor=out_tv.name,
                 width=width,
+                reduces_features=node.op_type in _FEATURE_REDUCTION_OPS,
             )
         )
         

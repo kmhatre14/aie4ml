@@ -203,16 +203,23 @@ class _MemoryPlanMaterializer:
         base_p = p_ports[0]
         for slot, p in enumerate(p_ports):
             if entry.producer.node is None:
+                # PL-cut input: mirror the cut-output read -- write complete rows (batch-split) so the
+                # whole-row layout the reduction PL op produced is reassembled for the AIE consumer.
                 if entry.graph_input is not None:
                     desc = localized_graph_io_descriptor(
                         graph_input_writer_port_descriptor(entry, int(p)),
                         list(unit.offset_base),
                         list(buf_dims),
                     )
+                    if self._needs_row_join(entry.logical_tensor, desc, len(p_ports)):
+                        desc = self._cut_row_join_descriptor(desc, buf_dims, slot, len(p_ports), 'write')
                 else:
                     desc = self._graph_input_writer_descriptor(entry)
                     desc['buffer_dimension'] = list(buf_dims)
-                    desc['offset'][shard_dim] = (int(p) - int(base_p)) * int(port_stride)
+                    if self._needs_row_join(entry.logical_tensor, desc, len(p_ports)):
+                        desc = self._cut_row_join_descriptor(desc, buf_dims, slot, len(p_ports), 'write')
+                    else:
+                        desc['offset'][shard_dim] = (int(p) - int(base_p)) * int(port_stride)
                 self._max_graph_input_port = max(self._max_graph_input_port, int(p))
             else:
                 inst = self._kernel_inst(entry.producer.node)
@@ -276,7 +283,10 @@ class _MemoryPlanMaterializer:
             for slot, local_port in enumerate(p_ports):
                 graph_port = self._next_graph_output_port
                 self._next_graph_output_port += 1
-                desc = self._graph_output_reader_descriptor(entry, local_port, buf_dims, unit_base_dim0=unit_base_dim0)
+                desc = self._graph_output_reader_descriptor(
+                    entry, local_port, buf_dims, unit_base_dim0=unit_base_dim0,
+                    slot=slot, n_ports=len(p_ports),
+                )
                 buffer['readers'].append(
                     {
                         'source': f'{name}.out[{reader_base + slot}]',
@@ -315,16 +325,96 @@ class _MemoryPlanMaterializer:
             'outer_dimension': int(base['outer_dimension']),
         }
 
+    def _row_join_tensors(self):
+        """Cut boundary tensors (both legs) whose op reduces over features -> the PL kernel needs
+        complete rows, so the cut must be delivered batch-split (row-complete)."""
+        return {
+            t
+            for cut in self.ctx.ir.logical.pl_cuts
+            if cut.reduces_features
+            for t in (cut.cut_out_tensor, cut.cut_in_tensor)
+        }
+
+    def _needs_row_join(self, tensor_name, base, n_ports) -> bool:
+        """True only when this cut boundary must be flipped to batch-split: (1) the op reduces over
+        features, (2) the tensor is actually split across >1 port, AND (3) the current layout is a
+        FEATURE split (slice axis == inner/feature). A layout that is already batch-split is left
+        alone. If the descriptor omits the axis roles (some graph-IO descriptors do), fall back to
+        (1)+(2) -- a reduction cut still needs the join."""
+        if int(n_ports) <= 1 or tensor_name not in self._row_join_tensors():
+            return False
+        slice_dim = base.get('slice_dimension')
+        inner = base.get('inner_dimension')
+        if slice_dim is None or inner is None:
+            return True
+        return int(slice_dim) == int(inner)
+
+    def _cut_row_join_descriptor(self, base, buf_dims, slot, n_ports, access) -> Dict[str, Any]:
+        """Batch-split (row-complete) access for a PL-cut boundary buffer: each PLIO port carries
+        COMPLETE feature rows (shard along the batch/outer axis), not feature-halves. This is the
+        mem-tile transpose (feature-split write <-> batch-split PLIO) a reduction op (e.g. softmax)
+        needs; without it each PL stream would see half of every row. Reproduces, generically, the
+        hand edit in proj_softmax_pl_merge/src/graph_plan.h.
+        """
+        inner = base.get('inner_dimension')
+        outer = base.get('outer_dimension')
+        if inner is None or outer is None:
+            # Fallback for descriptors that omit the axis roles: on a 2-D boundary the batch axis
+            # (outer) is the larger dim; the feature axis (inner) the other.
+            outer = max(range(len(buf_dims)), key=lambda d: int(buf_dims[d]))
+            inner = next((d for d in range(len(buf_dims)) if d != outer), outer)
+        inner, outer = int(inner), int(outer)
+        # The flip keeps the inner (feature) axis FULL and shards the outer (batch) axis. That only
+        # works if the buffer actually holds the whole feature dimension; a feature-sharded cut buffer
+        # would silently deliver partial rows.
+        full = base.get('io_boundary_dimension')
+        if full is not None and int(buf_dims[inner]) != int(full[inner]):
+            raise NotImplementedError(
+                f'cut row-join needs the full feature axis in the buffer, but buffer inner dim '
+                f'{buf_dims[inner]} != full {full[inner]} (feature-sharded cut buffers unsupported).'
+            )
+        slice_outer = int(buf_dims[outer]) // int(n_ports)
+        tiling = list(buf_dims)
+        tiling[outer] = slice_outer  # full inner (all features), sliced outer (batch/n_ports)
+        offset = [0 for _ in buf_dims]
+        offset[outer] = int(slot) * slice_outer
+        traversal = [
+            {'dimension': outer, 'stride': tiling[outer], 'wrap': 1},
+            {'dimension': inner, 'stride': tiling[inner], 'wrap': 1},
+        ]
+        desc = {
+            'access': access,
+            'buffer_dimension': list(buf_dims),
+            'tiling_dimension': list(tiling),
+            'io_tiling_dimension': list(tiling),
+            'io_boundary_dimension': list(buf_dims),
+            'offset': offset,
+            'tile_traversal': traversal,
+            'slice_dimension': outer,
+            'inner_dimension': inner,
+            'outer_dimension': outer,
+        }
+        if access == 'read':
+            desc['boundary_dimension'] = list(buf_dims)
+        return desc
+
     def _graph_output_reader_descriptor(
         self,
         entry: EdgeEntry,
         port: int,
         buf_dims: List[int],
         unit_base_dim0: int,
+        slot: int = 0,
+        n_ports: int = 1,
     ) -> Dict[str, Any]:
         producer = entry.producer
         inst = self._kernel_inst(producer.node)
         base = inst.variant.describe_output_staging(producer.node, inst.config, producer.tensor, port, buf_dims)
+        # PL-cut output feeding a REDUCTION op that is currently FEATURE-split: deliver complete rows
+        # (batch-split) so a per-stream PL op sees whole rows. Elementwise / already-batch-split cuts
+        # keep their default layout (see _needs_row_join).
+        if self._needs_row_join(entry.logical_tensor, base, n_ports):
+            return self._cut_row_join_descriptor(base, buf_dims, slot, n_ports, 'read')
         shard_dim = int(base['slice_dimension'])
         io_tile = list(base['io_tiling_dimension'])
         io_boundary = list(base['io_boundary_dimension'])

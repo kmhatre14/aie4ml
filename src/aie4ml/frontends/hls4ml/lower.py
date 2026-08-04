@@ -35,6 +35,9 @@ class LowerToAieIr(ModelOptimizerPass):
     def transform(self, model) -> bool:
         ctx = ensure_backend_context(model, lambda: self._create_context(model))
         ctx.reset_ir()
+        # Retain the hls4ml ModelGraph so the PL-offload path can slice marked layers back out and
+        # re-invoke hls4ml on the sub-graph to generate the PL kernel (pl_hls4ml.py).
+        ctx.source_model = model
 
         graph: LogicalIR = ctx.ir.logical
         layers = list(model.get_layers())
@@ -194,6 +197,11 @@ class LowerToAieIr(ModelOptimizerPass):
             meta['perm'] = [int(x) for x in perm]
             meta['data_format'] = layer.get_attr('data_format')
 
+        # hls4ml parses keras Add/Subtract/... into a single 'Merge' layer carrying attr op='add'/...
+        # Only elementwise 'add' is wired (elementwise family); it takes two ordered inputs lhs+rhs.
+        if layer.class_name == 'Merge' and (layer.get_attr('op') or '').lower() == 'add':
+            meta['input_roles'] = ['lhs', 'rhs']
+
         meta['layer_class'] = layer.class_name
         if is_pointwise_dense(layer):
             meta['source_class'] = layer.class_name
@@ -243,6 +251,14 @@ class LowerToAieIr(ModelOptimizerPass):
             return 'transpose'
         if layer.class_name == 'LayerNormalization':
             return 'layer_norm'
+        if layer.class_name == 'Merge':
+            # keras Add/Subtract/... all become hls4ml 'Merge' with attr op; only add is supported.
+            op = (layer.get_attr('op') or '').lower()
+            if op == 'add':
+                return 'add'
+            raise NotImplementedError(
+                f'{layer.name}: Merge op {op!r} is not supported (only elementwise add is wired).'
+            )
         return layer.class_name.lower()
 
     def _normalize_transpose_perm(self, node: OpNode, output_shape) -> None:

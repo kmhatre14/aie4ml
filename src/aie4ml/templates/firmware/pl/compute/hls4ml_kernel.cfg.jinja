@@ -1,0 +1,9 @@
+[hls]
+flow_target=vitis
+syn.file={{ kernel_name }}.cpp
+syn.cflags=-I. -I./{{ hls_proj }}/firmware -I./{{ hls_proj }}/firmware/nnet_utils
+syn.top={{ kernel_name }}
+package.ip.name={{ kernel_name }}
+package.output.syn = true
+package.output.format=xo
+package.output.file={{ kernel_name }}.xo

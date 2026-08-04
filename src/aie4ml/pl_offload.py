@@ -27,6 +27,9 @@ from .passes.utils import sanitize_identifier
 
 # PL compute kernels live under pl/compute/; the data movers live under pl/benchmark|deployment/.
 _COMPUTE_TEMPLATE_DIR = 'pl/compute'
+# The generic AXIS wrapper around an hls4ml-generated op body (pl_hls4ml.py fills the firmware +
+# template vars at write time). 'dummy_softmax' remains available for plumbing/bring-up tests.
+_HLS4ML_KERNEL = 'hls4ml_kernel'
 _DUMMY_KERNEL = 'dummy_softmax'
 
 # CU names the data movers already own. A layer may not collide with one, or system.cfg would
@@ -150,8 +153,8 @@ def _kernel_spec(ctx, layout, cut) -> PLKernelSpec:
         cut_out_ports=[p.port for p in out_ports],
         cut_in_ports=[p.port for p in in_ports],
         beats_per_iter=beats_out,
-        cpp_template=f'{_COMPUTE_TEMPLATE_DIR}/{_DUMMY_KERNEL}.cpp.jinja',
-        cfg_template=f'{_COMPUTE_TEMPLATE_DIR}/{_DUMMY_KERNEL}.cfg.jinja',
+        cpp_template=f'{_COMPUTE_TEMPLATE_DIR}/{_HLS4ML_KERNEL}.cpp.jinja',
+        cfg_template=f'{_COMPUTE_TEMPLATE_DIR}/{_HLS4ML_KERNEL}.cfg.jinja',
     )
 
 

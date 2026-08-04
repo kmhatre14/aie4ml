@@ -157,6 +157,8 @@ class AIEBackendContext:
     aie_config: Dict[str, Any] = field(default_factory=dict)
     traits: TraitRegistry = field(default_factory=TraitRegistry)
     ir: AIEPipelineIR = field(default_factory=AIEPipelineIR)
+    # The source frontend model (hls4ml ModelGraph). 
+    source_model: Any = None
 
     def reset_ir(self) -> None:
         self.ir.reset()
