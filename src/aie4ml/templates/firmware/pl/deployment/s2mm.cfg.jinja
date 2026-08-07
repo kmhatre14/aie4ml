@@ -1,9 +1,9 @@
 [hls]
 flow_target=vitis
-syn.file=s2mm.cpp
+syn.file={{ kernel_name }}.cpp
 syn.cflags=-I.
-syn.top=s2mm
-package.ip.name=s2mm
+syn.top={{ kernel_name }}
+package.ip.name={{ kernel_name }}
 package.output.syn = true
 package.output.format=xo
-package.output.file=s2mm.xo
+package.output.file={{ kernel_name }}.xo

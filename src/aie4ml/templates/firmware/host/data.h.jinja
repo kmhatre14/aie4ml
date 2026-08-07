@@ -4,4 +4,21 @@
 static const int IFM_SIZE_WORDS = {{ ifm_size_words }};
 static const int OFM_SIZE_WORDS = {{ ofm_size_words }};
 
+// Combined round-robin input (benchmark's single combined data mover reads this).
 static const uint32_t ifm_packed[IFM_SIZE_WORDS] = { {{ ifm_packed | join(', ') }} };
+{% if ifm_ports is defined %}
+
+// Per-input-tensor buffers: memory_stream's per-tensor mm2s movers each read one of these.
+{% for p in ifm_ports %}
+static const int IFM{{ p.index }}_SIZE_WORDS = {{ p.size_words }};
+static const uint32_t ifm{{ p.index }}_packed[IFM{{ p.index }}_SIZE_WORDS] = { {{ p.data | join(', ') }} };
+{% endfor %}
+{% endif %}
+{% if ofm_ports is defined %}
+
+// Per-output-tensor sizes: memory_stream's per-tensor s2mm movers each write one buffer (device
+// produces the data, so only the size is needed to allocate the host buffer).
+{% for p in ofm_ports %}
+static const int OFM{{ p.index }}_SIZE_WORDS = {{ p.size_words }};
+{% endfor %}
+{% endif %}
