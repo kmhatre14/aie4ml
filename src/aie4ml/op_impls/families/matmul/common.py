@@ -6,8 +6,7 @@ import numpy as np
 
 from ....aie_types import FLOAT_FORMATS
 from ....quant_utils import apply_rounding, dtype_for_precision, handle_overflow
-from ...utils import TensorView, canonical_buffer_axes, make_staging_descriptor, ordered_view_shape
-from ...utils.precision import storage_bytes_for_spec
+from ...utils import AxisPlan, TensorView, build_staging_descriptor, canonical_buffer_axes
 
 # Keys are canonical format-string pairs (lhs_format, rhs_format).
 # Integer formats: 'int8', 'int16' (sign-agnostic — both int8_t and uint8_t map here).
@@ -54,35 +53,18 @@ def describe_family_lhs_staging(view: TensorView, microtiling, port: int, buf_di
     microtile_k = int(microtiling.microtile_k)
     in_slice = view.tile_inner
     outer_slice = view.tile_outer
-    raw_in = view.tile_raw_inner
-    buffer_dimension = ordered_view_shape(view, 'full') if buf_dims is None else [int(x) for x in buf_dims]
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
-    io_tiling_dimension = ordered_view_shape(view, 'logical')
-    io_tiling_dimension[inner_dim] = raw_in
-    tiling_dimension = [1 for _ in buffer_dimension]
-    tiling_dimension[inner_dim] = microtile_k
-    tiling_dimension[outer_dim] = microtile_m
-    tile_traversal = []
-    for dim in traversal_dims:
-        if dim == inner_dim:
-            tile_traversal.append({'dimension': inner_dim, 'stride': microtile_k, 'wrap': in_slice // microtile_k})
-        elif dim == outer_dim:
-            tile_traversal.append({'dimension': outer_dim, 'stride': microtile_m, 'wrap': outer_slice // microtile_m})
-        else:
-            tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
-    offset = [0 for _ in buffer_dimension]
-    offset[inner_dim] = port * in_slice
-    return make_staging_descriptor(
+    return build_staging_descriptor(
+        view,
         access='read',
-        view=view,
-        tiling_dimension=tiling_dimension,
-        offset=offset,
-        tile_traversal=tile_traversal,
-        inner_dim=inner_dim,
-        outer_dim=outer_dim,
+        plans={
+            inner_dim: AxisPlan(microtile_k, microtile_k, in_slice // microtile_k, port * in_slice),
+            outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m),
+        },
+        order=traversal_dims,
+        io_tiling_overrides={inner_dim: view.tile_raw_inner},
+        buf_dims=buf_dims,
         boundary_shape='logical',
-        io_boundary_shape='logical',
-        io_tiling_dimension=io_tiling_dimension,
     )
 
 
@@ -92,34 +74,17 @@ def describe_family_output_staging(view: TensorView, microtiling, port: int, buf
     microtile_n = int(microtiling.microtile_n)
     out_slice = view.tile_inner
     outer_slice = view.tile_outer
-    raw_out = view.tile_raw_inner
-    buffer_dimension = ordered_view_shape(view, 'full') if buf_dims is None else [int(x) for x in buf_dims]
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
-    io_tiling_dimension = ordered_view_shape(view, 'real')
-    io_tiling_dimension[inner_dim] = raw_out
-    tiling_dimension = [1 for _ in buffer_dimension]
-    tiling_dimension[inner_dim] = microtile_n
-    tiling_dimension[outer_dim] = microtile_m
-    tile_traversal = []
-    for dim in traversal_dims:
-        if dim == inner_dim:
-            tile_traversal.append({'dimension': inner_dim, 'stride': microtile_n, 'wrap': out_slice // microtile_n})
-        elif dim == outer_dim:
-            tile_traversal.append({'dimension': outer_dim, 'stride': microtile_m, 'wrap': outer_slice // microtile_m})
-        else:
-            tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
-    offset = [0 for _ in buffer_dimension]
-    offset[inner_dim] = port * out_slice
-    return make_staging_descriptor(
+    return build_staging_descriptor(
+        view,
         access='write',
-        view=view,
-        tiling_dimension=tiling_dimension,
-        offset=offset,
-        tile_traversal=tile_traversal,
-        inner_dim=inner_dim,
-        outer_dim=outer_dim,
-        io_boundary_shape='real',
-        io_tiling_dimension=io_tiling_dimension,
+        plans={
+            inner_dim: AxisPlan(microtile_n, microtile_n, out_slice // microtile_n, port * out_slice),
+            outer_dim: AxisPlan(microtile_m, microtile_m, outer_slice // microtile_m),
+        },
+        order=traversal_dims,
+        io_tiling_overrides={inner_dim: view.tile_raw_inner},
+        buf_dims=buf_dims,
     )
 
 
@@ -132,93 +97,29 @@ def describe_family_rhs_staging(view: TensorView, microtiling, parallelism, port
     microtile_n = int(microtiling.microtile_n)
     # The rhs view encodes both K and N slices: outer dim = K, inner dim = N.
     k_slice = view.tile_outer
-    raw_k = view.tile_raw_outer
     n_slice = view.tile_inner
-    raw_n = view.tile_raw_inner
-    buffer_dimension = ordered_view_shape(view, 'full') if buf_dims is None else [int(x) for x in buf_dims]
     inner_dim, outer_dim, traversal_dims = canonical_buffer_axes(view)
-    io_tiling_dimension = ordered_view_shape(view, 'logical')
-    io_tiling_dimension[inner_dim] = raw_n
-    io_tiling_dimension[outer_dim] = raw_k
-    tiling_dimension = [1 for _ in buffer_dimension]
-    tiling_dimension[inner_dim] = microtile_n
-    tiling_dimension[outer_dim] = microtile_k
 
     row = int(port) // int(parallelism.cas_length)
     col = int(port) % int(parallelism.cas_length)
-    offset = [0 for _ in buffer_dimension]
-    offset[inner_dim] = row * n_slice
-    offset[outer_dim] = col * k_slice
 
-    tile_traversal = [
-        {'dimension': inner_dim, 'stride': microtile_n, 'wrap': max(1, n_slice // microtile_n)},
-        {'dimension': outer_dim, 'stride': microtile_k, 'wrap': max(1, k_slice // microtile_k)},
-    ]
-    used = {outer_dim, inner_dim}
-    for dim in traversal_dims:
-        if dim in used:
-            continue
-        tile_traversal.append({'dimension': dim, 'stride': 1, 'wrap': buffer_dimension[dim]})
-
-    return make_staging_descriptor(
+    return build_staging_descriptor(
+        view,
         access='read',
-        view=view,
-        tiling_dimension=tiling_dimension,
-        offset=offset,
-        tile_traversal=tile_traversal,
-        inner_dim=inner_dim,
-        outer_dim=outer_dim,
+        plans={
+            inner_dim: AxisPlan(microtile_n, microtile_n, max(1, n_slice // microtile_n), row * n_slice),
+            outer_dim: AxisPlan(microtile_k, microtile_k, max(1, k_slice // microtile_k), col * k_slice),
+        },
+        order=traversal_dims,
+        io_tiling_overrides={inner_dim: view.tile_raw_inner, outer_dim: view.tile_raw_outer},
+        buf_dims=buf_dims,
         boundary_shape='logical',
-        io_boundary_shape='logical',
-        io_tiling_dimension=io_tiling_dimension,
         extras={
             'packing': 'mmul_rhs',
             'packing_microtile_k': microtile_k,
             'packing_microtile_n': microtile_n,
         },
     )
-
-
-def validate_family_tile_contract(
-    *,
-    node_name: str,
-    precision,
-    parallelism,
-    microtiling,
-    lhs_view: TensorView,
-    output_view: TensorView,
-    bank_bytes: int,
-    rhs_overhead_bytes: int = 0,
-) -> None:
-    tile_outer = lhs_view.compacted_tile_outer
-    tile_inner_lhs = lhs_view.tile_inner
-    tile_inner_rhs = output_view.tile_inner
-    full_inner_lhs = lhs_view.full_inner
-    full_inner_rhs = output_view.full_inner
-
-    a_tile_bytes = int(tile_outer) * tile_inner_lhs * storage_bytes_for_spec(precision['lhs'])
-    b_tile_bytes = tile_inner_lhs * tile_inner_rhs * storage_bytes_for_spec(precision['rhs'])
-    c_tile_bytes = int(tile_outer) * tile_inner_rhs * storage_bytes_for_spec(precision['output'])
-    if a_tile_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: A tile uses {a_tile_bytes}B, exceeds one {bank_bytes}B bank.')
-    if b_tile_bytes + int(rhs_overhead_bytes) > bank_bytes:
-        raise ValueError(
-            f'{node_name}: B tile plus overhead uses '
-            f'{b_tile_bytes + int(rhs_overhead_bytes)}B, exceeds one {bank_bytes}B bank.'
-        )
-    if c_tile_bytes > bank_bytes:
-        raise ValueError(f'{node_name}: C tile uses {c_tile_bytes}B, exceeds one {bank_bytes}B bank.')
-
-    if full_inner_lhs != tile_inner_lhs * int(parallelism.cas_length):
-        raise ValueError(f'{node_name}: full_inner_lhs must equal tile_inner_lhs * cas_length.')
-    if full_inner_rhs != tile_inner_rhs * int(parallelism.cas_num):
-        raise ValueError(f'{node_name}: full_inner_rhs must equal tile_inner_rhs * cas_num.')
-    if tile_inner_lhs % max(1, 2 * int(microtiling.microtile_k)) != 0:
-        raise ValueError(f'{node_name}: tile_inner_lhs must be divisible by 2 * microtile_k.')
-    if tile_inner_rhs % max(1, 2 * int(microtiling.microtile_n)) != 0:
-        raise ValueError(f'{node_name}: tile_inner_rhs must be divisible by 2 * microtile_n.')
-    if lhs_view.compacted_tile_outer % max(1, 2 * int(microtiling.microtile_m)) != 0:
-        raise ValueError(f'{node_name}: tile_outer (lhs) must be divisible by 2 * microtile_m.')
 
 
 def np_dtype_for_spec(spec) -> np.dtype:
