@@ -145,7 +145,7 @@ def _ifm_mover_name(index: int) -> str:
     ``mm2s.{cpp,cfg}.jinja`` (see :func:`_kernel_entry`'s ``template_base``), so any N is supported
     with no extra template files.
     """
-    return 'mm2s' if index == 0 else f'mm2s_{index + 1}'
+    return 'mm2s_1' if index == 0 else f'mm2s_{index + 1}'
 
 
 def _ofm_mover_name(index: int) -> str:
@@ -155,7 +155,7 @@ def _ofm_mover_name(index: int) -> str:
     (so single-output designs are unchanged); later tensors get ``s2mm_2``, ``s2mm_3``, ... . All
     render from the one parameterized ``s2mm.{cpp,cfg}.jinja``.
     """
-    return 's2mm' if index == 0 else f's2mm_{index + 1}'
+    return 's2mm_1' if index == 0 else f's2mm_{index + 1}'
 
 
 def emits_system(model_or_ctx) -> bool:
