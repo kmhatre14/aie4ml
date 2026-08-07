@@ -195,10 +195,8 @@ class AIEProjectEmitter:
         # under pl/ or pl/deployment/, but always render to pl/<name>.{cpp,cfg}.
         for kernel in system_io['pl_plan']['kernels']:
             name = kernel['name']
-            # Per-kernel context (e.g. an mm2s mover's own n_streams) overrides the shared bag.
-            kernel_ctx = {**system_io, **kernel.get('context', {})}
-            self._render_template(env, kernel['cpp_template'], output_dir / 'pl' / f'{name}.cpp', kernel_ctx)
-            self._render_template(env, kernel['cfg_template'], output_dir / 'pl' / f'{name}.cfg', kernel_ctx)
+            self._render_template(env, kernel['cpp_template'], output_dir / 'pl' / f'{name}.cpp', system_io)
+            self._render_template(env, kernel['cfg_template'], output_dir / 'pl' / f'{name}.cfg', system_io)
 
         self._render_template(env, 'system.cfg.jinja', output_dir / 'system.cfg', system_io)
         self._render_template(env, 'host/host.cpp.jinja', output_dir / 'host' / 'host.cpp', system_io)
