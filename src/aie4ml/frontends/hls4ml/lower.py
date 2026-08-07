@@ -59,8 +59,51 @@ class LowerToAieIr(ModelOptimizerPass):
             )
         graph.mark_graph_input(input_var.name)
 
+        # LayerNorm reshape unwrap: hls4ml's LayerNormalization requires a 3-D (batch, seq, feat)
+        # input, so models wrap it in reshapes. We drop ONLY the reshapes directly adjacent to a 
+        # LayerNormalization -- the one feeding it and the one consuming its output
+        # Note: This case is handled because hls4ml does not have 2D layernorm support during parsing.
+        # This will not apply to onnx based frontends.
+        reshape_tensor_redirect: Dict[str, str] = {}   # folded-away tensor name -> surviving tensor name
+        bypassed_reshapes: set = set()       # reshape layer names that never become AIE nodes
+
+        # Collect, in one pass: the LayerNorm layer names, and the reshapes each LayerNorm consumes as input.
+        layernorm_names: set = set()
+        reshapes_feeding_layernorm: set = set()
+        for layer in layers:
+            if layer.class_name == 'LayerNormalization':
+                layernorm_names.add(layer.name)
+                reshapes_feeding_layernorm.update(layer.inputs)
+
+        for layer in layers:
+            if layer.class_name != 'Reshape':
+                continue
+            feeds_layernorm = layer.name in reshapes_feeding_layernorm    # reshape BEFORE a LayerNorm
+            follows_layernorm = layer.inputs[0] in layernorm_names        # reshape AFTER a LayerNorm
+            if not feeds_layernorm and not follows_layernorm:
+                continue
+
+            in_src = layer.inputs[0]
+            in_var = input_var if in_src == 'input' else model.output_vars[in_src]
+            out_var = model.output_vars[layer.name]
+            bypassed_reshapes.add(layer.name)
+            # Keep the LOWER-rank (2-D) tensor; drop the higher-rank one so the graph stays 2-D.
+            if len(out_var.shape) <= len(in_var.shape):
+                reshape_tensor_redirect[in_var.name] = out_var.name   # flatten (1,feat) -> (feat)
+            else:
+                reshape_tensor_redirect[out_var.name] = in_var.name   # expand  (feat) -> (1,feat)
+
+        def _resolve(name: str) -> str:
+            seen: set = set()
+            while name in reshape_tensor_redirect and name not in seen:
+                seen.add(name)
+                name = reshape_tensor_redirect[name]
+            return name
+
         for layer in layers:
             var = model.output_vars[layer.name]
+            if var.name in reshape_tensor_redirect:
+                continue  # bypassed no-op reshape -- no tensor; consumers resolve to its input
             if var.name not in graph.tensors:
                 prec = _precision_of(var)
                 if layer.class_name == 'Dense' or is_pointwise_dense(layer):
@@ -83,6 +126,8 @@ class LowerToAieIr(ModelOptimizerPass):
         created_nodes = set()
 
         for layer in layers:
+            if layer.name in bypassed_reshapes:
+                continue  # no-op reshape -- never becomes an AIE node (its tensor is aliased)
             node = OpNode(
                 name=f'{layer.name}_aie',
                 op_type=self._map_op_type(layer),
@@ -117,7 +162,7 @@ class LowerToAieIr(ModelOptimizerPass):
                 param_tensors[layer.name] = (gamma_tv, beta_tv)
 
             var = model.output_vars[layer.name]
-            tv = graph.tensors[var.name]
+            tv = graph.tensors[_resolve(var.name)]  # flatten reshape: emit the low-rank output
             tv.producer = node
             node.outputs.append(tv)
             if node.op_type == 'transpose':
@@ -135,7 +180,7 @@ class LowerToAieIr(ModelOptimizerPass):
 
             for src in layer.inputs:
                 var = input_var if src == 'input' else model.output_vars[src]
-                tv = graph.tensors[var.name]
+                tv = graph.tensors[_resolve(var.name)]  # resolve through bypassed no-op reshapes
                 node.inputs.append(tv)
                 tv.consumers.append(node)
 
@@ -150,7 +195,7 @@ class LowerToAieIr(ModelOptimizerPass):
                 set_input_roles(node, node.inputs, role_names)
 
         for out_var in model.get_output_variables():
-            graph.mark_graph_output(out_var.name)
+            graph.mark_graph_output(_resolve(out_var.name))
 
         return True
 

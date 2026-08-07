@@ -87,39 +87,36 @@ class ExcisePLNodes(AIEPass):
     def _excise(self, graph, node) -> None:
         layer = self._layer(node)
 
-        if len(node.inputs) != 1 or len(node.outputs) != 1:
-            params = [t.name for t in node.inputs if t.is_parameter]
-            detail = (
-                f' Layers with parameters ({params}) cannot run on the PL: a PL kernel has no RTP '
-                'path, so those weights could never be loaded and the design would silently compute '
-                'garbage.'
-                if params
-                else ''
-            )
+        # Weighted layers (layer_norm gamma/beta, ...) CAN run on the PL: the PL kernel gets its
+        # weights from the hls4ml firmware (baked) or runtime-loaded via s_axilite, and _cut_node
+        # drops the param tensors from the AIE graph. Only the ACTIVATION inputs become cut-outs.
+        activations = [t for t in node.inputs if not t.is_parameter]
+        if not activations or len(node.outputs) != 1:
             raise ValueError(
-                f"{layer}: run_on='pl' requires a single-input, single-output layer; got "
-                f'{len(node.inputs)} input(s) and {len(node.outputs)} output(s).{detail}'
+                f"{layer}: run_on='pl' requires >=1 activation input(s) and a single output; got "
+                f'{len(activations)} input(s) and {len(node.outputs)} output(s).'
             )
 
-        in_tv, out_tv = node.inputs[0], node.outputs[0]
+        out_tv = node.outputs[0]
 
-        producer = in_tv.producer
-        if producer is None or producer.is_placeholder:
-            raise ValueError(
-                f"{layer}: run_on='pl' requires an INTERMEDIATE layer, but its input {in_tv.name!r} "
-                'is a graph input -- there is no AIE stage in front of it to cut against. To source '
-                "the array from the fabric instead, use PLDataMoverMode='external_stream'."
-            )
-
-        # Fanout at the cut is very likely FINE: collect._group_edges keys on consumer_group, and a
-        # graph-output leg carries the 'graph_output' sentinel, so it never shares an EdgeEntry with
-        # a real consumer
-        if len(in_tv.consumers) != 1:
-            others = [c.name for c in in_tv.consumers if c is not node]
-            raise NotImplementedError(
-                f'{layer}: its input {in_tv.name!r} also feeds {others}. Broadcasting a cut tensor '
-                'to the PL and to the AIE at the same time is not yet validated.'
-            )
+        # Each input becomes a cut-out (AIE -> PL): validate it is an INTERMEDIATE tensor (an AIE
+        # stage in front) with no fanout (not broadcast to AIE and PL at once).
+        for in_tv in activations:
+            producer = in_tv.producer
+            if producer is None or producer.is_placeholder:
+                raise ValueError(
+                    f"{layer}: run_on='pl' requires an INTERMEDIATE layer, but its input {in_tv.name!r} "
+                    'is a graph input -- there is no AIE stage in front of it to cut against. To source '
+                    "the array from the fabric instead, use PLDataMoverMode='external_stream'."
+                )
+            # Fanout at the cut: collect._group_edges keys on consumer_group and a graph-output leg
+            # carries the 'graph_output' sentinel, so a shared feed is not yet validated.
+            if len(in_tv.consumers) != 1:
+                others = [c.name for c in in_tv.consumers if c is not node]
+                raise NotImplementedError(
+                    f'{layer}: its input {in_tv.name!r} also feeds {others}. Broadcasting a cut tensor '
+                    'to the PL and to the AIE at the same time is not yet validated.'
+                )
 
         if out_tv.name in graph.output_tensor_names:
             raise ValueError(
@@ -129,46 +126,46 @@ class ExcisePLNodes(AIEPass):
         if not out_tv.consumers:
             raise ValueError(f'{layer}: output {out_tv.name!r} has no consumers; nothing to cut back into.')
 
-        width = self._cut_width(layer, in_tv, out_tv)
+        width = self._cut_width(layer, activations + [out_tv])
 
-        # remove_node(mode='cut') leaves the IR intentionally invalid until BOTH marks land: out_tv
-        # is now producer-less, which verify() rejects unless it is a declared graph input.
+        # remove_node(mode='cut') leaves the IR intentionally invalid until the marks land: out_tv is
+        # now producer-less, which verify() rejects unless it is a declared graph input.
         graph.remove_node(node, mode='cut')
-        graph.mark_graph_output(in_tv.name)  # AIE -> PL
-        graph.mark_graph_input(out_tv.name)  # PL  -> AIE
+        for in_tv in activations:
+            graph.mark_graph_output(in_tv.name)  # AIE -> PL (one per input)
+        graph.mark_graph_input(out_tv.name)      # PL  -> AIE
         graph.pl_cuts.append(
             PLCut(
                 node_name=node.name,
                 source_layer=layer,
-                cut_out_tensor=in_tv.name,
+                cut_out_tensors=tuple(t.name for t in activations),
                 cut_in_tensor=out_tv.name,
                 width=width,
                 reduces_features=node.op_type in _FEATURE_REDUCTION_OPS,
             )
         )
-        
+
+        ins = ', '.join(t.name for t in activations)
         print(
             f"[aie4ml] run_on='pl': excised {layer!r} from the AIE graph "
-            f'(AIE -> {in_tv.name} -> PL -> {out_tv.name} -> AIE).'
+            f'(AIE -> [{ins}] -> PL -> {out_tv.name} -> AIE).'
         )
 
     @staticmethod
-    def _cut_width(layer: str, in_tv, out_tv) -> int:
-        """Element width in bits across the cut; both sides must agree."""
+    def _cut_width(layer: str, tensors) -> int:
+        """Element width in bits shared by every cut tensor.
+        But all widths must agree."""
         widths = []
-        for tensor in (in_tv, out_tv):
+        for tensor in tensors:
             precision = getattr(tensor, 'precision', None)
             width = getattr(precision, 'width', None)
             if width is None:
                 raise ValueError(f'{layer}: tensor {tensor.name!r} has no resolved precision width.')
             widths.append(int(width))
-
-        # Signedness MAY differ (HCCS softmax is int8 in, uint8 out). The cut carries raw AXI-stream
-        # bytes, so that is a harmless bit-reinterpretation.
-        if widths[0] != widths[1]:
+        if len(set(widths)) != 1:
             raise NotImplementedError(
-                f'{layer}: a PL cut carries raw AXI-stream bytes, so its input and output element '
-                f'widths must match; got {widths[0]}-bit in, {widths[1]}-bit out.'
+                f'{layer}: a PL cut carries raw AXI-stream bytes, so all cut tensors must share an '
+                f'element width; got {widths} for {[t.name for t in tensors]}.'
             )
         return widths[0]
 

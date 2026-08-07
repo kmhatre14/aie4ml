@@ -107,7 +107,7 @@ class PLCut:
 
     node_name: str  # IR node, e.g. 'softmax_0_aie'
     source_layer: str  # frontend layer, e.g. 'softmax_0' -- names the PL kernel and its CU
-    cut_out_tensor: str  # the node's INPUT  -> now a graph output (AIE -> PL)
+    cut_out_tensors: Tuple[str, ...]  # the node's INPUT(s) -> graph output(s) (AIE -> PL)
     cut_in_tensor: str  # the node's OUTPUT -> now a graph input  (PL -> AIE)
     width: int  # element width in bits; both sides must match (v1 is a bit-reinterpretation)
     reduces_features: bool = False  # op reduces over the feature axis (softmax/layer_norm), so the PL
@@ -227,27 +227,30 @@ class LogicalIR:
             (PL -> AIE, over PLIO_ifm)
         """
         # Parameters (weights/bias) ARE inputs in this IR -- see lower.py, which appends them to
-        # node.inputs alongside the activation.
+        # node.inputs alongside the activation. They do NOT cross the cut: the PL kernel gets its
+        # weights another way (baked into the hls4ml firmware. DROP them from the AIE graph 
+        # Their values remain reachable for host export via ctx.source_model.
         params = [t for t in node.inputs if t.is_parameter]
-        if params:
-            raise ValueError(
-                f'Cannot cut node {node.name}: it has parameter input(s) {[t.name for t in params]}. '
-                'Offloading a layer with weights/bias to the PL is not supported -- there is no '
-                'path to ship RTP artifacts to a PL kernel.'
-            )
+        for p in params:
+            if node in p.consumers:
+                p.consumers.remove(node)
+                # parameters have no producer, so dropping the last consumer orphans the tensor
+                if not p.consumers:
+                    self.tensors.pop(p.name, None)
 
         activations = [t for t in node.inputs if not t.is_parameter]
-        if len(activations) != 1 or len(node.outputs) != 1:
+        if not activations or len(node.outputs) != 1:
             raise ValueError(
-                f'Cannot cut node {node.name}: requires exactly one activation input and one '
+                f'Cannot cut node {node.name}: requires >=1 activation input(s) and exactly one '
                 f'output, got {len(activations)} and {len(node.outputs)}.'
             )
 
-        in_tv, out_tv = activations[0], node.outputs[0]
-        if node in in_tv.consumers:
-            in_tv.consumers.remove(node)
-        out_tv.producer = None
-        # Both tensors intentionally stay in self.tensors -- they are the two cut endpoints.
+        # Each activation input keeps its producer, loses this node as a consumer -> a graph OUTPUT.
+        out_tv = node.outputs[0]
+        for in_tv in activations:
+            if node in in_tv.consumers:
+                in_tv.consumers.remove(node)
+        out_tv.producer = None  # the single output keeps its consumers -> a graph INPUT
 
     def _detach_node(self, node: OpNode):
         """Fallback: Just cut the node out without merging tensors."""
@@ -275,7 +278,7 @@ class LogicalIR:
 
     def cut_out_tensor_names(self) -> Set[str]:
         """Graph-output tensors that feed a PL kernel (AIE -> PL), not real model outputs."""
-        return {cut.cut_out_tensor for cut in self.pl_cuts}
+        return {t for cut in self.pl_cuts for t in cut.cut_out_tensors}
 
     def cut_in_tensor_names(self) -> Set[str]:
         """Graph-input tensors driven by a PL kernel (PL -> AIE), not real model inputs."""

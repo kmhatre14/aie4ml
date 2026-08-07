@@ -332,7 +332,7 @@ class _MemoryPlanMaterializer:
             t
             for cut in self.ctx.ir.logical.pl_cuts
             if cut.reduces_features
-            for t in (cut.cut_out_tensor, cut.cut_in_tensor)
+            for t in (*cut.cut_out_tensors, cut.cut_in_tensor)
         }
 
     def _needs_row_join(self, tensor_name, base, n_ports) -> bool:
