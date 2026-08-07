@@ -2,22 +2,22 @@
 Copyright (C) 2026, Advent lab
 
 {{ kernel_name }} -- AUTO-GENERATED PL compute kernel for the offloaded '{{ source_layer }}' layer.
-Design: {{ project_name }} ({{ n_in }} stream(s) in / {{ n_out }} out, {{ beats_per_iter }} beats/stream/iter).
+Design: {{ project_name }} ({{ n_op_inputs }} operand(s) x {{ n_out }} shard(s) = {{ n_in }} in / {{ n_out }} out,
+{{ beats_per_iter }} beats/stream/iter).
 
 The AIE graph is CUT at this layer, so the data path detours through the fabric:
     AIE -> PLIO_ofm -> {{ kernel_name }} -> PLIO_ifm -> AIE
 
-The op body is hls4ml-generated firmware (pl/{{ hls_proj }}/, produced by re-invoking hls4ml on the
-sliced sub-graph -- hls4ml UNMODIFIED). This file is only the AXIS glue: 128-bit beats <-> hls4ml's
-io_stream nnet::array, TLAST regeneration, ap_ctrl_hs. It is common across ops; only the parameters
-(types, feats, beats, the nnet:: call) differ.
+The op body is hls4ml-generated firmware (pl/{{ hls_proj }}/, from re-invoking hls4ml on the sliced
+sub-graph -- hls4ml UNMODIFIED). This file is only the AXIS glue: 128-bit beats <-> hls4ml io_stream
+nnet::array
 */
 
 #include <ap_int.h>
 #include <hls_stream.h>
 #include <ap_axi_sdata.h>
 
-#include "{{ hls_defines }}"  // input_t, result_t + the precision typedefs parameters.h references
+#include "{{ hls_defines }}"  // input_t{% if n_op_inputs > 1 %}, input2_t{% endif %}, result_t + precision typedefs
 #include "{{ hls_params }}"    // {{ hls_cfg }}, {{ nnet_fn }}() + nnet_utils includes
 
 static const int FEATS           = {{ feats }};
@@ -27,33 +27,34 @@ static const int LANES_PER_BEAT  = {{ lanes_per_beat }};
 static const int LANE_BITS       = {{ lane_bits }};
 
 // Batch all rows ONE PLIO stream carries through a single op call at II=1 (matches the hand graft):
-// the generated config's per-row n_in is overridden to span the whole stream.
+// the generated config's per-row size is overridden to span the whole stream.
 struct {{ kernel_name }}_cfg : {{ hls_cfg }} {
-    static const unsigned n_in = ROWS_PER_STREAM * FEATS;
+    static const unsigned {{ size_field }} = ROWS_PER_STREAM * FEATS;
 };
 
-// --- DATAFLOW stage 1: gather AXIS beats -> one complete nnet::array row ---
-static void {{ kernel_name }}_read(hls::stream<ap_axis<128, 0, 0, 0>>& in, hls::stream<input_t>& sm_in) {
+// beats -> one nnet::array row (raw bit-reinterpret). Templated so it serves every operand type.
+template <typename ARR>
+static void {{ kernel_name }}_read(hls::stream<ap_axis<128, 0, 0, 0>>& in, hls::stream<ARR>& sm) {
     for (int r = 0; r < ROWS_PER_STREAM; r++) {
-        input_t x;
+        ARR x;
         for (int b = 0; b < BEATS_PER_ROW; b++) {
         #pragma HLS PIPELINE II=1
             ap_axis<128, 0, 0, 0> beat = in.read();
             for (int l = 0; l < LANES_PER_BEAT; l++) {
             #pragma HLS UNROLL
                 x[b * LANES_PER_BEAT + l].range(LANE_BITS - 1, 0) =
-                    beat.data.range(l * LANE_BITS + LANE_BITS - 1, l * LANE_BITS);  // raw bit-reinterpret
+                    beat.data.range(l * LANE_BITS + LANE_BITS - 1, l * LANE_BITS);
             }
         }
-        sm_in.write(x);
+        sm.write(x);
     }
 }
 
-// --- DATAFLOW stage 3: op-result rows -> truncated AXIS beats (+ regen TLAST) ---
-static void {{ kernel_name }}_write(hls::stream<result_t>& sm_out,
+// op-result rows -> AXIS beats (+ regen TLAST). result element is exactly LANE_BITS wide (on-wire).
+static void {{ kernel_name }}_write(hls::stream<result_t>& sm,
                                     hls::stream<ap_axis<128, 0, 0, 0>>& out, bool last_iter) {
     for (int r = 0; r < ROWS_PER_STREAM; r++) {
-        result_t y = sm_out.read();
+        result_t y = sm.read();
         for (int b = 0; b < BEATS_PER_ROW; b++) {
         #pragma HLS PIPELINE II=1
             ap_uint<128> packed = 0;
@@ -71,22 +72,36 @@ static void {{ kernel_name }}_write(hls::stream<result_t>& sm_out,
     }
 }
 
-// One PLIO stream: read complete rows -> hls4ml op (batched, II=1) -> write rows. DATAFLOW overlaps
-// read | compute | write.
-static void {{ kernel_name }}_stream(hls::stream<ap_axis<128, 0, 0, 0>>& in,
-                                     hls::stream<ap_axis<128, 0, 0, 0>>& out, bool last_iter) {
+// One OUTPUT shard: read shard-k of every operand, run the hls4ml op once (batched, II=1), write
+// shard-k of the result. DATAFLOW overlaps read | compute | write.
+static void {{ kernel_name }}_shard(
+{% for j in range(n_op_inputs) %}
+    hls::stream<ap_axis<128, 0, 0, 0>>& in{{ j }},
+{% endfor %}
+    hls::stream<ap_axis<128, 0, 0, 0>>& out, bool last_iter) {
 #pragma HLS DATAFLOW
-    hls::stream<input_t>  sm_in;
-    hls::stream<result_t> sm_out;
-#pragma HLS STREAM variable=sm_in  depth=8
-#pragma HLS STREAM variable=sm_out depth=8
-    {{ kernel_name }}_read(in, sm_in);
-    {{ nnet_fn }}<input_t, result_t, {{ kernel_name }}_cfg>(sm_in, sm_out);
-    {{ kernel_name }}_write(sm_out, out, last_iter);
+    hls::stream<input_t>  sm0;
+{% if n_op_inputs > 1 %}
+    hls::stream<input2_t> sm1;
+{% endif %}
+    hls::stream<result_t> smo;
+#pragma HLS STREAM variable=sm0 depth=8
+{% if n_op_inputs > 1 %}
+#pragma HLS STREAM variable=sm1 depth=8
+{% endif %}
+#pragma HLS STREAM variable=smo depth=8
+    {{ kernel_name }}_read(in0, sm0);
+{% if n_op_inputs > 1 %}
+    {{ kernel_name }}_read(in1, sm1);
+{% endif %}
+    {{ nnet_fn }}<input_t, {% if n_op_inputs > 1 %}input2_t, {% endif %}result_t, {{ kernel_name }}_cfg>(
+        sm0, {% if n_op_inputs > 1 %}sm1, {% endif %}smo);
+    {{ kernel_name }}_write(smo, out, last_iter);
 }
 
 extern "C" {
 
+// s_in ports are laid out operand-major: operand j, shard k -> s_in_{j*n_out + k}. s_out_k -> shard k.
 void {{ kernel_name }}(
 {% for s in range(n_in) %}
     hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
@@ -106,8 +121,12 @@ void {{ kernel_name }}(
 
     for (int it = 0; it < n_iter; it++) {
         bool last = (it == n_iter - 1);
-{% for s in range(n_in) %}
-        {{ kernel_name }}_stream(s_in_{{ s }}, s_out_{{ s }}, last);
+{% for k in range(n_out) %}
+        {{ kernel_name }}_shard(
+{% for j in range(n_op_inputs) %}
+            s_in_{{ j * n_out + k }},
+{% endfor %}
+            s_out_{{ k }}, last);
 {% endfor %}
     }
 }

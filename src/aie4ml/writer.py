@@ -208,10 +208,19 @@ class AIEProjectEmitter:
                     name=name,
                     source_layer=tv['source_layer'],
                     beats_per_iter=tv['beats_per_iter'],
+                    n_op_inputs=tv['n_op_inputs'],
+                    shards_per_input=tv['shards_per_input'],
                     out_dir=output_dir,
                 )
+            # Persist any HLS clock over-constraint back onto the kernel dict so the (later) Makefile
+            # render emits `--freqhz` for this kernel's `.xo` synthesis (same pl_plan object).
+            if extra_vars.get('syn_freqhz'):
+                kernel['syn_freqhz'] = extra_vars['syn_freqhz']
             kernel_ctx = {**system_io, **kernel.get('context', {}), **extra_vars}
-            self._render_template(env, kernel['cpp_template'], output_dir / 'pl' / f'{name}.cpp', kernel_ctx)
+            # A compute kernel may override its cpp template (e.g. LayerNorm's array-based wrapper);
+            # the .cfg template stays the generic one (same firmware includes).
+            cpp_template = extra_vars.get('cpp_template', kernel['cpp_template'])
+            self._render_template(env, cpp_template, output_dir / 'pl' / f'{name}.cpp', kernel_ctx)
             self._render_template(env, kernel['cfg_template'], output_dir / 'pl' / f'{name}.cfg', kernel_ctx)
 
         self._render_template(env, 'system.cfg.jinja', output_dir / 'system.cfg', system_io)

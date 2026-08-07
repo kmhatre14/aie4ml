@@ -1,6 +1,9 @@
 [hls]
 flow_target=vitis
 syn.file={{ kernel_name }}.cpp
+{% if hls_top_src %}
+syn.file={{ hls_top_src }}
+{% endif %}
 syn.cflags=-I. -I./{{ hls_proj }}/firmware -I./{{ hls_proj }}/firmware/nnet_utils
 syn.top={{ kernel_name }}
 package.ip.name={{ kernel_name }}

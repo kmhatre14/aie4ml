@@ -2,8 +2,8 @@
 
 """PL layer offload: partition the PLIO ports, and spec the PL compute kernels.
 
-When a layer carries ``run_on='pl'`` the ExcisePLNodes pass cuts it out of the AIE graph
-(passes/pl_excise.py), turning its two boundary tensors into extra PLIO ports. The array then has
+When a layer carries ``run_on='pl'`` the ExcisePLNodes pass cuts it out of the AIE graph, 
+turning its two boundary tensors into extra PLIO ports. The array then has
 more PLIO than the model's own inputs and outputs -- and the two roles are INTERLEAVED, not
 appended:
 
@@ -11,9 +11,7 @@ appended:
                \\___model__/ \\_cut_/                    \\_cut_/ \\model/
                   -> mm2s     <- PL kernel               -> PL     -> s2mm
 
-  * this module  -- port ROLES + each PL compute kernel's spec (an IR/plan projection).
-  * system_plan  -- nk=/sc= connectivity, the kernel list, the on-chip budget. It stays the single
-                    authority for connectivity; it just consumes the partition computed here.
+  * this module  -- port ROLES + each PL compute kernel's spec
 """
 
 from __future__ import annotations
@@ -25,15 +23,13 @@ from typing import List
 from .ir import get_backend_context
 from .passes.utils import sanitize_identifier
 
-# PL compute kernels live under pl/compute/; the data movers live under pl/benchmark|deployment/.
+# PL compute kernels live under pl/compute/
 _COMPUTE_TEMPLATE_DIR = 'pl/compute'
 # The generic AXIS wrapper around an hls4ml-generated op body (pl_hls4ml.py fills the firmware +
-# template vars at write time). 'dummy_softmax' remains available for plumbing/bring-up tests.
+# template vars at write time).
 _HLS4ML_KERNEL = 'hls4ml_kernel'
-_DUMMY_KERNEL = 'dummy_softmax'
 
-# CU names the data movers already own. A layer may not collide with one, or system.cfg would
-# declare two different kernels under the same nk= name.
+# CU names for data movers and tick gen
 _RESERVED_CU_NAMES = frozenset({'mm2s', 's2mm', 'tick_gen', 'traffic_gen', 'ddr_pl_aie_datamover'})
 
 
@@ -43,11 +39,25 @@ class PLKernelSpec:
 
     name: str  # CU name == the layer name, e.g. 'softmax_0'
     source_layer: str
-    cut_out_ports: List[int]  # PLIO_ofm indices -> kernel.s_in_*  (AIE -> PL)
+    # One PLIO_ofm port group per OP INPUT (AIE -> PL). A single-input op (softmax) has one group; a
+    # multi-input op (add) has one per operand. Each group is paired shard-for-shard with the output
+    # group, so group[k] and cut_in_ports[k] describe the same shard of one row.
+    cut_out_port_groups: List[List[int]]
     cut_in_ports: List[int]  # kernel.s_out_*   -> PLIO_ifm        (PL -> AIE)
     beats_per_iter: int  # AXIS beats ONE stream carries per iteration
     cpp_template: str
     cfg_template: str
+
+    @property
+    def n_op_inputs(self) -> int:
+        """Number of distinct operand tensors (1 for softmax, 2 for add)."""
+        return len(self.cut_out_port_groups)
+
+    @property
+    def cut_out_ports(self) -> List[int]:
+        """Flat PLIO_ofm list in s_in_* order: input-0 shards, then input-1 shards, ... Consumed by
+        the system.cfg wiring (sc= lines map flat index -> s_in_i)."""
+        return [p for group in self.cut_out_port_groups for p in group]
 
     @property
     def n_in(self) -> int:
@@ -55,6 +65,11 @@ class PLKernelSpec:
 
     @property
     def n_out(self) -> int:
+        return len(self.cut_in_ports)
+
+    @property
+    def shards_per_input(self) -> int:
+        """PLIO streams carrying one operand (== the output shard count; the wrapper pairs them)."""
         return len(self.cut_in_ports)
 
 
@@ -77,9 +92,7 @@ def resolve_pl_offload(model_or_ctx, layout) -> BoundaryPlan:
     """Partition the PLIO ports and describe each PL compute kernel.
 
     ``layout`` is a :class:`simulation.IOLayout` built from the physical plan; its per-tensor port
-    lists are already sorted by PLIO index. Port roles are ALWAYS derived from it, never assumed:
-    a cut tensor does not land in source order (in tutorial_4 the cut takes ofm[0..1] while the
-    real model output takes ofm[2]).
+    lists are already sorted by PLIO index.
 
     With no cuts this degenerates to the classic single-input/single-output check, so an AIE-only
     hardware build behaves exactly as before.
@@ -109,36 +122,39 @@ def resolve_pl_offload(model_or_ctx, layout) -> BoundaryPlan:
 
 
 def _kernel_spec(ctx, layout, cut) -> PLKernelSpec:
-    """Describe the PL kernel that replaces one excised layer."""
-    out_ports = layout.outputs.get(cut.cut_out_tensor)  # AIE -> PL
-    in_ports = layout.inputs.get(cut.cut_in_tensor)  # PL  -> AIE
-    if not out_ports or not in_ports:
+    """Describe the PL kernel that replaces one excised layer (single- or multi-input)."""
+    # One PLIO_ofm port group per OP INPUT (AIE -> PL); the single output group (PL -> AIE).
+    out_groups = [layout.outputs.get(t) for t in cut.cut_out_tensors]
+    in_ports = layout.inputs.get(cut.cut_in_tensor)  # PL -> AIE
+    missing = [t for t, g in zip(cut.cut_out_tensors, out_groups) if not g]
+    if missing or not in_ports:
         raise RuntimeError(
-            f'{cut.source_layer}: the cut tensors ({cut.cut_out_tensor!r} out, {cut.cut_in_tensor!r} '
-            'in) did not materialize as PLIO ports. The physical plan and the recorded cut disagree.'
+            f'{cut.source_layer}: cut tensors did not materialize as PLIO ports '
+            f'(missing out={missing}, in={cut.cut_in_tensor!r} -> {bool(in_ports)}). '
+            'The physical plan and the recorded cut disagree.'
         )
 
-    # The two port counts are resolved INDEPENDENTLY: cut_out follows the producer's output sharding
-    # (dense_1's CAS_NUM) and cut_in follows the consumer's input sharding (dense_2's CAS_LENGTH).
-    # They are both 2 in tutorial_4 only because the dims work out that way -- a differently shaped
-    # consumer could want 4 input chains, giving 2 ports out and 4 back in. The kernel maps
-    # s_in_k -> s_out_k one-to-one, so it cannot re-shard; reject rather than silently mis-wire.
-    if len(out_ports) != len(in_ports):
-        raise NotImplementedError(
-            f'{cut.source_layer}: the cut leaves the array on {len(out_ports)} PLIO port(s) and '
-            f're-enters on {len(in_ports)}. v1 maps s_in_k -> s_out_k one-to-one and cannot '
-            're-partition across the cut.'
-        )
+    # every input group must have the same port count as the output. Port counts follow 
+    # the producers' output sharding (each operand's CAS_NUM) and the consumer's input 
+    # sharding (CAS_LENGTH); reject a mismatch
+    n_out = len(in_ports)
+    for tname, group in zip(cut.cut_out_tensors, out_groups):
+        if len(group) != n_out:
+            raise NotImplementedError(
+                f'{cut.source_layer}: operand {tname!r} arrives on {len(group)} PLIO port(s) but the '
+                f'result re-enters on {n_out}.'
+            )
 
-    beats_out = _beats_per_iter(cut.source_layer, 'AIE->PL', ctx, out_ports)
-    beats_in = _beats_per_iter(cut.source_layer, 'PL->AIE', ctx, in_ports)
-    if beats_out != beats_in:
-        # Caught here rather than in hw_emu, where a volume mismatch presents as an unexplained hang.
-        raise NotImplementedError(
-            f'{cut.source_layer}: the cut carries {beats_out} beat(s)/stream out of the array but '
-            f'{beats_in} back in. The PL kernel would have to change the data volume, which an '
-            'elementwise op cannot.'
-        )
+    # All operands + the result share a shape here (elementwise/reduction), so beats/stream agree.
+    beats = _beats_per_iter(cut.source_layer, 'PL->AIE', ctx, in_ports)
+    for tname, group in zip(cut.cut_out_tensors, out_groups):
+        b = _beats_per_iter(cut.source_layer, f'AIE->PL[{tname}]', ctx, group)
+        if b != beats:
+            # Caught here rather than in hw_emu, where a volume mismatch presents as an unexplained hang.
+            raise NotImplementedError(
+                f'{cut.source_layer}: operand {tname!r} carries {b} beat(s)/stream but the result '
+                f'{beats}. The PL kernel would have to change the data volume.'
+            )
 
     name = sanitize_identifier(cut.source_layer)
     if name in _RESERVED_CU_NAMES:
@@ -150,9 +166,9 @@ def _kernel_spec(ctx, layout, cut) -> PLKernelSpec:
     return PLKernelSpec(
         name=name,
         source_layer=cut.source_layer,
-        cut_out_ports=[p.port for p in out_ports],
+        cut_out_port_groups=[[p.port for p in group] for group in out_groups],
         cut_in_ports=[p.port for p in in_ports],
-        beats_per_iter=beats_out,
+        beats_per_iter=beats,
         cpp_template=f'{_COMPUTE_TEMPLATE_DIR}/{_HLS4ML_KERNEL}.cpp.jinja',
         cfg_template=f'{_COMPUTE_TEMPLATE_DIR}/{_HLS4ML_KERNEL}.cfg.jinja',
     )

@@ -22,46 +22,49 @@ from typing import Any, Dict
 
 from .ir import get_backend_context
 
-# op_type (aie4ml) / hls4ml class_name -> the nnet:: streaming function the wrapper calls.
-# Each entry is a weight-less op called as fn<input_t, result_t, CONFIG>(in_stream, out_stream).
-_NNET_CALL = {
-    'Softmax': 'nnet::softmax',
-    'softmax': 'nnet::softmax',
+# aie4ml op key -> how to slice it and call it in the wrapper.
+_OP_SPEC = {
+    'softmax':    {'nnet_fn': 'nnet::softmax', 'size_field': 'n_in',   'n_inputs': 1},
+    # LayerNorm is DIFFERENT: io_parallel (array in/out, not streams), weighted (gamma/beta), and
+    # the call-the-top wrapper (hls4ml_baked_weights.cpp.jinja). Handled by a dedicated branch below.
+    'layer_norm': {'nnet_fn': 'nnet::layernormalize', 'size_field': 'n_in', 'n_inputs': 1,
+                   'io': 'parallel', 'weighted': True},
 }
 
 _DEFAULT_PART = 'xcve2802-vsvh1760-2MP-e-S'  # VEK280; only labels the hls4ml project (we do not build it)
 _FIFO_MAX_BITS = 4096  # hls::stream element aggregate limit
 
 
-def _parse_fixed(prec: str):
-    """'ap_ufixed<36,16,...>' | 'ufixed<36,16>' -> (unsigned: bool, W: int, I: int)."""
-    m = re.search(r'(ap_)?(u?)fixed<\s*(\d+)\s*,\s*(-?\d+)', str(prec))
-    if not m:
-        raise ValueError(f'cannot parse fixed-point precision {prec!r}')
-    return m.group(2) == 'u', int(m.group(3)), int(m.group(4))
-
-
-def _fmt_qi(qi) -> str:
+def _format_quant_intent(qi) -> str:
     """aie4ml QuantIntent (width, frac, signed) -> hls4ml precision string 'fixed<W,I>'/'ufixed<W,I>'
     (I = integer bits = width - frac)."""
     w, frac = int(qi.width), int(qi.frac)
     return f"{'' if qi.signed else 'u'}fixed<{w},{w - frac}>"
 
 
-def _fit_fifo(width: int, int_bits: int, n_feat: int):
-    """Narrow a fixed-point width so n_feat elements fit the <=4096-bit stream limit, keeping the
-    integer bits (value range) and trimming fractional bits. Returns (W, I)."""
-    if n_feat * width <= _FIFO_MAX_BITS:
-        return width, int_bits
-    cap = _FIFO_MAX_BITS // n_feat
-    new_w = cap
-    new_i = min(int_bits, new_w)
-    return new_w, new_i
+def _op_key(node) -> str:
+    """Normalize a retained-ModelGraph node to an aie4ml op key ('softmax' | 'layer_norm'), else None."""
+    cn = node.class_name
+    if cn in ('Softmax', 'softmax'):
+        return 'softmax'
+    if cn == 'LayerNormalization':
+        return 'layer_norm'
+    return None
 
 
-def generate_pl_kernel(model_or_ctx, *, name, source_layer, beats_per_iter, out_dir) -> Dict[str, Any]:
+def generate_pl_kernel(
+        model_or_ctx, *, 
+        name, 
+        source_layer, 
+        beats_per_iter, 
+        n_op_inputs, 
+        shards_per_input, 
+        out_dir
+    ) -> Dict[str, Any]:
+    
     """Slice ``source_layer`` out of the retained hls4ml ModelGraph, write its HLS firmware under
-    ``<out_dir>/pl/<name>_hls/``, and return the wrapper template vars."""
+    ``<out_dir>/pl/<name>_hls/``, and return the wrapper template vars. Handles the streaming
+    reduction op (softmax, batch-split) and the io_parallel weighted op (LayerNorm)."""
     import hls4ml  # noqa: F401  (import guarded here so aie-only flows need not import hls4ml)
     from hls4ml.model.graph import ModelGraph
 
@@ -78,33 +81,60 @@ def generate_pl_kernel(model_or_ctx, *, name, source_layer, beats_per_iter, out_
     if node is None:
         raise RuntimeError(f'PL offload: layer {layer!r} not found in the retained hls4ml ModelGraph.')
 
-    class_name = node.class_name
-    nnet_fn = _NNET_CALL.get(class_name)
-    if nnet_fn is None:
+    opkey = _op_key(node)
+    op = _OP_SPEC.get(opkey)
+    if op is None:
         raise NotImplementedError(
-            f'{layer}: auto PL kernel for op {class_name!r} is not supported yet (v1 supports '
-            f'weight-less streaming ops: {sorted(set(_NNET_CALL))}).'
+            f'{layer}: auto PL kernel for op {node.class_name!r} is not supported yet '
+            f'(supported: {sorted(_OP_SPEC)}).'
         )
+    if op['n_inputs'] != int(n_op_inputs):
+        raise RuntimeError(f'{layer}: op {opkey!r} takes {op["n_inputs"]} input(s) but the cut has {n_op_inputs}.')
 
-    in_var = node.get_input_variable()
-    in_name = node.inputs[0]
-    n_feat = int(in_var.shape[-1])
+    if op.get('io') == 'parallel':  # LayerNorm: io_parallel + baked gamma/beta (call-the-top)
+        return _layernorm_kernel(ctx, mg, node, name=name, source_layer=layer,
+                                 beats_per_iter=beats_per_iter, shards_per_input=shards_per_input, out_dir=out_dir)
 
-    # ON-WIRE precisions come from the aie4ml IR cut (the PLIO dtype authority), NOT the ModelGraph
-    # node: the AIE-flow node carries internal accumulator precisions (e.g. fixed<41,20>), while the
-    # cut carries the quantized int8/uint8 the data movers actually transfer across the PLIO.
     log = ctx.ir.logical
     cut = next((c for c in log.pl_cuts if c.source_layer == layer), None)
     if cut is None:
         raise RuntimeError(f'no PL cut recorded for layer {layer!r}')
-    in_prec = _fmt_qi(log.tensors[cut.cut_out_tensor].precision)   # AIE -> PL (op input)
-    u, w, i = _parse_fixed(_fmt_qi(log.tensors[cut.cut_in_tensor].precision))  # PL -> AIE (op output)
-    w2, i2 = _fit_fifo(w, i, n_feat)
-    out_frac = w2 - i2
-    out_prec = f"{'u' if u else ''}fixed<{w2},{i2}>"
+
+    full_feat = int(node.get_input_variable().shape[-1])
+    # PER-STREAM feature count: a batch-split (reduction) op carries WHOLE rows on each stream; a
+    # feature-split (elementwise) op carries a 1/shards slice. The sub-model + wrapper are built at
+    # this per-stream width.
+    per_stream_feat = full_feat if cut.reduces_features else full_feat // int(shards_per_input)
+    if per_stream_feat < 1:
+        raise RuntimeError(f'{layer}: per-stream feature count < 1 (full={full_feat}, shards={shards_per_input}).')
+
+    in_precs = [_format_quant_intent(log.tensors[t].precision) for t in cut.cut_out_tensors]  # per operand, in order
+    out_prec = _format_quant_intent(log.tensors[cut.cut_in_tensor].precision)
+    lane_bits = int(cut.width)
+    if per_stream_feat * lane_bits > _FIFO_MAX_BITS:
+        raise NotImplementedError(
+            f'{layer}: per-stream array is {per_stream_feat}x{lane_bits}={per_stream_feat * lane_bits} bits '
+            f'> {_FIFO_MAX_BITS}-bit hls::stream limit; needs more shards or a narrower dtype.'
+        )
 
     proj = f'{name}_hls'
     proj_dir = Path(out_dir) / 'pl' / proj
+
+    # Sub-model: N InputLayers -> op. Built at the per-stream feature width.
+    input_names = [f'{layer}_in{k}' for k in range(op['n_inputs'])]
+    layer_cfg = {nm: {'Precision': {'result': in_precs[k]}} for k, nm in enumerate(input_names)}
+    # Only the streaming softmax reaches here (layer_norm returns above; unsupported ops already raised).
+    layer_cfg[layer] = {
+        'Precision': {'result': out_prec}, 'implementation': 'stable',
+        'exp_table_t': 'fixed<18,8,RND,SAT>', 'inv_table_t': 'fixed<18,8,RND,SAT>',
+    }
+    op_layer = {'class_name': 'Softmax', 'name': layer, 'inputs': input_names, 'outputs': [layer],
+                'activation': 'softmax', 'axis': -1, 'n_in': per_stream_feat}
+    layer_list = [
+        {'class_name': 'InputLayer', 'name': nm, 'input_shape': [per_stream_feat], 'outputs': [nm]}
+        for nm in input_names
+    ]
+    layer_list.append(op_layer)
 
     sub_cfg = {
         'OutputDir': str(proj_dir),
@@ -114,50 +144,102 @@ def generate_pl_kernel(model_or_ctx, *, name, source_layer, beats_per_iter, out_
         # reject). Only labels the sub-project; aie4ml builds the .xo itself, never hls4ml's build.
         'Part': _DEFAULT_PART,
         'IOType': 'io_stream',
-        'HLSConfig': {
-            'Model': {'Precision': 'fixed<16,6>', 'ReuseFactor': 1, 'Strategy': 'Latency'},
-            'LayerName': {
-                in_name: {'Precision': {'result': in_prec}},
-                layer: {
-                    'Precision': {'result': out_prec},
-                    'implementation': 'stable',
-                    'exp_table_t': 'fixed<18,8,RND,SAT>',
-                    'inv_table_t': 'fixed<18,8,RND,SAT>',
-                },
-            },
-        },
+        'HLSConfig': {'Model': {'Precision': 'fixed<16,6>', 'ReuseFactor': 1, 'Strategy': 'Latency'},
+                      'LayerName': layer_cfg},
     }
-    input_layer = {'class_name': 'InputLayer', 'name': in_name, 'input_shape': [n_feat], 'outputs': [in_name]}
-    op_layer = {
-        'class_name': class_name, 'name': layer, 'inputs': [in_name], 'outputs': [layer],
-        'activation': 'softmax', 'axis': -1, 'n_in': n_feat,
-    }
-    sub = ModelGraph.from_layer_list(sub_cfg, [input_layer, op_layer], inputs=[in_name], outputs=[layer])
+    sub = ModelGraph.from_layer_list(sub_cfg, layer_list, inputs=input_names, outputs=[layer])
     sub.write()
 
-    params_h = proj_dir / 'firmware' / 'parameters.h'
-    cfg_name = _config_struct_name(params_h)
-
-    # rows one PLIO stream carries: beats_per_iter beats / (n_feat/lanes) beats-per-row.
-    lanes_per_beat = int(ctx.device.plio_width_bits) // int(spec_width(ctx, layer))
-    beats_per_row = n_feat // lanes_per_beat
+    cfg_name = _config_struct_name(proj_dir / 'firmware' / 'parameters.h')
+    lanes_per_beat = int(ctx.device.plio_width_bits) // lane_bits
+    beats_per_row = per_stream_feat // lanes_per_beat
     rows_per_stream = beats_per_iter // beats_per_row
-    lane_bits = int(spec_width(ctx, layer))
 
     return {
         'hls_proj': proj,                       # firmware dir + include prefix
         'hls_defines': f'{proj}/firmware/defines.h',
         'hls_params': f'{proj}/firmware/parameters.h',
-        'nnet_fn': nnet_fn,                      # e.g. nnet::softmax
-        'hls_cfg': cfg_name,                     # e.g. softmax_config2 (from the generated file)
-        'feats': n_feat,
+        'nnet_fn': op['nnet_fn'],               # nnet::softmax
+        'hls_cfg': cfg_name,                    # generated config struct (e.g. softmax_config2)
+        'size_field': op['size_field'],         # config field to batch over rows (n_in)
+        'n_op_inputs': op['n_inputs'],          # operand streams per output shard (1 for softmax)
+        'feats': per_stream_feat,
         'rows_per_stream': rows_per_stream,
         'beats_per_row': beats_per_row,
         'lanes_per_beat': lanes_per_beat,
         'lane_bits': lane_bits,
-        'trunc_hi': out_frac - 1,               # uint8 = top lane_bits of the fractional field
-        'trunc_lo': out_frac - lane_bits,
+        'trunc_hi': lane_bits - 1,              # result element is exactly lane_bits wide -> copy all
+        'trunc_lo': 0,
     }
+
+
+def _layernorm_kernel(ctx, mg, node, *, name, source_layer, beats_per_iter, shards_per_input, out_dir):
+    """LayerNorm PL kernel: io_parallel nnet::layernormalize with gamma/beta BAKED into the .xo via
+    the hls4ml-generated top (call-the-top). hls4ml requires a 3-D LN input, so the sub-model uses
+    shape [1, feat]; the trained gamma/beta are baked into the sub-model's firmware."""
+    import numpy as np
+    from hls4ml.model.graph import ModelGraph
+
+    layer = source_layer
+    log = ctx.ir.logical
+    cut = next((c for c in log.pl_cuts if c.source_layer == layer), None)
+    if cut is None:
+        raise RuntimeError(f'no PL cut recorded for layer {layer!r}')
+
+    full_feat = int(node.get_input_variable().shape[-1])
+    per_stream_feat = full_feat if cut.reduces_features else full_feat // int(shards_per_input)
+    lane_bits = int(cut.width)
+    if per_stream_feat * lane_bits > _FIFO_MAX_BITS:
+        raise NotImplementedError(
+            f'{layer}: per-stream array {per_stream_feat}x{lane_bits} > {_FIFO_MAX_BITS}-bit FIFO limit.'
+        )
+
+    in_prec = _format_quant_intent(log.tensors[cut.cut_out_tensors[0]].precision)
+    out_prec = _format_quant_intent(log.tensors[cut.cut_in_tensor].precision)
+
+    w = getattr(node, 'weights', {}) or {}
+    gamma = (np.asarray(w['scale'].data, dtype=np.float32).flatten() if 'scale' in w
+             else np.ones(per_stream_feat, dtype=np.float32))
+    beta = (np.asarray(w['bias'].data, dtype=np.float32).flatten() if 'bias' in w
+            else np.zeros(per_stream_feat, dtype=np.float32))
+
+    proj = f'{name}_hls'
+    proj_dir = Path(out_dir) / 'pl' / proj
+    in_name = f'{layer}_in0'
+    sub_cfg = {
+        'OutputDir': str(proj_dir), 'ProjectName': proj, 'Backend': 'Vitis', 'Part': _DEFAULT_PART,
+        'IOType': 'io_parallel',
+        'HLSConfig': {'Model': {'Precision': 'fixed<16,6>', 'ReuseFactor': 1, 'Strategy': 'Latency'},
+                      'LayerName': {in_name: {'Precision': {'result': in_prec}},
+                                    layer: {'Precision': {'result': out_prec}}}},
+    }
+    input_layer = {'class_name': 'InputLayer', 'name': in_name, 'input_shape': [1, per_stream_feat],
+                   'outputs': [in_name]}
+    ln_layer = {'class_name': 'LayerNormalization', 'name': layer, 'inputs': [in_name], 'outputs': [layer],
+                'n_in': per_stream_feat, 'seq_len': 1, 'epsilon': 1e-3,
+                'gamma_data': gamma, 'beta_data': beta, 'scale_data': gamma, 'bias_data': beta}
+    sub = ModelGraph.from_layer_list(sub_cfg, [input_layer, ln_layer], inputs=[in_name], outputs=[layer])
+    sub.write()
+
+    cfg_name = _config_struct_name(proj_dir / 'firmware' / 'parameters.h')
+    lanes_per_beat = int(ctx.device.plio_width_bits) // lane_bits
+    beats_per_row = per_stream_feat // lanes_per_beat
+    rows_per_stream = beats_per_iter // beats_per_row
+    common = {
+        'hls_proj': proj, 'hls_defines': f'{proj}/firmware/defines.h',
+        'hls_params': f'{proj}/firmware/parameters.h', 'hls_cfg': cfg_name,
+        'feats': per_stream_feat, 'rows_per_stream': rows_per_stream, 'beats_per_row': beats_per_row,
+        'lanes_per_beat': lanes_per_beat, 'lane_bits': lane_bits,
+    }
+    # Weights (gamma/beta) are BAKED into the .xo: the hls4ml-generated top declares them as const
+    # arrays and passes them to nnet::layernormalize internally, so the wrapper is pure data glue --
+    # the same call-the-top flow works for any weighted op.
+    # syn_freqhz over-constrains HLS (350 MHz) so the deep reduce/normalize datapath registers deeper
+    # and closes timing at the real 312.5 MHz PL clock (the DATAFLOW wrapper leaves latency headroom).
+    # Consumed by Makefile.jinja.
+    return {**common, 'cpp_template': 'pl/compute/hls4ml_baked_weights.cpp.jinja',
+            'hls_top': proj, 'hls_top_src': f'{proj}/firmware/{proj}.cpp',
+            'syn_freqhz': 350000000}
 
 
 def _config_struct_name(params_h: Path) -> str:

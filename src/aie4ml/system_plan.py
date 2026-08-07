@@ -311,6 +311,8 @@ def _compute_kernel_entry(spec) -> Dict[str, Any]:
             'source_layer': spec.source_layer,
             'n_in': spec.n_in,
             'n_out': spec.n_out,
+            'n_op_inputs': spec.n_op_inputs,        # operand tensors (1 softmax, 2 add)
+            'shards_per_input': spec.shards_per_input,  # PLIO streams per operand (== output shards)
             'beats_per_iter': spec.beats_per_iter,
         },
     }
@@ -339,11 +341,6 @@ def build_pl_plan(
       * ``system.cfg.jinja``  -> ``plan['nk']`` / ``plan['sc']`` connectivity,
       * ``host.cpp.jinja``    -> ``plan['host']`` (timing CU, ``cycles_*`` regs, compute CUs).
 
-    Ports are passed as EXPLICIT lists, not counts. When a layer is offloaded to the PL, the movers
-    no longer own PLIO_ifm_0..n-1: the cut takes some of that numbering (in tutorial_4 mm2s gets
-    ifm 0-3 while the cut gets ifm 4-5, and the model output sits on ofm 2 *after* the cut's ofm
-    0-1). ``pl_offload.resolve_pl_offload`` computes the partition; this function only wires it.
-
     Modes:
       ``benchmark``     single combined ``ddr_pl_aie_datamover`` CU (today's design);
       ``memory_stream`` one ``mm2s`` CU per input tensor + one ``s2mm`` CU, double-buffered, plus a
@@ -352,7 +349,7 @@ def build_pl_plan(
       ``external_stream`` on-chip HLS ``traffic_gen`` source -> AIE -> ``s2mm`` (a
                         synthesizable stand-in for an external AXI producer); PL timing off.
 
-    ``pl_kernels`` (PLKernelSpec) are the offloaded layers; only ``memory_stream`` supports them.
+      ``pl_kernels`` (PLKernelSpec) are the offloaded layers; only ``memory_stream`` supports them.
     """
     mode = str(mode).lower()
     n_ifm = sum(int(t['n_streams']) for t in ifm_tensors)  # total input PLIO ports

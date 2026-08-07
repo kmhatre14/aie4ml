@@ -88,8 +88,8 @@ class ExcisePLNodes(AIEPass):
         layer = self._layer(node)
 
         # Weighted layers (layer_norm gamma/beta, ...) CAN run on the PL: the PL kernel gets its
-        # weights from the hls4ml firmware (baked) or runtime-loaded via s_axilite, and _cut_node
-        # drops the param tensors from the AIE graph. Only the ACTIVATION inputs become cut-outs.
+        # weights baked into the hls4ml firmware (the generated top), and _cut_node drops the param
+        # tensors from the AIE graph. Only the ACTIVATION inputs become cut-outs.
         activations = [t for t in node.inputs if not t.is_parameter]
         if not activations or len(node.outputs) != 1:
             raise ValueError(

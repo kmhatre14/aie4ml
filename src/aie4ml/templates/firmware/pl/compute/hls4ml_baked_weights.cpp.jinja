@@ -1,0 +1,138 @@
+/*
+Copyright (C) 2026, Advent lab
+
+{{ kernel_name }} -- AUTO-GENERATED PL kernel for the offloaded '{{ source_layer }}' layer.
+Design: {{ project_name }} ({{ n_in }} stream(s) in / {{ n_out }} out, {{ beats_per_iter }} beats/stream/iter).
+
+GENERIC "call-the-top" flow: the op body is the hls4ml-generated TOP function
+({{ hls_top }} in pl/{{ hls_proj }}/), which declares and BAKES all parameters (weights/gamma/beta/...)
+as const arrays and passes them to the nnet:: layer internally. So this file is pure data glue
+(AXIS beats <-> the top's data IO) with ZERO parameter handling -- identical for softmax, layer-norm,
+dense, or any weighted op. hls4ml owns the parameter part.
+
+Per stream it runs an HLS DATAFLOW pipeline: gather-rows | call-the-top | scatter-rows execute
+CONCURRENTLY on different rows (read row N || compute row N-1 || write row N-2), so the per-row
+read/compute/write no longer serialize -- throughput is bounded by the slowest stage, not their sum.
+*/
+
+#include <ap_int.h>
+#include <hls_stream.h>
+#include <ap_axi_sdata.h>
+
+#include "{{ hls_defines }}"                 // input_t, result_t (scalar element types, io_parallel)
+#include "{{ hls_proj }}/firmware/{{ hls_proj }}.h"  // the generated top function {{ hls_top }}()
+
+static const int FEATS           = {{ feats }};
+static const int ROWS_PER_STREAM = {{ rows_per_stream }};
+static const int BEATS_PER_ROW   = {{ beats_per_row }};
+static const int LANES_PER_BEAT  = {{ lanes_per_beat }};
+static const int LANE_BITS       = {{ lane_bits }};
+
+// One complete feature row carried through the dataflow FIFOs (<= 4096-bit stream element).
+struct {{ kernel_name }}_row_in  { input_t  v[FEATS]; };
+struct {{ kernel_name }}_row_out { result_t v[FEATS]; };
+
+// --- stage 1: AXIS beats -> one assembled row ---
+static void {{ kernel_name }}_read(hls::stream<ap_axis<128, 0, 0, 0>>& in,
+                                   hls::stream<{{ kernel_name }}_row_in>& rows) {
+    for (int r = 0; r < ROWS_PER_STREAM; r++) {
+        {{ kernel_name }}_row_in x;
+        for (int b = 0; b < BEATS_PER_ROW; b++) {
+        #pragma HLS PIPELINE II=1
+            ap_axis<128, 0, 0, 0> beat = in.read();
+            for (int l = 0; l < LANES_PER_BEAT; l++) {
+            #pragma HLS UNROLL
+                x.v[b * LANES_PER_BEAT + l].range(LANE_BITS - 1, 0) =
+                    beat.data.range(l * LANE_BITS + LANE_BITS - 1, l * LANE_BITS);  // raw bit-reinterpret
+            }
+        }
+        rows.write(x);
+    }
+}
+
+// --- stage 2: call the hls4ml top per row (parameters baked inside it) ---
+static void {{ kernel_name }}_compute(hls::stream<{{ kernel_name }}_row_in>& rows_in,
+                                      hls::stream<{{ kernel_name }}_row_out>& rows_out) {
+    for (int r = 0; r < ROWS_PER_STREAM; r++) {
+        {{ kernel_name }}_row_in  x = rows_in.read();
+        {{ kernel_name }}_row_out y;
+        input_t  data[FEATS];
+        result_t res[FEATS];
+#pragma HLS ARRAY_PARTITION variable=data complete
+#pragma HLS ARRAY_PARTITION variable=res  complete
+        for (int i = 0; i < FEATS; i++) {
+        #pragma HLS UNROLL
+            data[i] = x.v[i];
+        }
+        {{ hls_top }}(data, res);  // hls4ml-generated top: weights/gamma/beta baked inside
+        for (int i = 0; i < FEATS; i++) {
+        #pragma HLS UNROLL
+            y.v[i] = res[i];
+        }
+        rows_out.write(y);
+    }
+}
+
+// --- stage 3: assembled row -> AXIS beats (+ regen TLAST) ---
+static void {{ kernel_name }}_write(hls::stream<{{ kernel_name }}_row_out>& rows,
+                                    hls::stream<ap_axis<128, 0, 0, 0>>& out, bool last_iter) {
+    for (int r = 0; r < ROWS_PER_STREAM; r++) {
+        {{ kernel_name }}_row_out y = rows.read();
+        for (int b = 0; b < BEATS_PER_ROW; b++) {
+        #pragma HLS PIPELINE II=1
+            ap_uint<128> packed = 0;
+            for (int l = 0; l < LANES_PER_BEAT; l++) {
+            #pragma HLS UNROLL
+                packed.range(l * LANE_BITS + LANE_BITS - 1, l * LANE_BITS) =
+                    y.v[b * LANES_PER_BEAT + l].range(LANE_BITS - 1, 0);
+            }
+            ap_axis<128, 0, 0, 0> beat;
+            beat.data = packed;
+            beat.keep = -1;
+            beat.last = (last_iter && r == ROWS_PER_STREAM - 1 && b == BEATS_PER_ROW - 1) ? 1 : 0;
+            out.write(beat);
+        }
+    }
+}
+
+// One PLIO stream: read | call-the-top | write overlap across rows (DATAFLOW).
+static void {{ kernel_name }}_stream(hls::stream<ap_axis<128, 0, 0, 0>>& in,
+                                     hls::stream<ap_axis<128, 0, 0, 0>>& out, bool last_iter) {
+#pragma HLS DATAFLOW
+    hls::stream<{{ kernel_name }}_row_in>  rows_in;
+    hls::stream<{{ kernel_name }}_row_out> rows_out;
+#pragma HLS STREAM variable=rows_in  depth=4
+#pragma HLS STREAM variable=rows_out depth=4
+    {{ kernel_name }}_read(in, rows_in);
+    {{ kernel_name }}_compute(rows_in, rows_out);
+    {{ kernel_name }}_write(rows_out, out, last_iter);
+}
+
+extern "C" {
+
+void {{ kernel_name }}(
+{% for s in range(n_in) %}
+    hls::stream<ap_axis<128, 0, 0, 0>>& s_in_{{ s }},
+{% endfor %}
+{% for s in range(n_out) %}
+    hls::stream<ap_axis<128, 0, 0, 0>>& s_out_{{ s }},
+{% endfor %}
+    int n_iter) {
+{% for s in range(n_in) %}
+#pragma HLS INTERFACE axis port=s_in_{{ s }}
+{% endfor %}
+{% for s in range(n_out) %}
+#pragma HLS INTERFACE axis port=s_out_{{ s }}
+{% endfor %}
+#pragma HLS INTERFACE s_axilite port=n_iter bundle=control
+#pragma HLS INTERFACE s_axilite port=return bundle=control
+
+    for (int it = 0; it < n_iter; it++) {
+        bool last = (it == n_iter - 1);
+{% for s in range(n_in) %}
+        {{ kernel_name }}_stream(s_in_{{ s }}, s_out_{{ s }}, last);
+{% endfor %}
+    }
+}
+
+}

@@ -152,7 +152,7 @@ hw_emu: aiecom kernels xsa_hw_emu host package_hw_emu
 # ---------- PL kernels (HLS data movers -> .xo) ----------
 kernels: guard-PLATFORM_REPO_PATHS
 {% for k in pl_plan.kernels %}
-	$(VPP) $(VPP_XO_FLAGS) --config pl/{{ k.name }}.cfg
+	$(VPP) $(VPP_XO_FLAGS) {% if k.syn_freqhz %}--freqhz {{ k.syn_freqhz }} {% endif %}--config pl/{{ k.name }}.cfg
 {% endfor %}
 
 # ---------- XSA (link PL .xo + AIE graph) ----------
