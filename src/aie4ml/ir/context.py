@@ -73,6 +73,8 @@ class DeviceSpec:
     max_mem_out_ports: int
     dialect: str
     vector_bytes: int = 64
+    # Concrete Vitis FPGA part string (e.g. 'xcve2802-vsvh1760-2MP-e-S'), 
+    part: str = ''
     # PL on-chip budget for the data mover preload buffers, as block geometry. The buffers are
     # bound to URAM or BRAM depending on PLMemory, so both pools are carried here; system
     # planning picks the matching one. Sourced from the catalog's "UltraRAM"/"BlockRAM" entries;
@@ -118,6 +120,7 @@ class DeviceSpec:
             max_mem_out_ports=_require_int(cfg, 'MaxMemTileOutPorts'),
             dialect=detect_dialect(str(cfg['Generation'])),
             vector_bytes=int(cfg.get('VectorBytes', 64)),
+            part=str(cfg.get('Part', '') or ''),
             uram_total_bytes=int(uram.get('TotalBytes', 0)),
             uram_block_bytes=int(uram.get('BlockBytes', 0)),
             uram_blocks=int(uram.get('Blocks', 0)),

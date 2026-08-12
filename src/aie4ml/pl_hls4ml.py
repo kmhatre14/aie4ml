@@ -31,8 +31,35 @@ _OP_SPEC = {
                    'io': 'parallel', 'weighted': True},
 }
 
-_DEFAULT_PART = 'xcve2802-vsvh1760-2MP-e-S'  # VEK280; only labels the hls4ml project (we do not build it)
 _FIFO_MAX_BITS = 4096  # hls::stream element aggregate limit
+
+
+def _pl_part(ctx) -> str:
+    """
+    Vitis part for the hls4ml PL offload
+    """
+    part = getattr(ctx.device, 'part', '') or ''
+    if not part:
+        raise RuntimeError(
+            f'PL offload needs a Vitis "Part" for platform {ctx.device.platform!r}, but its '
+            f'aie_devices.json entry has none. Add a "Part" field (e.g. "xcve2802-vsvh1760-2MP-e-S") '
+            f'to that device entry.'
+        )
+    return part
+
+
+def _pl_reuse_factor(mg, node) -> int:
+    """
+    ReuseFactor for this layer's hls4ml offloads. Defaults to 1 (fully spatial). 
+    """
+    raw = mg.config.get_layer_config_value(node, 'pl_reuse_factor', 1)
+    try:
+        rf = int(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f'{node.name}: pl_reuse_factor must be a positive integer, got {raw!r}.')
+    if rf < 1:
+        raise ValueError(f'{node.name}: pl_reuse_factor must be >= 1, got {rf}.')
+    return rf
 
 
 def _format_quant_intent(qi) -> str:
@@ -141,10 +168,12 @@ def generate_pl_kernel(
         'ProjectName': proj,
         'Backend': 'Vitis',
         # A concrete Vitis part (not the aie4ml platform string, which hls4ml's config parser would
-        # reject). Only labels the sub-project; aie4ml builds the .xo itself, never hls4ml's build.
-        'Part': _DEFAULT_PART,
+        # reject). Sourced from the device catalog ("Part" in aie_devices.json); only labels the
+        # sub-project -- aie4ml builds the .xo itself, never hls4ml's build.
+        'Part': _pl_part(ctx),
         'IOType': 'io_stream',
-        'HLSConfig': {'Model': {'Precision': 'fixed<16,6>', 'ReuseFactor': 1, 'Strategy': 'Latency'},
+        'HLSConfig': {'Model': {'Precision': 'fixed<16,6>', 'ReuseFactor': _pl_reuse_factor(mg, node),
+                                'Strategy': 'Latency'},
                       'LayerName': layer_cfg},
     }
     sub = ModelGraph.from_layer_list(sub_cfg, layer_list, inputs=input_names, outputs=[layer])
@@ -207,9 +236,10 @@ def _layernorm_kernel(ctx, mg, node, *, name, source_layer, beats_per_iter, shar
     proj_dir = Path(out_dir) / 'pl' / proj
     in_name = f'{layer}_in0'
     sub_cfg = {
-        'OutputDir': str(proj_dir), 'ProjectName': proj, 'Backend': 'Vitis', 'Part': _DEFAULT_PART,
+        'OutputDir': str(proj_dir), 'ProjectName': proj, 'Backend': 'Vitis', 'Part': _pl_part(ctx),
         'IOType': 'io_parallel',
-        'HLSConfig': {'Model': {'Precision': 'fixed<16,6>', 'ReuseFactor': 1, 'Strategy': 'Latency'},
+        'HLSConfig': {'Model': {'Precision': 'fixed<16,6>', 'ReuseFactor': _pl_reuse_factor(mg, node),
+                                'Strategy': 'Latency'},
                       'LayerName': {in_name: {'Precision': {'result': in_prec}},
                                     layer: {'Precision': {'result': out_prec}}}},
     }
