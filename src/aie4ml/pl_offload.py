@@ -77,10 +77,9 @@ class PLKernelSpec:
 class BoundaryPlan:
     """PLIO ports partitioned into the model boundary (DDR movers) and the PL-kernel cuts."""
 
-    model_ifm_ports: List[int]  # -> mm2s
-    model_ofm_ports: List[int]  # -> s2mm
-    model_input_tensor: str
-    model_output_tensor: str
+    # Model-boundary tensors 
+    model_input_tensors: List[str]  # -> one mm2s each
+    model_output_tensors: List[str]  # -> one s2mm each
     kernels: List[PLKernelSpec]
 
     @property
@@ -94,8 +93,9 @@ def resolve_pl_offload(model_or_ctx, layout) -> BoundaryPlan:
     ``layout`` is a :class:`simulation.IOLayout` built from the physical plan; its per-tensor port
     lists are already sorted by PLIO index.
 
-    With no cuts this degenerates to the classic single-input/single-output check, so an AIE-only
-    hardware build behaves exactly as before.
+    Every graph tensor that is not a cut tensor is a MODEL tensor and gets its own DDR mover, so
+    N model inputs / M model outputs are supported (memory_stream). With no cuts every layout
+    tensor is a model tensor and an AIE-only hardware build behaves exactly as before.
     """
     ctx = get_backend_context(model_or_ctx)
     cuts = list(ctx.ir.logical.pl_cuts)
@@ -103,20 +103,23 @@ def resolve_pl_offload(model_or_ctx, layout) -> BoundaryPlan:
     cut_in_names = ctx.ir.logical.cut_in_tensor_names()  # PL -> AIE (extra graph INPUTS)
     cut_out_names = ctx.ir.logical.cut_out_tensor_names()  # AIE -> PL (extra graph OUTPUTS)
 
-    model_inputs = [t for t in layout.inputs if t not in cut_in_names]
-    model_outputs = [t for t in layout.outputs if t not in cut_out_names]
-    if len(model_inputs) != 1 or len(model_outputs) != 1:
+    # Mover j serves model tensor j: order by first PLIO port so the numbering is deterministic and
+    # matches the host's buffer order (pack_host_data) and data.h's ifm_ports/ofm_ports.
+    def _first_port(ports):
+        return min(int(p.port) for p in ports)
+
+    model_inputs = sorted((t for t in layout.inputs if t not in cut_in_names), key=lambda t: _first_port(layout.inputs[t]))
+    model_outputs = sorted((t for t in layout.outputs if t not in cut_out_names), key=lambda t: _first_port(layout.outputs[t]))
+    if not model_inputs or not model_outputs:
         raise RuntimeError(
-            'system I/O plan supports exactly one graph input and one graph output tensor. After '
+            'system I/O plan needs at least one model input and one model output tensor. After '
             f'setting aside {len(cuts)} PL cut(s), it found input(s)={model_inputs} and '
-            f'output(s)={model_outputs}. Multiple model I/O tensors are not yet supported.'
+            f'output(s)={model_outputs}.'
         )
 
     return BoundaryPlan(
-        model_ifm_ports=[p.port for p in layout.inputs[model_inputs[0]]],
-        model_ofm_ports=[p.port for p in layout.outputs[model_outputs[0]]],
-        model_input_tensor=model_inputs[0],
-        model_output_tensor=model_outputs[0],
+        model_input_tensors=model_inputs,
+        model_output_tensors=model_outputs,
         kernels=[_kernel_spec(ctx, layout, cut) for cut in cuts],
     )
 

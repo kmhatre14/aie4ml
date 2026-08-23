@@ -368,8 +368,9 @@ def build_pl_plan(
             print("[aie4ml] PLDataMoverMode='benchmark' forces PL timers ON " '(overriding EnablePLTiming=False).')
             enable_pl_timing = True
         name = _BENCHMARK_KERNEL
-        sc = [f'{name}.s_out_{i}:ai_engine_0.PLIO_ifm_{p}' for i, p in enumerate(ifm_tensors[0]['ports'])]
-        sc += [f'ai_engine_0.PLIO_ofm_{p}:{name}.s_in_{i}' for i, p in enumerate(ofm_tensors[0]['ports'])]
+        # Single tensor per side and no PL cuts (both guarded), so the mover owns PLIO 0..n-1.
+        sc = [f'{name}.s_out_{s}:ai_engine_0.PLIO_ifm_{s}' for s in range(n_ifm)]
+        sc += [f'ai_engine_0.PLIO_ofm_{s}:{name}.s_in_{s}' for s in range(n_ofm)]
         # The combined CU owns tick_gen internally; the host reads its 7 cycles_* regs.
         return {
             'mode': mode,
@@ -541,25 +542,26 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     layout = build_io_layout(ctx)
     batch = int(ctx.aie_config['BatchSize'])
     pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
-    # Multiple graph input OR output tensors are supported only by memory_stream (each gets its own
+
+    # Partition the graph tensors into the MODEL boundary (what the DDR movers own) and the PL cuts
+    # (driven by the PL compute kernels).
+    boundary = resolve_pl_offload(ctx, layout)
+    model_inputs = {t: layout.inputs[t] for t in boundary.model_input_tensors}
+    model_outputs = {t: layout.outputs[t] for t in boundary.model_output_tensors}
+    # Multiple model input OR output tensors are supported only by memory_stream (each gets its own
     # mm2s / s2mm mover); benchmark/external assume a single tensor on each side.
-    if len(layout.inputs) > 1 and pl_data_mover_mode != 'memory_stream':
+    if len(model_inputs) > 1 and pl_data_mover_mode != 'memory_stream':
         raise RuntimeError(
-            f'multiple graph input tensors ({len(layout.inputs)}) require '
+            f'multiple graph input tensors ({len(model_inputs)}) require '
             f"PLDataMoverMode='memory_stream' (each input needs its own mm2s mover); "
             f'got {pl_data_mover_mode!r}.'
         )
-    if len(layout.outputs) > 1 and pl_data_mover_mode != 'memory_stream':
+    if len(model_outputs) > 1 and pl_data_mover_mode != 'memory_stream':
         raise RuntimeError(
-            f'multiple graph output tensors ({len(layout.outputs)}) require '
+            f'multiple graph output tensors ({len(model_outputs)}) require '
             f"PLDataMoverMode='memory_stream' (each output needs its own s2mm mover); "
             f'got {pl_data_mover_mode!r}.'
         )
-
-    # Partition the PLIO ports into the MODEL boundary (what the DDR movers own) and the PL cuts
-    boundary = resolve_pl_offload(ctx, layout)
-    model_inputs = {boundary.model_input_tensor: layout.inputs[boundary.model_input_tensor]}
-    model_outputs = {boundary.model_output_tensor: layout.outputs[boundary.model_output_tensor]}
 
     # Per-tensor movers, ordered by first PLIO port (one mm2s CU per input tensor, one s2mm CU per
     # output tensor -- a single sharded tensor stays one mover). (n_streams, per_stream) per tensor
@@ -571,17 +573,14 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     n_ifm = sum(s['n_streams'] for s in ifm_tensor_specs)  # model-boundary PLIO counts
     n_ofm = sum(s['n_streams'] for s in ofm_tensor_specs)
 
-    out_feat, out_bytes = _io_feat(
-        layout.outputs[boundary.model_output_tensor], boundary.model_output_tensor, 'output', batch
-    )
-    in_feat, _ = _io_feat(
-        layout.inputs[boundary.model_input_tensor], boundary.model_input_tensor, 'input', batch
-    )
-    # Per-PLIO-tile feature slices come from the first graph boundary port of each direction
-    # gin_port = next(iter(layout.inputs.values()))[0]
-    # gout_port = next(iter(layout.outputs.values()))[0]
-    gin_port = layout.inputs[boundary.model_input_tensor][0]
-    gout_port = layout.outputs[boundary.model_output_tensor][0]
+    # Scalar in_feat/out_feat and the per-PLIO-tile slices describe the FIRST model tensor on each
+    # side (== the only one for benchmark/external_stream; memory_stream sizes each mover from its
+    # own spec, so these scalars are informational there).
+    first_in, first_out = boundary.model_input_tensors[0], boundary.model_output_tensors[0]
+    out_feat, out_bytes = _io_feat(model_outputs[first_out], first_out, 'output', batch)
+    in_feat, _ = _io_feat(model_inputs[first_in], first_in, 'input', batch)
+    gin_port = model_inputs[first_in][0]
+    gout_port = model_outputs[first_out][0]
     in_feat_slice = gin_port.tiling_dimension[gin_port.slice_dimension]
     out_feat_slice = gout_port.tiling_dimension[gout_port.slice_dimension]
 
@@ -642,8 +641,8 @@ def build_system_io(model_or_ctx) -> Dict[str, Any]:
     # pl_data_mover_mode = str(ctx.aie_config.get('PLDataMoverMode', 'benchmark')).lower()
     pl_plan = build_pl_plan(
         pl_data_mover_mode,
-        ifm_tensors=boundary.model_ifm_ports,
-        ofm_tensors=boundary.model_ofm_ports,
+        ifm_tensors=ifm_tensor_specs,
+        ofm_tensors=ofm_tensor_specs,
         pl_kernels=boundary.kernels,
         enable_pl_timing=bool(ctx.aie_config.get('EnablePLTiming', True)),
     )
@@ -778,15 +777,13 @@ def pack_host_data(model_or_ctx, X=None):
     # Select the MODEL boundary explicitly: with a PL cut there are two input and two output
     # tensors, and iteration order would otherwise pack the cut tensor instead of the model's.
     bplan = resolve_pl_offload(ctx, layout)
-    in_tensor = bplan.model_input_tensor
-    in_ports = layout.inputs[in_tensor]
-    out_port0 = layout.outputs[bplan.model_output_tensor][0]
 
     # prepare_inputs() prepares EVERY tensor in the layout it is handed. The cut tensors are graph
-    # inputs too, but the PL kernel drives them -- not the host -- so give it a model-only view.
+    # inputs too, but the PL kernel drives them -- not the host -- so give it a model-only view
+    # (all model tensors, one host buffer per mover).
     model_layout = IOLayout(
-        inputs={in_tensor: in_ports},
-        outputs={bplan.model_output_tensor: layout.outputs[bplan.model_output_tensor]},
+        inputs={t: layout.inputs[t] for t in bplan.model_input_tensors},
+        outputs={t: layout.outputs[t] for t in bplan.model_output_tensors},
     )
 
     # One X per graph input tensor. Default: deterministic pseudo-random per tensor (its own seed
@@ -795,14 +792,14 @@ def pack_host_data(model_or_ctx, X=None):
     if X is None:
         X = {
             tname: np.random.default_rng(seed).random(ports[0].numpy_boundary_shape, dtype=np.float64) * 2.0 - 1.0
-            for seed, (tname, ports) in enumerate(layout.inputs.items())
+            for seed, (tname, ports) in enumerate(model_layout.inputs.items())
         }
-    prepared = prepare_inputs(layout, X, iterations=1, quantize=True)  # {tensor: (1, *boundary)}
+    prepared = prepare_inputs(model_layout, X, iterations=1, quantize=True)  # {tensor: (1, *boundary)}
 
     # One DDR buffer per INPUT TENSOR (== one per mm2s mover), ordered by the tensor's first PLIO
     # port. Each tensor's own PLIO-port tiles are round-robin interleaved into its buffer, exactly
     # as the original single-input mover expects; a single sharded input yields exactly one buffer.
-    tensor_order = sorted(layout.inputs.items(), key=lambda kv: min(int(p.port) for p in kv[1]))
+    tensor_order = sorted(model_layout.inputs.items(), key=lambda kv: min(int(p.port) for p in kv[1]))
     ifm_packed_tensors = []
     for tname, ports in tensor_order:
         tiles = []
@@ -822,7 +819,7 @@ def pack_host_data(model_or_ctx, X=None):
 
     # Per-OUTPUT-TENSOR sizes (32-bit words), ordered by first PLIO port -- one per s2mm mover.
     # The device produces the output data, so the host only needs each buffer's size to allocate it.
-    ofm_order = sorted(layout.outputs.items(), key=lambda kv: min(int(p.port) for p in kv[1]))
+    ofm_order = sorted(model_layout.outputs.items(), key=lambda kv: min(int(p.port) for p in kv[1]))
     ofm_size_tensors = []
     for tname, ports in ofm_order:
         p0 = ports[0]
