@@ -198,7 +198,7 @@ def main():
     print(f'ONNX model saved to {ONNX_MODEL}')
     print(f'Config file saved to {CONFIG_FILE}')
     aie_model = from_onnx(
-        'tutorial_3_onnx.onnx',
+        str(ONNX_MODEL),
         config,
         output_dir='proj_aie_' + PROJECT_NAME,
         project_name='proj_aie_' + PROJECT_NAME,
