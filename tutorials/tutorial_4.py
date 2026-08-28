@@ -2,7 +2,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.keras import Model
 from tensorflow.keras.optimizers import Adam
-
+from aie4ml.report import report
 from qkeras import QDense, QActivation, quantized_bits
 
 import hls4ml
@@ -16,20 +16,12 @@ BATCH = 256
 ITERS = 4
 PLATFORM = 'xilinx_vek280_base_202520_1'
 
-PROJECT_NAME = 'model_2d_1s_2d_1s_1d_sm_pl'
+PROJECT_NAME = 'model_2d_1s_2d_1s_1d'
 
 N_DENSE = 5            # dense_0, dense_1, dense_2
 SOFTMAX_COLS = 128     # features the softmax reduces over (== dense_1 output)
 
-# HCCS Softmax calibration constants (integer surrogate, not exponential softmax).
-# The AIE kernel scores each element as  clamp(B - S * (max - x), min=0)  with the
-# distance saturated at Dmax, then normalizes. Constraints enforced by the resolver
-# (see op_impls/families/softmax/common.py::pack_hccs_params) for cols=SOFTMAX_COLS:
-#   B in [0,32767], S in [0,127], Dmax in [0,127]
-#   B - S*Dmax >= 0                      -> 255 - 2*100 = 55   OK
-#   cols * (B - S*Dmax) >= 256           -> 128 * 55 = 7040    OK  (reciprocal range)
-#   cols * B <= 32767                    -> 128 * 255 = 32640  OK  (sum fits int16)
-# Retune these if you change SOFTMAX_COLS.
+# HCCS Softmax calibration constants 
 HCCS = {'B': 255, 'S': 2, 'Dmax': 100}
 
 
@@ -76,21 +68,16 @@ cfg = hls4ml.utils.config_from_keras_model(model, granularity='name')
 for h in range(N_DENSE):
     cfg['LayerName'][f'dense_{h}_linear']['Precision']['result'] = 'fixed<8,3,TRN,WRAP,0>'
 
-# HCCS Softmax: needs the approximation family + its calibration constants, and the
-# resolver requires a signed int8 input (quant_1) and a uint8 or int16 output.
+# HCCS Softmax constants
 cfg['LayerName']['softmax_0']['approximation'] = 'hccs'
-# cfg['LayerName']['softmax_0']['hccs'] = dict(HCCS)
 cfg['LayerName']['softmax_0'].setdefault('Precision', {})['result'] = 'ufixed<8,0,TRN,WRAP,0>'
 cfg['LayerName']['softmax_0'].update({'approximation': 'hccs', 'hccs': dict(HCCS)})
 
 cfg['LayerName']['softmax_1']['approximation'] = 'hccs'
-# cfg['LayerName']['softmax_1']['hccs'] = dict(HCCS)
 cfg['LayerName']['softmax_1'].setdefault('Precision', {})['result'] = 'ufixed<8,0,TRN,WRAP,0>'
 cfg['LayerName']['softmax_1'].update({'approximation': 'hccs', 'hccs': dict(HCCS)})
 
-# Pin BOTH ends of each direct dense->dense pair so a spacer column stays between them
-# (dense_0: cols 7-10, dense_1: 12-13 -> col 11 free; dense_2: 12-13, dense_3: 15-16 -> col 14 free).
-# Pinning only the consumer is not enough: the placer slides the free producer up against it.
+# Custom placement
 cfg['LayerName']['dense_0']['placement'] = {'col': 7, 'row': 0}
 cfg['LayerName']['dense_1']['placement'] = {'col': 12, 'row': 0}
 cfg['LayerName']['dense_2']['placement'] = {'col': 12, 'row': 4}
@@ -128,26 +115,5 @@ aie_model.build()
 # Simulation
 # x = np.random.random((BATCH, N_IN)).astype(np.float32)
 # y_aie = aie_model.predict(x, simulator='aie')[:BATCH]
-
-# from aie4ml.simulation import read_aie_report
-# report = read_aie_report(aie_model)
-
-# print('\n' + '=' * 60)
-# print('AIE SIMULATION REPORT')
-# print('=' * 60)
-
-# if 'throughput' in report:
-#     t = report['throughput']
-#     print('\n[Throughput]')
-#     print(f"  Avg : {t['Avg_GOPs']} GOPs")
-#     print(f"  Min : {t['Min_GOPs']} GOPs")
-#     print(f"  Max : {t['Max_GOPs']} GOPs")
-
-# if 'output_interval' in report:
-#     ii = report['output_interval']
-#     print('\n[Output Interval (ns)]')
-#     for name, vals in ii.items():
-#         if isinstance(vals, dict):
-#             print(f"  {name}:")
-#             for k, v in vals.items():
-#                 print(f"    {k}: {v} ns")
+# print("Generating report for AIE model...")
+# print(report(aie_model))
