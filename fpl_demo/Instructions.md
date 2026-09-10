@@ -22,7 +22,7 @@
     curl -L -O https://raw.githubusercontent.com/kmhatre14/aie4ml/fpl_workshop/fpl_workshop.zip
     unzip fpl_workshop.zip
     cd fpl_workshop
-    ssh -i fpl_aws.pem -L 5902:localhost:5902 ubuntu@ec2-52-8-195-25.us-west-1.compute.amazonaws.com # This will open a tunnel for vnc server
+    ssh -i fpl_aws.pem -L 5902:localhost:5902 ubuntu@ec2-13-56-126-135.us-west-1.compute.amazonaws.com # This will open a tunnel for vnc server
     ```
 
     5901 is the port number.
